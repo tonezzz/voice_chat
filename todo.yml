@@ -1,0 +1,26 @@
+# Basic task template for voice_chat project
+
+version: 1
+
+project: voice_chat
+
+backlog:
+  - id: setup-devcontainer
+    title: "Set up dev container and open project in container"
+    notes: "Use .devcontainer configuration and reopen folder in container."
+  - id: create-react-client
+    title: "Create Vite React client in /client"
+    notes: "Run npm create vite@latest client -- --template react, then npm install."
+  - id: wire-backend
+    title: "Verify Node backend + STT + Ollama via docker-compose"
+    notes: "docker compose up --build and test /voice-chat and /voice-chat-audio."
+  - id: implement-voice-ui
+    title: "Implement React UI with text & voice (browser STT + server STT)"
+    notes: "Use MediaRecorder and Web Speech API."
+  - id: expose-ngrok
+    title: "Expose backend/frontend through ngrok for public URL"
+    notes: "ngrok http localhost:3001 and (optionally) 5173."
+
+in_progress: []
+
+done: []
