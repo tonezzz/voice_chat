@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Voice Chat UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid #1f2937;
+      background: #020617;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    header span {
+      font-size: 0.8rem;
+      color: #9ca3af;
+    }
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 1rem;
+      gap: 0.75rem;
+      max-width: 900px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    #messages {
+      flex: 1;
+      border-radius: 0.5rem;
+      border: 1px solid #1f2937;
+      background: #020617;
+      padding: 0.75rem;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+    .msg {
+      padding: 0.5rem 0.75rem;
+      border-radius: 0.5rem;
+      max-width: 80%;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      font-size: 0.9rem;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: #4f46e5;
+    }
+    .msg.bot {
+      align-self: flex-start;
+      background: #111827;
+      border: 1px solid #1f2937;
+    }
+    .msg.system {
+      align-self: center;
+      background: transparent;
+      color: #9ca3af;
+      font-size: 0.8rem;
+      padding: 0.25rem 0.5rem;
+    }
+    form {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 0.25rem;
+      align-items: flex-end;
+    }
+    textarea {
+      flex: 1;
+      resize: vertical;
+      min-height: 2.5rem;
+      max-height: 8rem;
+      padding: 0.5rem 0.75rem;
+      border-radius: 0.5rem;
+      border: 1px solid #374151;
+      background: #020617;
+      color: #e5e7eb;
+      font-size: 0.9rem;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: #4f46e5;
+      box-shadow: 0 0 0 1px #4f46e5;
+    }
+    button {
+      padding: 0.6rem 1.1rem;
+      border-radius: 0.5rem;
+      border: none;
+      background: #4f46e5;
+      color: white;
+      font-weight: 500;
+      cursor: pointer;
+      font-size: 0.9rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      white-space: nowrap;
+    }
+    .mic-btn.recording {
+      background: #b91c1c;
+    }
+    .controls {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+    .options-row {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.75rem;
+      color: #9ca3af;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    footer {
+      padding: 0.5rem 1.5rem 1rem;
+      font-size: 0.75rem;
+      color: #6b7280;
+      text-align: center;
+    }
+    @media (max-width: 640px) {
+      main { padding: 0.75rem; }
+      header { padding: 0.75rem 1rem; }
+      footer { padding: 0.5rem 1rem 0.75rem; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Voice Chat UI</h1>
+    <span>Backend: http://localhost:3001</span>
+  </header>
+
+  <main>
+    <div id="messages"></div>
+    <form id="chat-form">
+      <textarea id="message" placeholder="Type a message and press Enter to send (Shift+Enter for newline)..." required></textarea>
+      <div class="controls">
+        <label class="options-row">
+          <span style="min-width:52px;">Model</span>
+          <select id="model-select" style="flex:1; background:#020617; color:#e5e7eb; border:1px solid #374151; border-radius:0.375rem; padding:0.25rem 0.5rem; font-size:0.8rem;">
+            <option value="llama3.2:1b">llama3.2:1b (small, fastest)</option>
+            <option value="llama3.2:3b">llama3.2:3b (small)</option>
+            <option value="llama3">llama3 (default)</option>
+          </select>
+        </label>
+        <div style="display:flex; gap:0.4rem;">
+          <button type="submit" id="send-btn">Send</button>
+          <button type="button" id="mic-btn" class="mic-btn">Mic</button>
+        </div>
+        <label class="options-row">
+          <input type="checkbox" id="stream-toggle" checked />
+          <span>Stream-style reply animation</span>
+        </label>
+        <label class="options-row">
+          <input type="checkbox" id="voice-toggle" />
+          <span>Voice output for bot replies</span>
+        </label>
+      </div>
+    </form>
+  </main>
+
+  <footer>
+    Simple UI talking to <code>/voice-chat</code> on your local Node server.
+  </footer>
+
+  <script>
+    const API_BASE = 'http://localhost:3001';
+    const messagesEl = document.getElementById('messages');
+    const form = document.getElementById('chat-form');
+    const textarea = document.getElementById('message');
+    const sendBtn = document.getElementById('send-btn');
+    const micBtn = document.getElementById('mic-btn');
+    const streamToggle = document.getElementById('stream-toggle');
+    const voiceToggle = document.getElementById('voice-toggle');
+    const modelSelect = document.getElementById('model-select');
+
+    let mediaRecorder = null;
+    let audioChunks = [];
+
+    function addMessage(role, text) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + role;
+      div.textContent = text;
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return div;
+    }
+
+    function addSystem(text) {
+      const div = document.createElement('div');
+      div.className = 'msg system';
+      div.textContent = text;
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function speak(text) {
+      if (!voiceToggle.checked) return;
+      if (!('speechSynthesis' in window)) {
+        addSystem('Voice output not supported in this browser.');
+        voiceToggle.checked = false;
+        return;
+      }
+
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      window.speechSynthesis.speak(utterance);
+    }
+
+    async function typeReply(div, fullText) {
+      const useStream = streamToggle.checked;
+      if (!useStream) {
+        div.textContent = fullText;
+        speak(fullText);
+        return;
+      }
+
+      div.textContent = '';
+      for (let i = 0; i < fullText.length; i++) {
+        div.textContent += fullText[i];
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        await new Promise(r => setTimeout(r, 12));
+      }
+      speak(fullText);
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const message = textarea.value.trim();
+      if (!message) return;
+
+      addMessage('user', message);
+      textarea.value = '';
+      textarea.focus();
+
+      sendBtn.disabled = true;
+      sendBtn.textContent = 'Sending...';
+
+      try {
+        const res = await fetch(API_BASE + '/voice-chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            message,
+            model: modelSelect.value || undefined
+          })
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          console.error('Server error', text);
+          addSystem('Error from server: ' + res.status + ' ' + text);
+          return;
+        }
+
+        const data = await res.json();
+        const botDiv = addMessage('bot', '');
+        await typeReply(botDiv, data.reply || '[no reply field in response]');
+      } catch (err) {
+        console.error(err);
+        addSystem('Network error: ' + err.message);
+      } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Send';
+      }
+    });
+
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        form.requestSubmit();
+      }
+    });
+
+    async function startRecording() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        addSystem('Microphone not supported in this browser.');
+        return;
+      }
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+
+        mediaRecorder.addEventListener('dataavailable', (e) => {
+          if (e.data.size > 0) audioChunks.push(e.data);
+        });
+
+        mediaRecorder.addEventListener('stop', async () => {
+          stream.getTracks().forEach(t => t.stop());
+
+          if (!audioChunks.length) {
+            addSystem('No audio captured.');
+            return;
+          }
+
+          const blob = new Blob(audioChunks, { type: 'audio/webm' });
+          const formData = new FormData();
+          formData.append('audio', blob, 'recording.webm');
+          if (modelSelect.value) {
+            formData.append('model', modelSelect.value);
+          }
+
+          micBtn.disabled = true;
+          micBtn.textContent = 'Uploading...';
+
+          try {
+            const res = await fetch(API_BASE + '/voice-chat-audio', {
+              method: 'POST',
+              body: formData
+            });
+
+            if (!res.ok) {
+              const text = await res.text();
+              console.error('Audio server error', text);
+              addSystem('Error from audio endpoint: ' + res.status + ' ' + text);
+              return;
+            }
+
+            const data = await res.json();
+            if (data.transcript) {
+              addMessage('user', '[voice] ' + data.transcript);
+            }
+            const botDiv = addMessage('bot', '');
+            await typeReply(botDiv, data.reply || '[no reply field in response]');
+          } catch (err) {
+            console.error(err);
+            addSystem('Network error (audio): ' + err.message);
+          } finally {
+            micBtn.disabled = false;
+            micBtn.textContent = 'Mic';
+          }
+        });
+
+        mediaRecorder.start();
+        micBtn.classList.add('recording');
+        micBtn.textContent = 'Stop';
+        addSystem('Recording... speak now, then click Stop.');
+      } catch (err) {
+        console.error(err);
+        addSystem('Could not access microphone: ' + err.message);
+      }
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+        micBtn.classList.remove('recording');
+      }
+    }
+
+    micBtn.addEventListener('click', () => {
+      if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+        startRecording();
+      } else {
+        stopRecording();
+      }
+    });
+
+    addSystem('Ready. Make sure your Node server is running on http://localhost:3001.');
+  </script>
+</body>
+</html>
