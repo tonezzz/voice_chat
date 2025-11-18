@@ -1,14 +1,51 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './style.css'
 import type { DetectionResult, DetectionTestPayload } from './types/yolo'
 
-const API_BASE =
-  import.meta.env.VITE_API_BASE_URL ||
-  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3002')
+interface ServiceStatus {
+  name: string
+  label: string
+  status: string
+  detail?: unknown
+}
+
+const BANK_OCR_LANG_OPTIONS = [
+  { value: 'eng', label: 'English' },
+  { value: 'tha', label: 'ไทย (Thai)' },
+  { value: 'spa', label: 'Español' }
+]
+
+const downloadBase64File = (dataUrl: string, filename: string) => {
+  const link = document.createElement('a')
+  link.href = dataUrl
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+}
+
+const resolveDefaultApiBase = () => {
+  if (typeof window === 'undefined') {
+    return 'http://localhost:3002'
+  }
+
+  const { protocol, hostname, port } = window.location
+  const localPreviewPorts = new Set(['5173', '4173', '4174'])
+  if (port && localPreviewPorts.has(port)) {
+    return `${protocol}//${hostname}:3002`
+  }
+  return window.location.origin
+}
+
+const API_BASE = import.meta.env.VITE_API_BASE_URL || resolveDefaultApiBase()
 const API_URL = `${API_BASE}/voice-chat`
 const API_AUDIO_URL = `${API_BASE}/voice-chat-audio`
 const HEALTH_URL = `${API_BASE}/health`
 const DETECT_URL = `${API_BASE}/detect-image`
+const GENERATE_IMAGE_URL = `${API_BASE}/generate-image`
+const OCR_URL = `${API_BASE}/ocr-image`
+const VOICES_URL = `${API_BASE}/voices`
+const PREVIEW_VOICE_URL = `${API_BASE}/preview-voice`
 
 const SpeechRecognitionImpl: typeof window.SpeechRecognition | undefined =
   (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
@@ -23,6 +60,9 @@ interface ChatAttachment {
   label?: string
   order?: number
   prompt?: string
+  base64?: string
+  mimetype?: string
+  size?: number
 }
 
 interface ChatMessage {
@@ -32,11 +72,35 @@ interface ChatMessage {
   time: string
   model?: string
   sttModel?: string
+  sttLanguage?: string | null
   attachmentType?: AttachmentType
   attachmentName?: string
   attachmentUrl?: string
   accelerator?: 'cpu' | 'gpu'
   attachments?: ChatAttachment[]
+  voiceId?: string | null
+}
+
+type InlineSpeakerStatus = 'idle' | 'playing' | 'paused'
+
+interface InlineSpeakerState {
+  messageId: string | null
+  status: InlineSpeakerStatus
+}
+
+interface SpeakLifecycle {
+  onStart?: () => void
+  onEnd?: () => void
+  onError?: () => void
+}
+
+type InlinePlaybackMode = 'audio' | 'speech'
+
+type LlmProvider = 'ollama' | 'anthropic' | 'openai'
+
+interface PlayAudioOptions {
+  onStart?: () => void
+  onEnded?: () => void
 }
 
 const detectionTargetOptions = [
@@ -51,6 +115,456 @@ const detectionTargetOptions = [
   { label: 'Traffic lights', value: 'traffic light' }
 ]
 
+const speechLanguageOptions = [
+  { value: 'auto', label: 'Auto detect (recommended)', speechRecognition: '' },
+  { value: 'en', label: 'English (US)', speechRecognition: 'en-US' },
+  { value: 'th', label: 'ไทย (Thai)', speechRecognition: 'th-TH' },
+  { value: 'es', label: 'Español (LatAm)', speechRecognition: 'es-419' },
+  { value: 'vi', label: 'Tiếng Việt', speechRecognition: 'vi-VN' },
+  { value: 'ja', label: '日本語 (Japanese)', speechRecognition: 'ja-JP' }
+]
+
+const speechLanguageValueMap = new Map(speechLanguageOptions.map((option) => [option.value, option]))
+const speechRecognitionCodeMap = new Map(
+  speechLanguageOptions
+    .filter((option) => option.speechRecognition)
+    .map((option) => [option.speechRecognition!.toLowerCase(), option])
+)
+
+const getSpeechRecognitionCode = (value: string) => speechLanguageValueMap.get(value)?.speechRecognition || ''
+
+const normalizeSpeechLanguageValue = (code?: string | null) => {
+  if (!code) return null
+  if (speechLanguageValueMap.has(code)) {
+    return code
+  }
+  const lowered = code.toLowerCase()
+  const match = speechRecognitionCodeMap.get(lowered)
+  return match ? match.value : code
+}
+
+const getSpeechLanguageLabel = (code?: string | null) => {
+  if (!code) return null
+  if (code === 'auto') return 'Auto'
+  const normalized = normalizeSpeechLanguageValue(code)
+  if (normalized && speechLanguageValueMap.has(normalized)) {
+    return speechLanguageValueMap.get(normalized)!.label
+  }
+  if (typeof code === 'string') {
+    const recognitionMatch = speechRecognitionCodeMap.get(code.toLowerCase())
+    if (recognitionMatch) {
+      return recognitionMatch.label
+    }
+  }
+  return code.toUpperCase()
+}
+
+type BankFieldType =
+  | 'amount'
+  | 'sender'
+  | 'receiver'
+  | 'account'
+  | 'bank'
+  | 'date'
+  | 'time'
+  | 'reference'
+  | 'other'
+
+interface TransactionField {
+  id: string
+  type: BankFieldType
+  label: string
+  value?: string | null
+  confidence?: number
+  bbox?: [number, number, number, number] | null
+}
+
+interface OcrSpan {
+  id: string
+  text: string
+  confidence?: number | null
+  bbox?: [number, number, number, number] | null
+}
+
+interface BankOcrResult {
+  text: string
+  lang: string
+  confidence?: number | null
+  lines: OcrSpan[]
+  words: OcrSpan[]
+}
+
+type StatusGroupKey = 'language' | 'speech' | 'voice' | 'vision' | 'other'
+
+interface ServiceStatus {
+  name: string
+  label: string
+  status: string
+  detail?: unknown
+  group: StatusGroupKey
+  type: string
+}
+
+type HealthServiceEntry = { name: string; status?: string; detail?: unknown }
+
+const serviceGroupMeta: Record<StatusGroupKey, { title: string; subtitle: string; icon: string }> = {
+  language: { title: 'Language models', subtitle: 'LLM inference targets', icon: '💬' },
+  speech: { title: 'Speech to text', subtitle: 'Transcription services', icon: '🗣️' },
+  voice: { title: 'Voice synthesis', subtitle: 'TTS / OpenVoice engines', icon: '🎧' },
+  vision: { title: 'Vision & tools', subtitle: 'YOLO / MCP utilities', icon: '🖼️' },
+  other: { title: 'Other services', subtitle: 'Miscellaneous endpoints', icon: '🧩' }
+}
+
+const statusGroupOrder: StatusGroupKey[] = ['language', 'speech', 'voice', 'vision', 'other']
+
+const serviceMeta: Record<string, { label: string; group: StatusGroupKey; type: string }> = {
+  ollama: { label: 'LLM (CPU)', group: 'language', type: 'CPU' },
+  ollamaGpu: { label: 'LLM (GPU)', group: 'language', type: 'GPU' },
+  stt: { label: 'STT (CPU)', group: 'speech', type: 'CPU' },
+  sttGpu: { label: 'STT (GPU)', group: 'speech', type: 'GPU' },
+  tts: { label: 'TTS (CPU)', group: 'voice', type: 'CPU' },
+  ttsGpu: { label: 'TTS (GPU)', group: 'voice', type: 'GPU' },
+  openvoice: { label: 'OpenVoice (CPU)', group: 'voice', type: 'CPU' },
+  openvoiceGpu: { label: 'OpenVoice (GPU)', group: 'voice', type: 'GPU' },
+  yolo: { label: 'YOLO MCP', group: 'vision', type: 'Service' },
+  image: { label: 'Image MCP (CPU)', group: 'vision', type: 'CPU' },
+  imageGpu: { label: 'Image MCP (GPU)', group: 'vision', type: 'GPU' }
+}
+
+const formatStatusDetail = (detail: unknown): string => {
+  if (!detail) return ''
+  if (typeof detail === 'string') return detail
+  if (typeof detail === 'object') {
+    try {
+      const serialized = JSON.stringify(detail)
+      return serialized === '{}' ? '' : serialized
+    } catch {
+      return ''
+    }
+  }
+  return ''
+}
+
+interface GeneratedImageResult {
+  image_base64: string
+  prompt: string
+  negative_prompt?: string | null
+  guidance_scale?: number
+  num_inference_steps?: number
+  width: number
+  height: number
+  seed?: number | null
+  duration_ms?: number | null
+  accelerator?: 'cpu' | 'gpu' | null
+}
+
+const BANK_FIELD_KEYWORDS: Record<BankFieldType, string[]> = {
+  amount: [
+    'amount',
+    'total',
+    'money',
+    'sum',
+    'amt',
+    'ยอด',
+    'ยอดเงิน',
+    'จำนวนเงิน',
+    'transfer amount',
+    'paid'
+  ],
+  sender: ['sender', 'from', 'payer', 'ผู้โอน', 'sender name', 'account name'],
+  receiver: ['receiver', 'to', 'payee', 'ผู้รับ', 'beneficiary', 'recipient'],
+  account: ['account', 'acc', 'acct', 'number', 'acct no', 'account no', 'เลขที่บัญชี', 'บัญชี'],
+  bank: ['bank', 'branch', 'ธนาคาร', 'สาขา', 'bank name'],
+  date: ['date', 'วันที่', 'transaction date'],
+  time: ['time', 'เวลา', 'transaction time'],
+  reference: ['reference', 'ref', 'transaction id', 'arn', 'หมายเลขอ้างอิง', 'ref no'],
+  other: []
+}
+
+const BANK_FIELD_LABELS: Record<BankFieldType, string> = {
+  amount: 'Amount',
+  sender: 'Sender',
+  receiver: 'Receiver',
+  account: 'Account',
+  bank: 'Bank / Branch',
+  date: 'Date',
+  time: 'Time',
+  reference: 'Reference',
+  other: 'Other details'
+}
+
+const BANK_FIELD_CONFIDENCE_FLOOR: Partial<Record<BankFieldType, number>> = {
+  amount: 0.35,
+  sender: 0.3,
+  receiver: 0.3,
+  account: 0.25,
+  bank: 0.25,
+  date: 0.2,
+  time: 0.2,
+  reference: 0.25
+}
+
+const normalizeBankFieldType = (raw?: string): BankFieldType => {
+  if (!raw) return 'other'
+  const normalized = raw.toLowerCase()
+  for (const [type, keywords] of Object.entries(BANK_FIELD_KEYWORDS) as [BankFieldType, string[]][]) {
+    if (type === 'other') continue
+    if (keywords.some((keyword) => normalized.includes(keyword))) {
+      return type
+    }
+  }
+  return 'other'
+}
+
+const normalizeBbox = (bbox: number[]): [number, number, number, number] => {
+  const [x1, y1, x2, y2] = bbox
+  return [Math.min(x1, x2), Math.min(y1, y2), Math.max(x1, x2), Math.max(y1, y2)]
+}
+
+const clampBboxToImage = (
+  bbox: number[] | undefined,
+  imageSize?: { width: number; height: number } | null
+): [number, number, number, number] | null => {
+  if (!Array.isArray(bbox) || bbox.length !== 4) return null
+  const [minX, minY, maxX, maxY] = normalizeBbox(bbox)
+
+  if (!imageSize?.width || !imageSize?.height) {
+    return [minX, minY, maxX, maxY]
+  }
+
+  const width = Math.max(1, imageSize.width)
+  const height = Math.max(1, imageSize.height)
+  const x1 = Math.max(0, Math.min(minX, width))
+  const y1 = Math.max(0, Math.min(minY, height))
+  const x2 = Math.max(x1, Math.min(maxX, width))
+  const y2 = Math.max(y1, Math.min(maxY, height))
+  return [x1, y1, x2, y2]
+}
+
+const bboxDimensions = (clamped: [number, number, number, number]) => {
+  const [x1, y1, x2, y2] = clamped
+  return {
+    width: Math.max(1, x2 - x1),
+    height: Math.max(1, y2 - y1)
+  }
+}
+
+const safeFilename = (input: string, fallback: string) => {
+  const base = input.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  return base || fallback
+}
+
+const formatImageDuration = (value?: number | null) => {
+  if (!value || value <= 0) return null
+  if (value < 1000) {
+    return `${value} ms`
+  }
+  const seconds = value / 1000
+  return `${seconds.toFixed(seconds >= 10 ? 0 : 1)} s`
+}
+
+const bboxAreaPercent = (
+  dims: { width: number; height: number },
+  imageSize?: { width: number; height: number } | null
+) => {
+  if (!imageSize?.width || !imageSize?.height) return null
+  const totalArea = imageSize.width * imageSize.height
+  if (!totalArea) return null
+  return (dims.width * dims.height * 100) / totalArea
+}
+
+const formatDuration = (ms: number) => {
+  if (!Number.isFinite(ms) || ms <= 0) return '0:00'
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`
+}
+
+const boxesOverlap = (
+  a: [number, number, number, number],
+  b: [number, number, number, number]
+) => !(a[0] > b[2] || a[2] < b[0] || a[1] > b[3] || a[3] < b[1])
+
+const bboxArea = ([x1, y1, x2, y2]: [number, number, number, number]) =>
+  Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
+
+const bboxIntersectionArea = (
+  a: [number, number, number, number],
+  b: [number, number, number, number]
+) => {
+  const xLeft = Math.max(a[0], b[0])
+  const yTop = Math.max(a[1], b[1])
+  const xRight = Math.min(a[2], b[2])
+  const yBottom = Math.min(a[3], b[3])
+  const width = Math.max(0, xRight - xLeft)
+  const height = Math.max(0, yBottom - yTop)
+  return width * height
+}
+
+const bboxOverlapRatio = (
+  a: [number, number, number, number],
+  b: [number, number, number, number]
+) => {
+  const intersection = bboxIntersectionArea(a, b)
+  if (!intersection) return 0
+  const smallest = Math.min(bboxArea(a) || 1, bboxArea(b) || 1)
+  return intersection / smallest
+}
+
+const normalizeText = (value?: string | null) => value?.replace(/\s+/g, ' ').trim() ?? ''
+
+const extractFieldValue = (label: string, matchedText?: string): string => {
+  const sources = [matchedText, label]
+    .map((text) => normalizeText(text))
+    .filter((text): text is string => !!text)
+
+  const amountRegex = /([+-]?\d[\d,.]*(?:\.\d+)?\s?(?:thb|baht|usd|usd\$|฿|\$)?)/i
+  for (const source of sources) {
+    const amountMatch = source.match(amountRegex)
+    if (amountMatch) {
+      return amountMatch[0].trim()
+    }
+  }
+
+  for (const source of sources) {
+    const splitterMatch = source.match(/[:\-]/)
+    if (splitterMatch) {
+      const [heading, ...rest] = source.split(splitterMatch[0])
+      const tail = rest.join(splitterMatch[0]).trim()
+      if (tail) {
+        return tail
+      }
+      if (heading) {
+        return heading.trim()
+      }
+    }
+  }
+
+  if (sources.length) {
+    return sources[0]
+  }
+  return label.trim()
+}
+
+type OcrWordWithBox = OcrSpan & { bbox: [number, number, number, number] }
+
+const collectOcrTextForBbox = (
+  bbox: [number, number, number, number] | null,
+  words: OcrWordWithBox[]
+) => {
+  if (!bbox || !words.length) return ''
+  const matches = words
+    .map((word) => {
+      if (!word.bbox) return null
+      const overlap = bboxOverlapRatio(bbox, word.bbox)
+      if (overlap < 0.25) return null
+      return { ...word, overlap }
+    })
+    .filter((word): word is OcrWordWithBox & { overlap: number } => !!word)
+    .sort((a, b) => a.bbox[1] - b.bbox[1] || a.bbox[0] - b.bbox[0])
+
+  const text = matches.map((word) => word.text).join(' ')
+  return normalizeText(text)
+}
+
+const findDuplicateFieldIndex = (
+  fields: TransactionField[],
+  candidate: TransactionField
+) => {
+  const candidateBox = candidate.bbox
+  if (!candidateBox) return -1
+  return fields.findIndex((field) => {
+    if (field.type !== candidate.type) return false
+    const fieldBox = field.bbox
+    if (!fieldBox) return false
+    return bboxOverlapRatio(fieldBox, candidateBox) >= 0.65
+  })
+}
+
+const shouldReplaceField = (existing: TransactionField, next: TransactionField) => {
+  const existingConfidence = existing.confidence ?? 0
+  const nextConfidence = next.confidence ?? 0
+  if (nextConfidence > existingConfidence + 0.05) {
+    return true
+  }
+  if (!existing.value && next.value) {
+    return true
+  }
+  const existingValueLength = existing.value?.length ?? 0
+  const nextValueLength = next.value?.length ?? 0
+  return nextValueLength > existingValueLength + 3
+}
+
+const applyConfidenceFloor = (fields: TransactionField[]) => {
+  return fields.filter((field) => {
+    const floor = BANK_FIELD_CONFIDENCE_FLOOR[field.type]
+    if (typeof floor !== 'number') return true
+    return (field.confidence ?? 0) >= floor
+  })
+}
+
+const buildTransactionFields = (
+  detections: DetectionResult[],
+  imageSize?: { width: number; height: number } | null,
+  ocrWords?: OcrSpan[]
+): TransactionField[] => {
+  if (!detections.length) return []
+
+  const normalizedWords: OcrWordWithBox[] = (ocrWords || [])
+    .map((word) => ({
+      ...word,
+      bbox: clampBboxToImage(word.bbox ?? undefined, imageSize)
+    }))
+    .filter((word): word is OcrWordWithBox => !!word.text && !!word.bbox)
+
+  const fields = detections.reduce<TransactionField[]>((acc, det, idx) => {
+    const bbox = clampBboxToImage(det.bbox, imageSize)
+    const matchedOcrText = collectOcrTextForBbox(bbox, normalizedWords)
+    const rawLabel = normalizeText(det.class_name) || matchedOcrText || `Field ${idx + 1}`
+    const context = [det.class_name, matchedOcrText].filter(Boolean).join(' ')
+    const type = normalizeBankFieldType(context || rawLabel)
+    const field: TransactionField = {
+      id: `bank-field-${idx}`,
+      type,
+      label: rawLabel,
+      value: extractFieldValue(rawLabel, matchedOcrText),
+      confidence: det.confidence,
+      bbox
+    }
+
+    const duplicateIndex = findDuplicateFieldIndex(acc, field)
+    if (duplicateIndex >= 0) {
+      if (shouldReplaceField(acc[duplicateIndex], field)) {
+        acc[duplicateIndex] = field
+      }
+      return acc
+    }
+    acc.push(field)
+    return acc
+  }, [])
+
+  return applyConfidenceFloor(fields)
+}
+
+const normalizeOcrBbox = (bbox?: number[] | null): [number, number, number, number] | null => {
+  if (!Array.isArray(bbox) || bbox.length !== 4) return null
+  const [x1, y1, x2, y2] = bbox.map((value) => (typeof value === 'number' ? value : Number(value) || 0))
+  return [x1, y1, x2, y2]
+}
+
+const mapOcrSpans = (spans: any, prefix: string): OcrSpan[] => {
+  if (!Array.isArray(spans)) return []
+  return spans
+    .filter(Boolean)
+    .map((span, idx) => ({
+      id: typeof span?.id === 'string' ? span.id : `${prefix}-${idx}`,
+      text: typeof span?.text === 'string' ? span.text.trim() : '',
+      confidence: typeof span?.confidence === 'number' ? span.confidence : null,
+      bbox: normalizeOcrBbox(span?.bbox)
+    }))
+}
+
 interface PendingAttachment {
   id: string
   file: File
@@ -60,6 +574,8 @@ interface PendingAttachment {
   label?: string
   order: number
   prompt?: string
+  mimetype?: string
+  size?: number
 }
 
 interface UploadedAttachment {
@@ -70,9 +586,18 @@ interface UploadedAttachment {
   label?: string
   order?: number
   prompt?: string
+  base64?: string
+  mimetype?: string
+  size?: number
 }
 
 const builtInLlmModels = ['llama3.2-vision:11b', 'llama3.2:1b', 'llama3.2:3b', 'llama3.1:8b', 'phi3:mini'] as const
+
+const LLM_PROVIDER_OPTIONS: Array<{ value: LlmProvider; label: string }> = [
+  { value: 'ollama', label: 'Ollama (local)' },
+  { value: 'anthropic', label: 'Anthropic Claude' },
+  { value: 'openai', label: 'OpenAI GPT' }
+]
 
 const SESSION_STORAGE_KEY = 'voice-chat-session-id'
 
@@ -97,16 +622,133 @@ interface SessionResponse {
   messages: SessionMessage[]
 }
 
+interface VoiceOption {
+  id: string
+  name: string
+  sampleRate?: number | null
+  engine?: string | null
+  language?: string | null
+  style?: string | null
+  type?: string | null
+  tier?: string | null
+}
+
 const defaultModels = {
-  llm: builtInLlmModels[0],
+  llm: 'llama3.2:1b',
   whisper: 'tiny'
 }
 
 const STORAGE_KEYS = {
   messages: 'chaba.messages',
   sessionId: 'chaba.sessionId',
-  accelerator: 'chaba.accelerator'
+  accelerator: 'chaba.accelerator',
+  voice: 'chaba.voice',
+  speechLang: 'chaba.speechLang',
+  voiceEngine: 'chaba.voiceEngine',
+  llmModel: 'chaba.llmModel',
+  llmProvider: 'chaba.llmProvider',
+  whisperModel: 'chaba.whisperModel',
+  micMode: 'chaba.micMode',
+  activePanel: 'chaba.activePanel',
+  detectConfidence: 'chaba.detectConfidence',
+  detectConfidenceAlt: 'chaba.detectConfidenceAlt',
+  bankDetectConfidence: 'chaba.bankDetectConfidence',
+  showDetectionBoxes: 'chaba.showDetectionBoxes',
+  showDetectionBoxesAlt: 'chaba.showDetectionBoxesAlt',
+  bankShowDetectionBoxes: 'chaba.bankShowDetectionBoxes',
+  detectionTargets: 'chaba.secondaryDetectionTargets',
+  imagePrompt: 'chaba.imagePrompt',
+  imageNegativePrompt: 'chaba.imageNegativePrompt',
+  imageGuidance: 'chaba.imageGuidance',
+  imageSteps: 'chaba.imageSteps',
+  imageWidth: 'chaba.imageWidth',
+  imageHeight: 'chaba.imageHeight',
+  imageSeed: 'chaba.imageSeed',
+  imageAccelerator: 'chaba.imageAccelerator'
 }
+
+const IMAGE_DIMENSION_OPTIONS = [384, 512, 640, 768, 896, 1024] as const
+const IMAGE_HISTORY_LIMIT = 6
+const IMAGE_MIN_GUIDANCE = 1
+const IMAGE_MAX_GUIDANCE = 14
+const IMAGE_MIN_STEPS = 5
+const IMAGE_MAX_STEPS = 60
+const IMAGE_ACCELERATOR_OPTIONS: Array<{ value: 'cpu' | 'gpu'; label: string }> = [
+  { value: 'gpu', label: 'GPU (fastest, requires CUDA)' },
+  { value: 'cpu', label: 'CPU (fallback)' }
+]
+
+const clampNumeric = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
+
+const normalizeImageDimension = (value: number) => {
+  const rounded = Math.round(value / 8) * 8
+  return clampNumeric(rounded || 512, 256, 1024)
+}
+
+const parseSeedValue = (seed: string) => {
+  if (!seed) return null
+  const trimmed = seed.trim()
+  if (!trimmed) return null
+  const parsed = Number(trimmed)
+  if (!Number.isFinite(parsed)) return null
+  return Math.floor(parsed)
+}
+
+const mapImageResponse = (payload: any): GeneratedImageResult => {
+  const accelerator = typeof payload?.accelerator === 'string' ? payload.accelerator.toLowerCase() : null
+  const normalizedAccelerator = accelerator === 'gpu' || accelerator === 'cpu' ? accelerator : null
+  return {
+    image_base64: typeof payload?.image_base64 === 'string' ? payload.image_base64 : '',
+    prompt: String(payload?.prompt || ''),
+    negative_prompt:
+      typeof payload?.negative_prompt === 'string' && payload.negative_prompt.trim()
+        ? payload.negative_prompt
+        : null,
+    guidance_scale:
+      typeof payload?.guidance_scale === 'number' ? payload.guidance_scale : undefined,
+    num_inference_steps:
+      typeof payload?.num_inference_steps === 'number' ? payload.num_inference_steps : undefined,
+    width: typeof payload?.width === 'number' ? payload.width : 512,
+    height: typeof payload?.height === 'number' ? payload.height : 512,
+    seed: typeof payload?.seed === 'number' ? payload.seed : null,
+    duration_ms:
+      typeof payload?.duration_ms === 'number'
+        ? payload.duration_ms
+        : typeof payload?.durationMs === 'number'
+          ? payload.durationMs
+          : null,
+    accelerator: normalizedAccelerator
+  }
+}
+
+const readFromStorage = <T,>(key: string, fallback: T): T => {
+  if (typeof window === 'undefined') return fallback
+  try {
+    const raw = window.localStorage.getItem(key)
+    if (raw === null) return fallback
+    return JSON.parse(raw) as T
+  } catch (err) {
+    console.warn('Failed to read storage key', key, err)
+    return fallback
+  }
+}
+
+const writeToStorage = (key: string, value: unknown) => {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value))
+  } catch (err) {
+    console.error('Failed to persist storage key', key, err)
+  }
+}
+
+type VoiceEngineFilter = 'all' | 'piper' | 'openvoice'
+
+const VOICE_ENGINE_FILTERS: { value: VoiceEngineFilter; label: string }[] = [
+  { value: 'all', label: 'All voices' },
+  { value: 'piper', label: 'Standard (Piper)' },
+  { value: 'openvoice', label: 'Premium (OpenVoice)' }
+]
 
 const MAX_PERSISTED_MESSAGES = 200
 const HISTORY_FOR_SERVER = 20
@@ -137,8 +779,12 @@ export function App() {
   const [recording, setRecording] = useState(false)
   const [health, setHealth] = useState<'unknown' | 'ok' | 'error'>('unknown')
   const [healthInfo, setHealthInfo] = useState<any>(null)
-  const [llmModel, setLlmModel] = useState<string>(defaultModels.llm)
-  const [whisperModel, setWhisperModel] = useState(defaultModels.whisper)
+  const [statusExpanded, setStatusExpanded] = useState(false)
+  const [llmProvider, setLlmProvider] = useState<LlmProvider>(() => readFromStorage(STORAGE_KEYS.llmProvider, 'ollama'))
+  const [llmModel, setLlmModel] = useState<string>(() => readFromStorage(STORAGE_KEYS.llmModel, defaultModels.llm))
+  const [whisperModel, setWhisperModel] = useState(() =>
+    readFromStorage(STORAGE_KEYS.whisperModel, defaultModels.whisper)
+  )
   const [acceleratorMode, setAcceleratorMode] = useState<'cpu' | 'gpu'>(() => {
     if (typeof window === 'undefined') return 'gpu'
     try {
@@ -154,27 +800,67 @@ export function App() {
   const [uploadingAttachment, setUploadingAttachment] = useState(false)
   const [clipboardSupported, setClipboardSupported] = useState(false)
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([])
-  const [detectConfidence, setDetectConfidence] = useState(0.25)
+  const [detectConfidence, setDetectConfidence] = useState(() =>
+    readFromStorage(STORAGE_KEYS.detectConfidence, 0.25)
+  )
   const [detecting, setDetecting] = useState(false)
+  const [lastDetectionFile, setLastDetectionFile] = useState<File | null>(null)
   const [detectionImage, setDetectionImage] = useState<string | null>(null)
   const [detectionPreviewUrl, setDetectionPreviewUrl] = useState<string | null>(null)
   const [detectionExpanded, setDetectionExpanded] = useState(false)
-  const [showDetectionBoxes, setShowDetectionBoxes] = useState(true)
+  const [showDetectionBoxes, setShowDetectionBoxes] = useState(() =>
+    readFromStorage(STORAGE_KEYS.showDetectionBoxes, true)
+  )
   const [detectionResults, setDetectionResults] = useState<DetectionResult[]>([])
   const [detectionImageSize, setDetectionImageSize] = useState<{ width: number; height: number } | null>(null)
   const [detectionError, setDetectionError] = useState<string | null>(null)
-  const [secondaryDetectionTargets, setSecondaryDetectionTargets] = useState<string[]>(['face'])
-  const [detectConfidenceAlt, setDetectConfidenceAlt] = useState(0.3)
+  const [secondaryDetectionTargets, setSecondaryDetectionTargets] = useState<string[]>(() =>
+    readFromStorage(STORAGE_KEYS.detectionTargets, ['face'])
+  )
+  const [detectConfidenceAlt, setDetectConfidenceAlt] = useState(() =>
+    readFromStorage(STORAGE_KEYS.detectConfidenceAlt, 0.3)
+  )
   const [detectingAlt, setDetectingAlt] = useState(false)
+  const [lastDetectionFileAlt, setLastDetectionFileAlt] = useState<File | null>(null)
   const [detectionImageAlt, setDetectionImageAlt] = useState<string | null>(null)
   const [detectionPreviewUrlAlt, setDetectionPreviewUrlAlt] = useState<string | null>(null)
   const [detectionExpandedAlt, setDetectionExpandedAlt] = useState(false)
-  const [showDetectionBoxesAlt, setShowDetectionBoxesAlt] = useState(true)
+  const [showDetectionBoxesAlt, setShowDetectionBoxesAlt] = useState(() =>
+    readFromStorage(STORAGE_KEYS.showDetectionBoxesAlt, true)
+  )
   const [detectionResultsAlt, setDetectionResultsAlt] = useState<DetectionResult[]>([])
   const [hoveredDetectionAlt, setHoveredDetectionAlt] = useState<number | null>(null)
   const [detectionImageSizeAlt, setDetectionImageSizeAlt] = useState<{ width: number; height: number } | null>(null)
   const [detectionErrorAlt, setDetectionErrorAlt] = useState<string | null>(null)
-  const [activePanel, setActivePanel] = useState<'chat' | 'yolo-detection'>('chat')
+  const [bankDetectConfidence, setBankDetectConfidence] = useState(() =>
+    readFromStorage(STORAGE_KEYS.bankDetectConfidence, 0.35)
+  )
+  const [bankDetecting, setBankDetecting] = useState(false)
+  const [bankDetectionImage, setBankDetectionImage] = useState<string | null>(null)
+  const [bankDetectionPreviewUrl, setBankDetectionPreviewUrl] = useState<string | null>(null)
+  const [bankDetectionExpanded, setBankDetectionExpanded] = useState(false)
+  const [bankShowDetectionBoxes, setBankShowDetectionBoxes] = useState(() =>
+    readFromStorage(STORAGE_KEYS.bankShowDetectionBoxes, true)
+  )
+  const [bankDetectionResults, setBankDetectionResults] = useState<DetectionResult[]>([])
+  const [bankDetectionError, setBankDetectionError] = useState<string | null>(null)
+  const [bankDetectionImageSize, setBankDetectionImageSize] = useState<{ width: number; height: number } | null>(
+    null
+  )
+  const [bankFields, setBankFields] = useState<TransactionField[]>([])
+  const [bankDetectionSourceFile, setBankDetectionSourceFile] = useState<File | null>(null)
+  const [bankOcrResult, setBankOcrResult] = useState<BankOcrResult | null>(null)
+  const [bankOcrLang, setBankOcrLang] = useState('eng')
+  const [bankOcrBusy, setBankOcrBusy] = useState(false)
+  const [bankOcrError, setBankOcrError] = useState<string | null>(null)
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
+  const [activePanel, setActivePanel] = useState<'chat' | 'openvoice' | 'image-mcp' | 'yolo-detection' | 'bank-slip'>(() =>
+    readFromStorage(STORAGE_KEYS.activePanel, 'chat')
+  )
+  const [inlineSpeakerState, setInlineSpeakerState] = useState<InlineSpeakerState>({
+    messageId: null,
+    status: 'idle'
+  })
   const [sessionId, setSessionId] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null
     try {
@@ -184,20 +870,89 @@ export function App() {
       return null
     }
   })
+  const [voiceOptions, setVoiceOptions] = useState<VoiceOption[]>([])
+  const [defaultVoiceId, setDefaultVoiceId] = useState<string | null>(null)
+  const [selectedVoice, setSelectedVoice] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null
+    try {
+      return window.localStorage.getItem(STORAGE_KEYS.voice)
+    } catch (err) {
+      console.warn('Failed to read stored voice selection', err)
+      return null
+    }
+  })
+  const [voiceFetchError, setVoiceFetchError] = useState<string | null>(null)
+  const [voicesLoading, setVoicesLoading] = useState(false)
+  const [voicePreviewLoading, setVoicePreviewLoading] = useState(false)
+  const [voicePreviewError, setVoicePreviewError] = useState<string | null>(null)
+  const [speechLanguage, setSpeechLanguage] = useState(() => {
+    if (typeof window === 'undefined') return 'auto'
+    try {
+      return window.localStorage.getItem(STORAGE_KEYS.speechLang) || 'auto'
+    } catch (err) {
+      console.warn('Failed to read stored speech language', err)
+      return 'auto'
+    }
+  })
+  const [browserDetectedLanguage, setBrowserDetectedLanguage] = useState<string | null>(null)
 
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null)
-  const [micMode, setMicMode] = useState<'browser' | 'server'>('browser')
+  const [micMode, setMicMode] = useState<'browser' | 'server'>(() =>
+    readFromStorage(STORAGE_KEYS.micMode, 'browser')
+  )
+  const [referenceRecorder, setReferenceRecorder] = useState<MediaRecorder | null>(null)
+  const [referenceRecording, setReferenceRecording] = useState(false)
+  const [referenceAudioBlob, setReferenceAudioBlob] = useState<Blob | null>(null)
+  const [referenceAudioUrl, setReferenceAudioUrl] = useState<string | null>(null)
+  const [referenceDurationMs, setReferenceDurationMs] = useState(0)
+  const [referenceFilename, setReferenceFilename] = useState('openvoice-reference')
+  const [referenceRecorderError, setReferenceRecorderError] = useState<string | null>(null)
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null)
   const [showCamera, setShowCamera] = useState(false)
   const [attachmentPreview, setAttachmentPreview] = useState<{ src: string; name: string } | null>(
     null
   )
+  const [imagePrompt, setImagePrompt] = useState(() => readFromStorage(STORAGE_KEYS.imagePrompt, ''))
+  const [imageNegativePrompt, setImageNegativePrompt] = useState(() =>
+    readFromStorage(STORAGE_KEYS.imageNegativePrompt, '')
+  )
+  const [imageGuidance, setImageGuidance] = useState(() => readFromStorage(STORAGE_KEYS.imageGuidance, 7))
+  const [imageSteps, setImageSteps] = useState(() => readFromStorage(STORAGE_KEYS.imageSteps, 25))
+  const [imageWidth, setImageWidth] = useState(() => readFromStorage(STORAGE_KEYS.imageWidth, 512))
+  const [imageHeight, setImageHeight] = useState(() => readFromStorage(STORAGE_KEYS.imageHeight, 512))
+  const [imageSeed, setImageSeed] = useState(() => readFromStorage(STORAGE_KEYS.imageSeed, ''))
+  const [imageAccelerator, setImageAccelerator] = useState<'cpu' | 'gpu'>(() => {
+    if (typeof window === 'undefined') return 'gpu'
+    try {
+      const stored = window.localStorage.getItem(STORAGE_KEYS.imageAccelerator)
+      if (stored === 'cpu' || stored === 'gpu') {
+        return stored
+      }
+    } catch (err) {
+      console.warn('Failed to read stored image accelerator', err)
+    }
+    return 'gpu'
+  })
+  const [imageResults, setImageResults] = useState<GeneratedImageResult[]>([])
+  const [imageBusy, setImageBusy] = useState(false)
+  const [imageError, setImageError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const detectFileInputRef = useRef<HTMLInputElement | null>(null)
   const detectFileInputRefAlt = useRef<HTMLInputElement | null>(null)
+  const detectFileInputRefBank = useRef<HTMLInputElement | null>(null)
+  const chatMessagesRef = useRef<HTMLDivElement | null>(null)
+  const statusWrapperRef = useRef<HTMLDivElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const textInputRef = useRef<HTMLTextAreaElement | null>(null)
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null)
+  const audioEventCleanupRef = useRef<(() => void) | null>(null)
+  const speechUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
+  const inlinePlaybackModeRef = useRef<InlinePlaybackMode | null>(null)
+  const referenceChunksRef = useRef<BlobPart[]>([])
+  const referenceTimerRef = useRef<number | null>(null)
+  const referenceStartRef = useRef<number>(0)
+  const referenceRecorderRef = useRef<MediaRecorder | null>(null)
+  const referenceStreamRef = useRef<MediaStream | null>(null)
 
   const pendingPreviewRef = useRef<PendingAttachment[]>([])
   const attachmentCounterRef = useRef(1)
@@ -233,12 +988,48 @@ export function App() {
   }, [detectionPreviewUrlAlt])
 
   useEffect(() => {
+    return () => {
+      if (bankDetectionPreviewUrl && bankDetectionPreviewUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(bankDetectionPreviewUrl)
+      }
+    }
+  }, [bankDetectionPreviewUrl])
+
+  useEffect(() => {
     setHoveredDetectionAlt(null)
   }, [detectionResultsAlt])
 
   useEffect(() => {
     setHoveredDetectionAlt(null)
   }, [secondaryDetectionTargets])
+
+  useEffect(() => {
+    return () => {
+      if (referenceTimerRef.current) {
+        window.clearInterval(referenceTimerRef.current)
+        referenceTimerRef.current = null
+      }
+      if (referenceRecorderRef.current && referenceRecorderRef.current.state !== 'inactive') {
+        try {
+          referenceRecorderRef.current.stop()
+        } catch (err) {
+          console.warn('Reference recorder cleanup error', err)
+        }
+      }
+      if (referenceStreamRef.current) {
+        referenceStreamRef.current.getTracks().forEach((track) => track.stop())
+        referenceStreamRef.current = null
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (referenceAudioUrl) {
+        URL.revokeObjectURL(referenceAudioUrl)
+      }
+    }
+  }, [referenceAudioUrl])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -277,25 +1068,106 @@ export function App() {
   const stopSpeech = () => {
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel()
+      speechUtteranceRef.current = null
     }
+    if (inlinePlaybackModeRef.current === 'speech') {
+      inlinePlaybackModeRef.current = null
+    }
+    setInlineSpeakerState({ messageId: null, status: 'idle' })
   }
 
-  const speak = (text: string) => {
+  const pauseSpeechPlayback = () => {
+    if (!('speechSynthesis' in window)) return false
+    const synth = window.speechSynthesis
+    if (synth.speaking && !synth.paused) {
+      synth.pause()
+      return true
+    }
+    return false
+  }
+
+  const resumeSpeechPlayback = () => {
+    if (!('speechSynthesis' in window)) return false
+    const synth = window.speechSynthesis
+    if (synth.speaking && synth.paused) {
+      synth.resume()
+      return true
+    }
+    return false
+  }
+
+  const speak = (text: string, lifecycle?: SpeakLifecycle) => {
     if (!('speechSynthesis' in window)) return
     stopSpeech()
     const utter = new SpeechSynthesisUtterance(text)
+    speechUtteranceRef.current = utter
+    inlinePlaybackModeRef.current = 'speech'
+
+    if (lifecycle?.onStart) {
+      utter.onstart = lifecycle.onStart
+    }
+    utter.onend = () => {
+      if (speechUtteranceRef.current === utter) {
+        speechUtteranceRef.current = null
+      }
+      if (inlinePlaybackModeRef.current === 'speech') {
+        inlinePlaybackModeRef.current = null
+      }
+      lifecycle?.onEnd?.()
+    }
+    utter.onerror = () => {
+      if (speechUtteranceRef.current === utter) {
+        speechUtteranceRef.current = null
+      }
+      if (inlinePlaybackModeRef.current === 'speech') {
+        inlinePlaybackModeRef.current = null
+      }
+      lifecycle?.onError?.()
+    }
+
     window.speechSynthesis.speak(utter)
   }
 
   const stopAudioPlayback = () => {
+    if (audioEventCleanupRef.current) {
+      audioEventCleanupRef.current()
+      audioEventCleanupRef.current = null
+    }
     if (audioPlayerRef.current) {
       audioPlayerRef.current.pause()
       audioPlayerRef.current.src = ''
       audioPlayerRef.current = null
     }
+    if (inlinePlaybackModeRef.current === 'audio') {
+      inlinePlaybackModeRef.current = null
+    }
   }
 
-  const playResponseAudio = (audioPath?: string) => {
+  const pauseAudioPlayback = () => {
+    const player = audioPlayerRef.current
+    if (player && !player.paused) {
+      player.pause()
+      return true
+    }
+    return false
+  }
+
+  const resumeAudioPlayback = () => {
+    const player = audioPlayerRef.current
+    if (player && player.paused) {
+      const resumed = player.play()
+      if (resumed && typeof resumed.then === 'function') {
+        resumed.catch((err) => {
+          console.error('Audio resume failed', err)
+          stopAudioPlayback()
+        })
+      }
+      return true
+    }
+    return false
+  }
+
+  const playResponseAudio = (audioPath?: string, options?: PlayAudioOptions) => {
     if (!audioPath) return false
     const absolute = absoluteServerUrl(audioPath)
     if (!absolute) return false
@@ -304,9 +1176,42 @@ export function App() {
       stopAudioPlayback()
       const player = new Audio(absolute)
       audioPlayerRef.current = player
-      void player.play().catch((err) => {
-        console.error('Audio playback failed', err)
-      })
+
+      const handlePlaying = () => {
+        options?.onStart?.()
+      }
+
+      const handleEnded = () => {
+        options?.onEnded?.()
+        cleanup()
+      }
+
+      const handleError = () => {
+        options?.onEnded?.()
+        cleanup()
+      }
+
+      const cleanup = () => {
+        player.removeEventListener('playing', handlePlaying)
+        player.removeEventListener('ended', handleEnded)
+        player.removeEventListener('error', handleError)
+        if (audioEventCleanupRef.current === cleanup) {
+          audioEventCleanupRef.current = null
+        }
+      }
+
+      player.addEventListener('playing', handlePlaying)
+      player.addEventListener('ended', handleEnded)
+      player.addEventListener('error', handleError)
+      audioEventCleanupRef.current = cleanup
+
+      const playPromise = player.play()
+      if (playPromise && typeof playPromise.then === 'function') {
+        playPromise.catch((err) => {
+          console.error('Audio playback failed', err)
+          cleanup()
+        })
+      }
       return true
     } catch (err) {
       console.error('Audio playback setup failed', err)
@@ -314,13 +1219,95 @@ export function App() {
     }
   }
 
-  const addMessage = (msg: Omit<ChatMessage, 'id' | 'time'>) => {
+  const synthesizeInlineVoice = async (messageId: string, text: string, voiceId: string) => {
+    try {
+      const response = await fetch(PREVIEW_VOICE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          voiceId,
+          accelerator: acceleratorMode,
+          text: text.slice(0, 800)
+        })
+      })
+      if (!response.ok) {
+        const detail = await response.text()
+        throw new Error(detail || 'inline_voice_request_failed')
+      }
+      const data = await response.json()
+      if (!data?.audioUrl) {
+        throw new Error('inline_voice_audio_missing')
+      }
+
+      inlinePlaybackModeRef.current = 'audio'
+      const started = playResponseAudio(data.audioUrl, {
+        onStart: () => {
+          setInlineSpeakerState({ messageId, status: 'playing' })
+        },
+        onEnded: () => {
+          inlinePlaybackModeRef.current = null
+          setInlineSpeakerState((prev) =>
+            prev.messageId === messageId ? { messageId: null, status: 'idle' } : prev
+          )
+        }
+      })
+
+      if (!started) {
+        inlinePlaybackModeRef.current = null
+        throw new Error('inline_voice_play_failed')
+      }
+      return true
+    } catch (err) {
+      inlinePlaybackModeRef.current = null
+      setInlineSpeakerState((prev) =>
+        prev.messageId === messageId ? { messageId: null, status: 'idle' } : prev
+      )
+      console.error('Inline voice playback failed', err)
+      return false
+    }
+  }
+
+  const previewVoice = useCallback(async () => {
+    if (!selectedVoice) {
+      setVoicePreviewError('Select a voice first')
+      return
+    }
+    setVoicePreviewLoading(true)
+    setVoicePreviewError(null)
+    try {
+      const response = await fetch(PREVIEW_VOICE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voiceId: selectedVoice, accelerator: acceleratorMode })
+      })
+      if (!response.ok) {
+        const detail = await response.text()
+        throw new Error(detail || 'Preview failed')
+      }
+      const data = await response.json()
+      if (!data?.audioUrl) {
+        throw new Error('Preview audio unavailable')
+      }
+      playResponseAudio(data.audioUrl)
+    } catch (err: any) {
+      setVoicePreviewError(err?.message || 'Preview failed')
+    } finally {
+      setVoicePreviewLoading(false)
+    }
+  }, [selectedVoice, acceleratorMode])
+
+  const addMessage = (msg: Omit<ChatMessage, 'id' | 'time'> & { voiceId?: string | null }) => {
+    const resolvedVoiceId =
+      msg.role === 'assistant'
+        ? msg.voiceId || selectedVoice || selectedVoiceInfo?.id || null
+        : msg.voiceId || null
     setMessages((prev) => [
       ...prev,
       {
-        id: `${Date.now()}-${prev.length}`,
-        time: nowString(),
-        ...msg
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        time: new Date().toLocaleTimeString(),
+        ...msg,
+        voiceId: resolvedVoiceId || undefined
       }
     ])
   }
@@ -341,21 +1328,100 @@ export function App() {
     }
   }
 
+  const healthServices = useMemo<HealthServiceEntry[]>(() => {
+    if (!Array.isArray(healthInfo?.services)) {
+      return []
+    }
+
+    return (healthInfo.services as HealthServiceEntry[]).filter(
+      (svc): svc is HealthServiceEntry => !!svc && typeof svc.name === 'string'
+    )
+  }, [healthInfo])
+
+  const providerStatuses = useMemo<Record<LlmProvider, { available: boolean; label: string }>>(() => {
+    const formatStatusLabel = (status?: string) => {
+      if (!status || status === 'unknown') return 'Unknown'
+      if (status === 'ok') return 'Available'
+      return status
+        .split('_')
+        .map((chunk) => chunk.charAt(0).toUpperCase() + chunk.slice(1))
+        .join(' ')
+    }
+
+    if (!healthServices.length) {
+      return {
+        ollama: { available: true, label: 'Available' },
+        anthropic: { available: true, label: 'Unknown' },
+        openai: { available: true, label: 'Unknown' }
+      }
+    }
+
+    const byName = new Map<string, HealthServiceEntry>(healthServices.map((svc) => [svc.name, svc]))
+    const statusFor = (name: string) => byName.get(name)?.status || 'unknown'
+    const isOk = (status?: string) => status === 'ok'
+
+    const ollamaCpuStatus = statusFor('ollama')
+    const ollamaGpuStatus = statusFor('ollamaGpu')
+    const ollamaAvailable = [ollamaCpuStatus, ollamaGpuStatus].some(isOk)
+    const ollamaLabel = ollamaAvailable
+      ? 'Available'
+      : formatStatusLabel(ollamaCpuStatus !== 'unknown' ? ollamaCpuStatus : ollamaGpuStatus)
+
+    const anthropicStatus = statusFor('anthropic')
+    const openaiStatus = statusFor('openai')
+
+    return {
+      ollama: { available: ollamaAvailable || !healthServices.length, label: ollamaLabel || 'Unknown' },
+      anthropic: { available: isOk(anthropicStatus), label: formatStatusLabel(anthropicStatus) },
+      openai: { available: isOk(openaiStatus), label: formatStatusLabel(openaiStatus) }
+    }
+  }, [healthServices])
+
+  useEffect(() => {
+    const current = providerStatuses[llmProvider]
+    if (current && !current.available) {
+      const fallback = LLM_PROVIDER_OPTIONS.find((option) => providerStatuses[option.value]?.available)
+      if (fallback && fallback.value !== llmProvider) {
+        setLlmProvider(fallback.value)
+      }
+    }
+  }, [llmProvider, providerStatuses])
+
   useEffect(() => {
     fetchHealth()
   }, [])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.llmProvider, llmProvider)
+  }, [llmProvider])
+
+  useEffect(() => {
+    if (!statusExpanded) return
+
+    const handleClickAway = (event: MouseEvent) => {
+      if (!statusWrapperRef.current) return
+      if (statusWrapperRef.current.contains(event.target as Node)) return
+      setStatusExpanded(false)
+    }
+
+    document.addEventListener('mousedown', handleClickAway)
+    return () => document.removeEventListener('mousedown', handleClickAway)
+  }, [statusExpanded])
 
   useEffect(() => {
     setClipboardSupported(typeof navigator !== 'undefined' && !!navigator.clipboard?.read)
   }, [])
 
   useEffect(() => {
-    if (typeof window === 'undefined') return
-    try {
-      window.localStorage.setItem(STORAGE_KEYS.accelerator, acceleratorMode)
-    } catch (err) {
-      console.error('Failed to persist acceleratorMode', err)
-    }
+    writeToStorage(STORAGE_KEYS.llmModel, llmModel)
+  }, [llmModel])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.whisperModel, whisperModel)
+  }, [whisperModel])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.accelerator, acceleratorMode)
   }, [acceleratorMode])
 
   useEffect(() => {
@@ -385,6 +1451,175 @@ export function App() {
     }
   }, [sessionId])
 
+  useEffect(() => {
+    if (selectedVoice) {
+      writeToStorage(STORAGE_KEYS.voice, selectedVoice)
+    } else if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(STORAGE_KEYS.voice)
+    }
+  }, [selectedVoice])
+
+  useEffect(() => {
+    if (speechLanguage) {
+      writeToStorage(STORAGE_KEYS.speechLang, speechLanguage)
+    }
+  }, [speechLanguage])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.detectConfidence, detectConfidence)
+  }, [detectConfidence])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.detectConfidenceAlt, detectConfidenceAlt)
+  }, [detectConfidenceAlt])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.bankDetectConfidence, bankDetectConfidence)
+  }, [bankDetectConfidence])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.showDetectionBoxes, showDetectionBoxes)
+  }, [showDetectionBoxes])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.showDetectionBoxesAlt, showDetectionBoxesAlt)
+  }, [showDetectionBoxesAlt])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.bankShowDetectionBoxes, bankShowDetectionBoxes)
+  }, [bankShowDetectionBoxes])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.detectionTargets, secondaryDetectionTargets)
+  }, [secondaryDetectionTargets])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.micMode, micMode)
+  }, [micMode])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.activePanel, activePanel)
+  }, [activePanel])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.imagePrompt, imagePrompt)
+  }, [imagePrompt])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.imageNegativePrompt, imageNegativePrompt)
+  }, [imageNegativePrompt])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.imageGuidance, imageGuidance)
+  }, [imageGuidance])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.imageSteps, imageSteps)
+  }, [imageSteps])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.imageWidth, imageWidth)
+  }, [imageWidth])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.imageHeight, imageHeight)
+  }, [imageHeight])
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.imageSeed, imageSeed)
+  }, [imageSeed])
+
+  useEffect(() => {
+    let cancelled = false
+    const loadVoices = async () => {
+      setVoicesLoading(true)
+      try {
+        const res = await fetch(VOICES_URL)
+        if (!res.ok) {
+          const detail = await res.text()
+          throw new Error(detail || 'Failed to load voices')
+        }
+        const data = await res.json()
+        if (cancelled) return
+        const incomingVoices: VoiceOption[] = Array.isArray(data?.voices) ? data.voices : []
+        setVoiceOptions(incomingVoices)
+        setDefaultVoiceId(typeof data?.defaultVoice === 'string' ? data.defaultVoice : null)
+        setVoiceFetchError(null)
+      } catch (err: any) {
+        if (cancelled) return
+        console.error('Voice fetch failed', err)
+        setVoiceFetchError(err?.message || 'Failed to load voices')
+        setVoiceOptions([])
+      } finally {
+        if (!cancelled) {
+          setVoicesLoading(false)
+        }
+      }
+    }
+
+    loadVoices().catch((err) => {
+      console.error('Voice fetch unexpected error', err)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!voiceOptions.length) {
+      return
+    }
+    if (selectedVoice && voiceOptions.some((voice) => voice.id === selectedVoice)) {
+      return
+    }
+    const fallback =
+      (defaultVoiceId && voiceOptions.find((voice) => voice.id === defaultVoiceId)?.id) || voiceOptions[0].id
+    setSelectedVoice(fallback)
+  }, [voiceOptions, defaultVoiceId, selectedVoice])
+
+  useEffect(() => {
+    if (!voiceOptions.length) return
+    if (speechLanguage === 'th') {
+      const thaiVoice = voiceOptions.find((voice) => voice.id.toLowerCase().includes('th'))
+      if (thaiVoice && thaiVoice.id !== selectedVoice) {
+        setSelectedVoice(thaiVoice.id)
+      }
+    }
+  }, [speechLanguage, voiceOptions, selectedVoice])
+
+  useEffect(() => {
+    if (activePanel !== 'chat') {
+      setShowScrollToBottom(false)
+      return
+    }
+
+    const container = chatMessagesRef.current
+    if (!container) return
+
+    const handleScroll = () => {
+      const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+      setShowScrollToBottom(distanceFromBottom > 120)
+    }
+
+    container.addEventListener('scroll', handleScroll)
+    handleScroll()
+
+    return () => {
+      container.removeEventListener('scroll', handleScroll)
+    }
+  }, [messages.length, replying, activePanel])
+
+  useEffect(() => {
+    if (activePanel !== 'chat') return
+    const container = chatMessagesRef.current
+    if (!container) return
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+    if (distanceFromBottom <= 160) {
+      scrollChatToBottom(true)
+    }
+  }, [messages.length, replying, activePanel])
+
   const runWithAcceleratorFallback = async <T,>(
     task: (acc: 'cpu' | 'gpu') => Promise<T>,
     preferred: 'cpu' | 'gpu'
@@ -408,7 +1643,22 @@ export function App() {
     attachments.forEach((att, idx) => {
       const reference = att.order ?? idx + 1
       const name = att.label?.trim() ? att.label.trim() : `Attachment ${reference}`
-      lines.push(`- ${name}: ${att.url}`)
+      const typeLabel = att.type ? ` (${att.type})` : ''
+      lines.push(`- ${name}${typeLabel}`)
+      if (att.url) {
+        lines.push(`  URL: ${att.url}`)
+      }
+      if (att.mimetype || typeof att.size === 'number') {
+        const parts: string[] = []
+        if (att.mimetype) parts.push(att.mimetype)
+        if (typeof att.size === 'number') parts.push(`${att.size} bytes`)
+        if (parts.length) {
+          lines.push(`  Info: ${parts.join(', ')}`)
+        }
+      }
+      if (att.base64) {
+        lines.push(`  DataURI: ${att.base64}`)
+      }
       if (att.prompt?.trim()) {
         lines.push(`  Prompt: ${att.prompt.trim()}`)
       }
@@ -433,7 +1683,7 @@ export function App() {
 
   const sendMessage = async (
     text: string,
-    opts?: { accelerator?: 'cpu' | 'gpu'; attachments?: UploadedAttachment[] }
+    opts?: { accelerator?: 'cpu' | 'gpu'; attachments?: UploadedAttachment[]; sttLanguage?: string | null }
   ) => {
     if (replying) return
 
@@ -458,6 +1708,7 @@ export function App() {
       text: trimmed,
       model: llmModel,
       accelerator: targetAccelerator,
+      sttLanguage: opts?.sttLanguage || null,
       attachments: attachmentsWithIds,
       attachmentType: firstAttachment?.type,
       attachmentName: firstAttachment?.name,
@@ -476,7 +1727,9 @@ export function App() {
             model: llmModel,
             accelerator: acc,
             sessionId,
-            history: historyPayload
+            history: historyPayload,
+            provider: llmProvider,
+            voice: selectedVoice && voiceOptions.some((voice) => voice.id === selectedVoice) ? selectedVoice : undefined
           })
         })
         if (!res.ok) {
@@ -564,6 +1817,8 @@ export function App() {
     void sendMessage(message.text, { accelerator: acceleratorMode })
   }
 
+  const getLanguageLabel = (code?: string | null) => getSpeechLanguageLabel(code)
+
   const startListening = () => {
     if (!SpeechRecognitionImpl) {
       alert('SpeechRecognition not supported in this browser')
@@ -571,16 +1826,24 @@ export function App() {
     }
 
     stopSpeech()
+    setBrowserDetectedLanguage(null)
 
     const Recog = SpeechRecognitionImpl
     const recognition = new Recog()
-    recognition.lang = 'en-US' // change to 'th-TH' if you prefer
+    const recognitionLang = getSpeechRecognitionCode(speechLanguage)
+    if (speechLanguage === 'auto') {
+      // Let the browser pick the best language based on user/system settings.
+      recognition.lang = ''
+    } else {
+      recognition.lang = recognitionLang || 'en-US'
+    }
     recognition.interimResults = true
     recognition.continuous = false
 
     setListening(true)
 
     let finalText = ''
+    let detectedLang: string | null = null
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
       let text = ''
@@ -588,6 +1851,13 @@ export function App() {
         text += event.results[i][0].transcript
       }
       finalText = text
+      const latest = event.results[event.results.length - 1]?.[0] as SpeechRecognitionResult['0'] & {
+        language?: string
+      }
+      if (latest && typeof (latest as any).language === 'string') {
+        detectedLang = normalizeSpeechLanguageValue((latest as any).language)
+        setBrowserDetectedLanguage(detectedLang)
+      }
     }
 
     recognition.onerror = (event) => {
@@ -599,7 +1869,8 @@ export function App() {
       setListening(false)
       if (finalText.trim()) {
         setInput(finalText)
-        void sendMessage(finalText)
+        void sendMessage(finalText, { sttLanguage: detectedLang || browserDetectedLanguage })
+        setBrowserDetectedLanguage(null)
       }
     }
 
@@ -619,6 +1890,13 @@ export function App() {
         formData.append('model', llmModel)
         formData.append('whisper_model', whisperModel)
         formData.append('accelerator', acc)
+        formData.append('provider', llmProvider)
+        if (selectedVoice && voiceOptions.some((voice) => voice.id === selectedVoice)) {
+          formData.append('voice', selectedVoice)
+        }
+        if (speechLanguage) {
+          formData.append('language', speechLanguage)
+        }
 
         const res = await fetch(API_AUDIO_URL, {
           method: 'POST',
@@ -647,6 +1925,7 @@ export function App() {
       }
 
       const usedWhisperModel = (data && data.model) || whisperModel
+      const detectedLanguage = (data && data.language) || (speechLanguage !== 'auto' ? speechLanguage : null)
       if (data.error) {
         console.error('audio endpoint error:', data)
         addMessage({ role: 'system', text: `Audio flow error: ${data.error}`, model: llmModel })
@@ -659,6 +1938,7 @@ export function App() {
           text: data.transcript,
           model: llmModel,
           sttModel: usedWhisperModel,
+          sttLanguage: detectedLanguage,
           accelerator: acceleratorUsed
         })
       }
@@ -669,6 +1949,7 @@ export function App() {
           text: data.reply,
           model: llmModel,
           sttModel: usedWhisperModel,
+          sttLanguage: detectedLanguage,
           accelerator: acceleratorUsed
         })
         const played = playResponseAudio(data.audioUrl)
@@ -725,6 +2006,113 @@ export function App() {
     }
   }
 
+  const stopReferenceTimer = () => {
+    if (referenceTimerRef.current) {
+      window.clearInterval(referenceTimerRef.current)
+      referenceTimerRef.current = null
+    }
+  }
+
+  const clearReferenceAudio = () => {
+    stopReferenceTimer()
+    referenceChunksRef.current = []
+    if (referenceAudioUrl) {
+      URL.revokeObjectURL(referenceAudioUrl)
+    }
+    setReferenceAudioBlob(null)
+    setReferenceAudioUrl(null)
+    setReferenceDurationMs(0)
+  }
+
+  const startReferenceRecording = async () => {
+    if (referenceRecording) return
+    setReferenceRecorderError(null)
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setReferenceRecorderError('getUserMedia is not supported in this browser')
+      return
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const recorder = new MediaRecorder(stream)
+      referenceChunksRef.current = []
+      referenceStartRef.current = Date.now()
+      setReferenceDurationMs(0)
+      if (referenceAudioUrl) {
+        URL.revokeObjectURL(referenceAudioUrl)
+        setReferenceAudioUrl(null)
+      }
+      setReferenceAudioBlob(null)
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          referenceChunksRef.current.push(event.data)
+        }
+      }
+
+      recorder.onstop = () => {
+        stopReferenceTimer()
+        setReferenceRecording(false)
+        setReferenceRecorder(null)
+        referenceRecorderRef.current = null
+        if (referenceStreamRef.current) {
+          referenceStreamRef.current.getTracks().forEach((track) => track.stop())
+          referenceStreamRef.current = null
+        }
+        const chunks = referenceChunksRef.current.slice()
+        referenceChunksRef.current = []
+        if (!chunks.length) {
+          setReferenceRecorderError('No audio captured')
+          return
+        }
+        const mimeType = recorder.mimeType || 'audio/webm'
+        const blob = new Blob(chunks, { type: mimeType })
+        const url = URL.createObjectURL(blob)
+        setReferenceAudioBlob(blob)
+        setReferenceAudioUrl(url)
+        setReferenceDurationMs(Date.now() - referenceStartRef.current)
+      }
+
+      recorder.onerror = () => {
+        setReferenceRecorderError('Recorder error occurred')
+      }
+
+      referenceStreamRef.current = stream
+      referenceRecorderRef.current = recorder
+      setReferenceRecorder(recorder)
+      setReferenceRecording(true)
+      stopReferenceTimer()
+      referenceTimerRef.current = window.setInterval(() => {
+        setReferenceDurationMs(Date.now() - referenceStartRef.current)
+      }, 200)
+      recorder.start()
+    } catch (err: any) {
+      console.error('Reference recording failed', err)
+      setReferenceRecorderError(err?.message || 'Unable to access microphone')
+    }
+  }
+
+  const stopReferenceRecording = () => {
+    if (referenceRecorderRef.current && referenceRecorderRef.current.state !== 'inactive') {
+      referenceRecorderRef.current.stop()
+    }
+  }
+
+  const downloadReferenceAudio = () => {
+    if (!referenceAudioBlob) return
+    const sanitizedName = referenceFilename.trim().replace(/[^a-z0-9._-]/gi, '_') || 'openvoice-reference'
+    const link = document.createElement('a')
+    const url = referenceAudioUrl || URL.createObjectURL(referenceAudioBlob)
+    link.href = url
+    link.download = `${sanitizedName}.webm`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    if (!referenceAudioUrl) {
+      URL.revokeObjectURL(url)
+    }
+  }
+
   const stopAllAudio = () => {
     stopSpeech()
     stopAudioPlayback()
@@ -736,6 +2124,28 @@ export function App() {
   }
 
   const closeAttachmentPreview = () => setAttachmentPreview(null)
+
+  const scrollChatToBottom = (smooth = false) => {
+    const container = chatMessagesRef.current
+    if (!container) return
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: smooth ? 'smooth' : 'auto'
+    })
+  }
+
+  useEffect(() => {
+    if (!attachmentPreview) return
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeAttachmentPreview()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [attachmentPreview])
 
   const ensureFileHasName = (file: File) => {
     if (file.name && file.name.trim()) {
@@ -755,8 +2165,27 @@ export function App() {
     if (!pathFromServer) return ''
     if (/^https?:\/\//i.test(pathFromServer)) return pathFromServer
     const normalized = pathFromServer.startsWith('/') ? pathFromServer : `/${pathFromServer}`
-    return `${API_BASE}${normalized}`
+    if (typeof window === 'undefined') return normalized
+    const base = window.location.origin.replace(/\/$/, '')
+    return `${base}${normalized}`
   }
+
+  const fileToDataUrl = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const result = reader.result
+        if (typeof result === 'string') {
+          resolve(result)
+        } else {
+          reject(new Error('Failed to read attachment as data URL'))
+        }
+      }
+      reader.onerror = () => {
+        reject(reader.error || new Error('Attachment read error'))
+      }
+      reader.readAsDataURL(file)
+    })
 
   const revokeAttachmentPreview = (att: PendingAttachment) => {
     if (att.preview && att.preview.startsWith('blob:')) {
@@ -774,7 +2203,9 @@ export function App() {
       preview: file.type?.startsWith('image/') ? URL.createObjectURL(file) : undefined,
       label: '',
       order,
-      prompt: ''
+      prompt: '',
+      mimetype: file.type,
+      size: file.size
     }
 
     setPendingAttachments((prev) => [...prev, pending])
@@ -793,6 +2224,58 @@ export function App() {
   const updatePendingAttachmentLabel = (id: string, label: string) => {
     setPendingAttachments((prev) =>
       prev.map((att) => (att.id === id ? { ...att, label } : att))
+    )
+  }
+
+  const renderBankDetectionBoxes = () => {
+    if (
+      !bankShowDetectionBoxes ||
+      !bankDetectionImage ||
+      !bankDetectionImageSize ||
+      bankDetectionResults.length === 0
+    ) {
+      return null
+    }
+
+    const width = bankDetectionImageSize.width || 1
+    const height = bankDetectionImageSize.height || 1
+
+    return (
+      <div className="vision-overlay">
+        {bankDetectionResults.map((det, idx) => {
+          if (!Array.isArray(det.bbox) || det.bbox.length !== 4) return null
+          const [rawX1, rawY1, rawX2, rawY2] = det.bbox
+
+          const x1 = Math.max(0, Math.min(rawX1, width))
+          const y1 = Math.max(0, Math.min(rawY1, height))
+          const x2 = Math.max(x1, Math.min(rawX2, width))
+          const y2 = Math.max(y1, Math.min(rawY2, height))
+
+          const boxWidth = Math.max(1, x2 - x1)
+          const boxHeight = Math.max(1, y2 - y1)
+
+          const leftPct = (x1 / width) * 100
+          const topPct = (y1 / height) * 100
+          const widthPct = (boxWidth / width) * 100
+          const heightPct = (boxHeight / height) * 100
+
+          const label = det.class_name || (typeof det.class_id === 'number' ? `Class ${det.class_id}` : `Detection ${idx + 1}`)
+          const confidence = typeof det.confidence === 'number' ? `${(det.confidence * 100).toFixed(0)}%` : null
+
+          return (
+            <div
+              key={`${label}-${idx}`}
+              className="vision-box"
+              style={{ left: `${leftPct}%`, top: `${topPct}%`, width: `${widthPct}%`, height: `${heightPct}%` }}
+            >
+              <span className="vision-box-label">
+                {label}
+                {confidence ? <span className="vision-box-conf">{confidence}</span> : null}
+              </span>
+            </div>
+          )
+        })}
+      </div>
     )
   }
 
@@ -834,6 +2317,7 @@ export function App() {
     const uploaded: UploadedAttachment[] = []
     try {
       for (const att of attachments) {
+        const dataUrl = await fileToDataUrl(att.file)
         const formData = new FormData()
         formData.append('file', att.file, att.name || att.file.name)
 
@@ -860,7 +2344,10 @@ export function App() {
           url: attachmentUrl,
           label: att.label,
           order: att.order,
-          prompt: att.prompt
+          prompt: att.prompt,
+          base64: dataUrl,
+          mimetype: att.mimetype || data.mimetype || att.file.type,
+          size: typeof att.size === 'number' ? att.size : data.size
         })
 
         removePendingAttachment(att.id)
@@ -881,8 +2368,21 @@ export function App() {
     e.target.value = ''
   }
 
+  const handleRedetectPrimary = () => {
+    if (detecting || !lastDetectionFile) return
+    setDetectionError(null)
+    void handleDetectFile(lastDetectionFile)
+  }
+
+  const handleRedetectLinked = () => {
+    if (detectingAlt || !lastDetectionFileAlt) return
+    setDetectionErrorAlt(null)
+    void handleDetectFileAlt(lastDetectionFileAlt)
+  }
+
   const handleDetectFile = async (rawFile: File) => {
     const file = ensureFileHasName(rawFile)
+    setLastDetectionFile(file)
     const formData = new FormData()
     formData.append('image', file, file.name)
     formData.append('confidence', detectConfidence.toString())
@@ -937,8 +2437,120 @@ export function App() {
     e.target.value = ''
   }
 
+  const runBankOcr = useCallback(
+    async (file: File, lang: string) => {
+      setBankOcrBusy(true)
+      setBankOcrError(null)
+      try {
+        const formData = new FormData()
+        formData.append('image', file, file.name)
+        formData.append('lang', lang)
+
+        const response = await fetch(OCR_URL, {
+          method: 'POST',
+          body: formData
+        })
+
+        if (!response.ok) {
+          const detail = await response.text()
+          throw new Error(detail || 'OCR request failed')
+        }
+
+        const data = await response.json()
+        const normalized: BankOcrResult = {
+          text: typeof data?.text === 'string' ? data.text.trim() : '',
+          lang: typeof data?.lang === 'string' ? data.lang : lang,
+          confidence: typeof data?.confidence === 'number' ? data.confidence : null,
+          lines: mapOcrSpans(data?.lines, 'ocr-line'),
+          words: mapOcrSpans(data?.words, 'ocr-word')
+        }
+
+        setBankOcrResult(normalized)
+      } catch (err: any) {
+        console.error('runBankOcr failed', err)
+        setBankOcrError(err?.message || 'OCR failed')
+      } finally {
+        setBankOcrBusy(false)
+      }
+    },
+    []
+  )
+
+  const handleBankDetectFile = async (rawFile: File) => {
+    const file = ensureFileHasName(rawFile)
+    const formData = new FormData()
+    formData.append('image', file, file.name)
+    formData.append('confidence', bankDetectConfidence.toString())
+
+    setBankDetecting(true)
+    setBankDetectionError(null)
+    setBankDetectionSourceFile(file)
+    setBankOcrResult(null)
+    setBankOcrError(null)
+
+    try {
+      const res = await fetch(DETECT_URL, {
+        method: 'POST',
+        body: formData
+      })
+
+      if (!res.ok) {
+        const detail = await res.text()
+        throw new Error(detail || 'Detection failed')
+      }
+
+      const data = await res.json()
+      const imageData = typeof data?.image === 'string' && data.image ? data.image : null
+      const detections = Array.isArray(data?.detections) ? (data.detections as DetectionResult[]) : []
+
+      setBankDetectionImage(imageData)
+      setBankDetectionResults(detections)
+      setBankDetectionPreviewUrl((prev) => {
+        if (imageData && prev && prev.startsWith('blob:')) {
+          URL.revokeObjectURL(prev)
+        }
+        return imageData || prev || null
+      })
+    } catch (err: any) {
+      console.error('Bank detection failed', err)
+      setBankDetectionError(err?.message || 'Detection failed')
+      setBankDetectionImage(null)
+      setBankDetectionResults([])
+      setBankFields([])
+    } finally {
+      setBankDetecting(false)
+      if (detectFileInputRefBank.current) {
+        detectFileInputRefBank.current.value = ''
+      }
+    }
+  }
+
+  const handleDetectFileChangeBank = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) {
+      setBankDetectionImage(null)
+      setBankDetectionResults([])
+      setBankDetectionError(null)
+      setBankDetectionExpanded(false)
+      setBankShowDetectionBoxes(true)
+      setBankDetectionImageSize(null)
+      setBankFields([])
+      setBankDetectionSourceFile(null)
+      setBankOcrResult(null)
+      setBankOcrError(null)
+      setBankOcrBusy(false)
+      setBankDetectionPreviewUrl((prev) => {
+        if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev)
+        return URL.createObjectURL(file)
+      })
+      void handleBankDetectFile(file)
+    }
+    e.target.value = ''
+  }
+
   const handleDetectFileAlt = async (rawFile: File) => {
     const file = ensureFileHasName(rawFile)
+    setLastDetectionFileAlt(file)
     const formData = new FormData()
     formData.append('image', file, file.name)
     formData.append('confidence', detectConfidenceAlt.toString())
@@ -1079,6 +2691,98 @@ export function App() {
     stopCamera()
   }
 
+  const resetImageForm = () => {
+    setImagePrompt('')
+    setImageNegativePrompt('')
+    setImageGuidance(7)
+    setImageSteps(25)
+    setImageWidth(512)
+    setImageHeight(512)
+    setImageSeed('')
+    setImageError(null)
+  }
+
+  const handleReuseImagePrompt = (result: GeneratedImageResult) => {
+    setImagePrompt(result.prompt || '')
+    setImageNegativePrompt(result.negative_prompt || '')
+    if (typeof result.guidance_scale === 'number') {
+      setImageGuidance(clampNumeric(result.guidance_scale, IMAGE_MIN_GUIDANCE, IMAGE_MAX_GUIDANCE))
+    }
+    if (typeof result.num_inference_steps === 'number') {
+      setImageSteps(clampNumeric(result.num_inference_steps, IMAGE_MIN_STEPS, IMAGE_MAX_STEPS))
+    }
+    if (typeof result.width === 'number') {
+      setImageWidth(normalizeImageDimension(result.width))
+    }
+    if (typeof result.height === 'number') {
+      setImageHeight(normalizeImageDimension(result.height))
+    }
+    if (typeof result.seed === 'number') {
+      setImageSeed(String(result.seed))
+    }
+    setActivePanel('image-mcp')
+  }
+
+  const handleDownloadImageResult = (result: GeneratedImageResult) => {
+    const safePrompt = safeFilename(result.prompt || 'image', 'image')
+    downloadBase64File(result.image_base64, `${safePrompt}-${result.width}x${result.height}.png`)
+  }
+
+  const handleGenerateImage = async () => {
+    const trimmedPrompt = imagePrompt.trim()
+    if (!trimmedPrompt) {
+      setImageError('Prompt is required')
+      return
+    }
+
+    const payload: Record<string, unknown> = {
+      prompt: trimmedPrompt,
+      guidance_scale: clampNumeric(Number(imageGuidance) || 7, IMAGE_MIN_GUIDANCE, IMAGE_MAX_GUIDANCE),
+      num_inference_steps: clampNumeric(Number(imageSteps) || 25, IMAGE_MIN_STEPS, IMAGE_MAX_STEPS),
+      width: normalizeImageDimension(Number(imageWidth) || 512),
+      height: normalizeImageDimension(Number(imageHeight) || 512),
+      accelerator: imageAccelerator
+    }
+
+    const negative = imageNegativePrompt.trim()
+    if (negative) {
+      payload.negative_prompt = negative
+    }
+
+    if (imageSeedValue !== null) {
+      payload.seed = imageSeedValue
+    }
+
+    setImageBusy(true)
+    setImageError(null)
+
+    try {
+      const response = await fetch(GENERATE_IMAGE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+
+      if (!response.ok) {
+        const detail = await response.text()
+        throw new Error(detail || 'Image MCP unavailable')
+      }
+
+      const data = await response.json()
+      const mapped = mapImageResponse(data)
+      if (!mapped.image_base64) {
+        throw new Error('Image generator returned no pixels')
+      }
+
+      setImageResults((prev) => [mapped, ...prev].slice(0, IMAGE_HISTORY_LIMIT))
+    } catch (err: any) {
+      console.error('Image generation failed', err)
+      setImageError(err?.message || 'Image generation failed')
+    } finally {
+      setImageBusy(false)
+    }
+  }
+
   useEffect(() => {
     if (!detectionImage) {
       setDetectionImageSize(null)
@@ -1090,6 +2794,25 @@ export function App() {
       setDetectionImageSizeAlt(null)
     }
   }, [detectionImageAlt])
+
+  useEffect(() => {
+    if (!bankDetectionImage) {
+      setBankDetectionImageSize(null)
+      setBankFields([])
+      setBankOcrResult(null)
+      setBankOcrError(null)
+      setBankOcrBusy(false)
+    }
+  }, [bankDetectionImage])
+
+  useEffect(() => {
+    if (!bankDetectionResults.length) {
+      setBankFields([])
+      return
+    }
+    const fields = buildTransactionFields(bankDetectionResults, bankDetectionImageSize, bankOcrResult?.words)
+    setBankFields(fields)
+  }, [bankDetectionResults, bankDetectionImageSize, bankOcrResult])
 
   const filteredLinkedDetections = useMemo(() => {
     if (!secondaryDetectionTargets.length) {
@@ -1119,6 +2842,47 @@ export function App() {
     ? `${filteredLinkedDetections.length} / ${detectionResultsAlt.length}`
     : `${detectionResultsAlt.length}`
 
+  const referenceStatus = referenceRecording ? 'recording' : referenceAudioBlob ? 'ready' : 'idle'
+  const referenceStatusLabel = referenceRecording ? 'Recording…' : referenceAudioBlob ? 'Ready to use' : 'Idle'
+  const referenceDurationLabel = referenceDurationMs ? formatDuration(referenceDurationMs) : '0:00'
+  const imageSeedValue = parseSeedValue(imageSeed)
+  const imageWidthOptions = IMAGE_DIMENSION_OPTIONS.map((value) => ({ value, label: `${value}px` }))
+  const imageHeightOptions = imageWidthOptions
+
+  useEffect(() => {
+    writeToStorage(STORAGE_KEYS.imageAccelerator, imageAccelerator)
+  }, [imageAccelerator])
+
+  const selectedVoiceInfo = useMemo(() => {
+    if (!selectedVoice) return null
+    return voiceOptions.find((voice) => voice.id === selectedVoice) || null
+  }, [selectedVoice, voiceOptions])
+
+  const premiumVoiceNames = useMemo(
+    () => voiceOptions.filter((voice) => (voice.tier || 'standard') === 'premium').map((voice) => voice.name),
+    [voiceOptions]
+  )
+
+  const premiumVoiceSummary = useMemo(() => {
+    if (!premiumVoiceNames.length) {
+      return null
+    }
+
+    if (premiumVoiceNames.length <= 3) {
+      return `Premium voices: ${premiumVoiceNames.join(', ')}`
+    }
+
+    const count = premiumVoiceNames.length
+    return `${count} premium voice${count === 1 ? '' : 's'} available`
+  }, [premiumVoiceNames])
+
+  const resolvedBankOcrLangLabel = useMemo(() => {
+    const activeLang = bankOcrResult?.lang || bankOcrLang
+    const match = BANK_OCR_LANG_OPTIONS.find((option) => option.value === activeLang)
+    if (match) return match.label
+    return (activeLang || '—').toUpperCase()
+  }, [bankOcrResult, bankOcrLang])
+
   const llmOptions = useMemo(() => {
     const unique = new Set<string>(builtInLlmModels)
     unique.add(llmModel)
@@ -1131,9 +2895,98 @@ export function App() {
     return 'Offline'
   }, [health])
 
-  const handleSpeakerClick = (text: string) => {
-    if (!text?.trim()) return
-    speak(text)
+  const serviceStatuses = useMemo<ServiceStatus[]>(() => {
+    if (!healthServices.length) return []
+    return healthServices.map((svc) => {
+      const meta = serviceMeta[svc.name] || { label: svc.name, group: 'other' as StatusGroupKey, type: 'Service' }
+      return {
+        name: svc.name,
+        label: meta.label,
+        status: svc.status || 'unknown',
+        detail: svc.detail,
+        group: meta.group,
+        type: meta.type
+      }
+    })
+  }, [healthServices])
+
+  const groupedServiceStatuses = useMemo(
+    () =>
+      statusGroupOrder
+        .map((groupKey) => ({
+          key: groupKey,
+          meta: serviceGroupMeta[groupKey],
+          services: serviceStatuses.filter((svc) => svc.group === groupKey)
+        }))
+        .filter((section) => section.services.length > 0),
+    [serviceStatuses]
+  )
+
+  const inlineSpeakerMetaFor = (messageId: string): { icon: string; label: string } => {
+    if (inlineSpeakerState.messageId !== messageId) {
+      return { icon: '🔊', label: 'Replay reply audio' }
+    }
+    if (inlineSpeakerState.status === 'playing') {
+      return { icon: '⏸', label: 'Pause reply audio' }
+    }
+    if (inlineSpeakerState.status === 'paused') {
+      return { icon: '⏹', label: 'Stop reply audio' }
+    }
+    return { icon: '🔊', label: 'Replay reply audio' }
+  }
+
+  const handleSpeakerClick = async (message: ChatMessage) => {
+    const trimmed = message.text?.trim()
+    if (!trimmed) return
+
+    if (inlineSpeakerState.messageId === message.id) {
+      if (inlineSpeakerState.status === 'playing') {
+        const paused =
+          inlinePlaybackModeRef.current === 'audio' ? pauseAudioPlayback() : pauseSpeechPlayback()
+        if (paused) {
+          setInlineSpeakerState({ messageId: message.id, status: 'paused' })
+          return
+        }
+      }
+      if (inlineSpeakerState.status === 'paused') {
+        const resumed =
+          inlinePlaybackModeRef.current === 'audio' ? resumeAudioPlayback() : resumeSpeechPlayback()
+        if (resumed) {
+          setInlineSpeakerState({ messageId: message.id, status: 'playing' })
+          return
+        }
+        stopAllAudio()
+      }
+    }
+
+    stopAllAudio()
+
+    const effectiveVoiceId = (() => {
+      if (selectedVoice && selectedVoice.trim()) return selectedVoice.trim()
+      if (selectedVoiceInfo?.id) return selectedVoiceInfo.id
+      if (message.voiceId) return message.voiceId
+      if (defaultVoiceId) return defaultVoiceId
+      return null
+    })()
+
+    if (effectiveVoiceId) {
+      const ok = await synthesizeInlineVoice(message.id, trimmed, effectiveVoiceId)
+      if (ok) {
+        return
+      }
+    }
+
+    speak(trimmed, {
+      onStart: () => setInlineSpeakerState({ messageId: message.id, status: 'playing' }),
+      onEnd: () =>
+        setInlineSpeakerState((prev) =>
+          prev.messageId === message.id ? { messageId: null, status: 'idle' } : prev
+        ),
+      onError: () =>
+        setInlineSpeakerState((prev) =>
+          prev.messageId === message.id ? { messageId: null, status: 'idle' } : prev
+        )
+    })
   }
 
   const handleResetConversation = () => {
@@ -1156,6 +3009,14 @@ export function App() {
     const { naturalWidth, naturalHeight } = event.currentTarget
     if (naturalWidth && naturalHeight) {
       setDetectionImageSizeAlt({ width: naturalWidth, height: naturalHeight })
+    }
+  }
+
+  const handleBankDetectionImageLoad = (event: React.SyntheticEvent<HTMLImageElement>) => {
+    if (!bankDetectionImage) return
+    const { naturalWidth, naturalHeight } = event.currentTarget
+    if (naturalWidth && naturalHeight) {
+      setBankDetectionImageSize({ width: naturalWidth, height: naturalHeight })
     }
   }
 
@@ -1263,11 +3124,85 @@ export function App() {
     <div className="app-root">
       <header className="app-header">
         <div className="title">Chaba – Voice Chat</div>
-        <div className={`status-pill status-${health}`}>
-          <span className="dot" /> {statusLabel}
-        </div>
-        <div className="model-info">
-          LLM: {llmModel} | STT: {whisperModel}
+        <div className="status-wrapper" ref={statusWrapperRef}>
+          <button
+            type="button"
+            className={`status-pill status-${health}`}
+            onClick={() => setStatusExpanded((prev) => !prev)}
+            aria-haspopup="true"
+            aria-expanded={statusExpanded}
+            aria-label="Toggle service status details"
+          >
+            <span className="status-pill-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" role="presentation" focusable="false">
+                <path d="M4.5 14.5c1.5-1.7 3.6-2.8 6-2.8s4.5 1.1 6 2.8" />
+                <path d="M2 11c2.1-2.5 5.2-4 8.5-4s6.4 1.5 8.5 4" />
+                <circle cx="12" cy="18" r="1.6" />
+              </svg>
+            </span>
+            <span className="dot" /> {statusLabel}
+          </button>
+          <div className="model-info" aria-label="Model configuration">
+            LLM: {llmModel} | STT: {whisperModel}
+          </div>
+          {statusExpanded ? (
+            <div className="status-details" role="dialog" aria-label="Service status and model details">
+              <div className="status-details-header">Service health</div>
+              <div className="status-details-content">
+                {groupedServiceStatuses.length ? (
+                  <div className="status-details-groups">
+                    {groupedServiceStatuses.map((group) => (
+                      <section className="status-group" key={group.key} aria-label={group.meta.title}>
+                        <header className="status-group-heading">
+                          <span className="status-group-icon" aria-hidden="true">{group.meta.icon}</span>
+                          <div className="status-group-text">
+                            <div className="status-group-title">{group.meta.title}</div>
+                            <div className="status-group-subtitle">{group.meta.subtitle}</div>
+                          </div>
+                        </header>
+                        <div className="status-group-list">
+                          {group.services.map((svc) => {
+                            const pillState = svc.status === 'ok' ? 'ok' : svc.status === 'unconfigured' ? 'unknown' : 'error'
+                            const detailText = formatStatusDetail(svc.detail)
+                            const typeClass = `status-type-${svc.type.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+                            return (
+                              <div className="status-service-card" key={svc.name}>
+                                <div className="status-service-header">
+                                  <span className="status-service-label">{svc.label}</span>
+                                  <span className={`status-type-pill ${typeClass}`}>{svc.type}</span>
+                                </div>
+                                <div className="status-service-body">
+                                  <span className={`status-indicator status-${pillState}`}>
+                                    <span className="dot" /> {svc.status}
+                                  </span>
+                                  {detailText ? <span className="status-details-meta">{detailText}</span> : null}
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </section>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="status-empty">No service data yet.</div>
+                )}
+                <div className="status-model-info-section">
+                  <div className="status-details-header">Model info</div>
+                  <div className="status-model-info-grid">
+                    <div className="status-model-info-item">
+                      <span className="label">LLM</span>
+                      <span className="value">{llmModel}</span>
+                    </div>
+                    <div className="status-model-info-item">
+                      <span className="label">STT</span>
+                      <span className="value">{whisperModel}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
       </header>
 
@@ -1282,17 +3217,38 @@ export function App() {
           </button>
           <button
             type="button"
+            className={`panel-tab ${activePanel === 'openvoice' ? 'active' : ''}`}
+            onClick={() => setActivePanel('openvoice')}
+          >
+            OpenVoice
+          </button>
+          <button
+            type="button"
+            className={`panel-tab ${activePanel === 'image-mcp' ? 'active' : ''}`}
+            onClick={() => setActivePanel('image-mcp')}
+          >
+            Image lab
+          </button>
+          <button
+            type="button"
             className={`panel-tab ${activePanel === 'yolo-detection' ? 'active' : ''}`}
             onClick={() => setActivePanel('yolo-detection')}
           >
             YOLO detection
+          </button>
+          <button
+            type="button"
+            className={`panel-tab ${activePanel === 'bank-slip' ? 'active' : ''}`}
+            onClick={() => setActivePanel('bank-slip')}
+          >
+            Bank slip
           </button>
         </div>
 
         {activePanel === 'chat' ? (
           <div className="chat-layout" aria-label="Chat interface">
             <section className="chat-panel">
-              <div className="chat-messages">
+              <div className="chat-messages" ref={chatMessagesRef}>
                 {messages.map((m) => (
                   <div
                     key={m.id}
@@ -1301,17 +3257,22 @@ export function App() {
                     <div className={`bubble bubble-${m.role}`}>
                       <div className="bubble-text">
                         {m.text}
-                        {m.role === 'assistant' && m.text && (
-                          <button
-                            type="button"
-                            className="inline-speaker-button"
-                            onClick={() => handleSpeakerClick(m.text)}
-                            title="Replay reply audio"
-                            aria-label="Replay reply audio"
-                          >
-                            🔊
-                          </button>
-                        )}
+                        {m.role === 'assistant' && m.text ? (
+                          (() => {
+                            const { icon, label } = inlineSpeakerMetaFor(m.id)
+                            return (
+                              <button
+                                type="button"
+                                className="inline-speaker-button"
+                                onClick={() => handleSpeakerClick(m)}
+                                title={label}
+                                aria-label={label}
+                              >
+                                {icon}
+                              </button>
+                            )
+                          })()
+                        ) : null}
                         {m.attachments?.length ? (
                           <div className="chat-attachments">
                             {m.attachments.map((att, idx) =>
@@ -1367,6 +3328,7 @@ export function App() {
                         <span>· {m.time}</span>
                         {m.model && <span>· llm: {m.model}</span>}
                         {m.sttModel && <span>· stt: {m.sttModel}</span>}
+                        {m.sttLanguage && <span>· lang: {getLanguageLabel(m.sttLanguage)}</span>}
                         {m.accelerator && <span>· accel: {m.accelerator.toUpperCase()}</span>}
                       </div>
                       {m.role === 'user' && (
@@ -1406,11 +3368,76 @@ export function App() {
                     </div>
                   </div>
                 )}
+                <button
+                  type="button"
+                  className={`chat-scroll-bottom ${showScrollToBottom ? 'visible' : ''}`.trim()}
+                  onClick={() => scrollChatToBottom(true)}
+                  aria-label="Scroll to latest message"
+                  title="Scroll to latest message"
+                >
+                  ↓
+                </button>
               </div>
             </section>
 
             <section className="controls-panel">
               <div className="control-chips snap-scroll" role="group" aria-label="Chat settings">
+                <label className="control-chip">
+                  <span className="chip-header">
+                    <span className="chip-icon" aria-hidden>
+                      🌐
+                    </span>
+                    <span className="chip-label">Speech lang</span>
+                  </span>
+                  <select
+                    value={speechLanguage}
+                    onChange={(e) => setSpeechLanguage(e.target.value)}
+                    className="chip-select"
+                  >
+                    {speechLanguageOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="chip-helper">Used for mic input & Whisper hints.</span>
+                  {speechLanguage === 'auto' && browserDetectedLanguage && (
+                    <span className="chip-helper" aria-live="polite">
+                      Browser detected: {getLanguageLabel(browserDetectedLanguage) || browserDetectedLanguage}
+                    </span>
+                  )}
+                </label>
+                <label className="control-chip">
+                  <span className="chip-header">
+                    <span className="chip-icon" aria-hidden>
+                      🧠
+                    </span>
+                    <span className="chip-label">Provider</span>
+                  </span>
+                  <select
+                    value={llmProvider}
+                    onChange={(e) => setLlmProvider(e.target.value as LlmProvider)}
+                    className="chip-select"
+                  >
+                    {LLM_PROVIDER_OPTIONS.map((option) => {
+                      const status = providerStatuses[option.value]
+                      const statusSuffix = status && status.label !== 'Available' ? ` (${status.label})` : ''
+                      const disableOption = healthServices.length > 0 && status && !status.available
+                      return (
+                        <option key={option.value} value={option.value} disabled={disableOption}>
+                          {option.label}
+                          {statusSuffix}
+                        </option>
+                      )
+                    })}
+                  </select>
+                  <span className="chip-helper">Switch between Ollama, Anthropic, or OpenAI.</span>
+                  {providerStatuses[llmProvider] && providerStatuses[llmProvider].label !== 'Available' && (
+                    <span className="chip-helper" role="status">
+                      Status: {providerStatuses[llmProvider].label}
+                    </span>
+                  )}
+                </label>
                 <label className="control-chip">
                   <span className="chip-header">
                     <span className="chip-icon" aria-hidden>
@@ -1446,6 +3473,73 @@ export function App() {
                     <option value="base">base</option>
                     <option value="small">small</option>
                   </select>
+                </label>
+                <label className="control-chip">
+                  <span className="chip-header">
+                    <span className="chip-icon" aria-hidden>
+                      🎙️
+                    </span>
+                    <span className="chip-label">Voice</span>
+                  </span>
+                  <div className="voice-control-row">
+                    <select
+                      value={selectedVoice || ''}
+                      onChange={(e) => setSelectedVoice(e.target.value || null)}
+                      className="chip-select voice-select"
+                      disabled={!voiceOptions.length || voicesLoading}
+                    >
+                      {voiceOptions.length === 0 ? (
+                        <option value="">{voicesLoading ? 'Loading voices…' : 'No voices available'}</option>
+                      ) : (
+                        voiceOptions.map((voice) => {
+                          const parts = [voice.name]
+                          if ((voice.tier || 'standard') === 'premium') {
+                            parts.push('Premium')
+                          }
+                          if (voice.sampleRate) {
+                            parts.push(`${voice.sampleRate}Hz`)
+                          }
+                          return (
+                            <option key={voice.id} value={voice.id}>
+                              {parts.join(' • ')}
+                            </option>
+                          )
+                        })
+                      )}
+                    </select>
+                    <button
+                      type="button"
+                      className="voice-preview-btn"
+                      onClick={() => {
+                        void previewVoice()
+                      }}
+                      disabled={!selectedVoice || voicePreviewLoading}
+                    >
+                      {voicePreviewLoading ? 'Previewing…' : '▶ Preview'}
+                    </button>
+                  </div>
+                  {(selectedVoiceInfo?.tier === 'premium' || premiumVoiceSummary) && (
+                    <div className="voice-helper-row">
+                      {selectedVoiceInfo?.tier === 'premium' && (
+                        <span className="voice-tier-pill" aria-live="polite">
+                          Premium
+                        </span>
+                      )}
+                      {premiumVoiceSummary && (
+                        <span className="voice-helper-text">{premiumVoiceSummary}</span>
+                      )}
+                    </div>
+                  )}
+                  {voiceFetchError && (
+                    <span className="chip-helper" role="alert">
+                      {voiceFetchError}
+                    </span>
+                  )}
+                  {voicePreviewError && (
+                    <span className="chip-helper" role="alert">
+                      {voicePreviewError}
+                    </span>
+                  )}
                 </label>
                 <label className="control-chip">
                   <span className="chip-header">
@@ -1630,7 +3724,284 @@ export function App() {
               )}
             </section>
           </div>
-        ) : (
+        ) : activePanel === 'openvoice' ? (
+          <div className="openvoice-layout" aria-label="OpenVoice reference panel">
+            <section className="panel-surface openvoice-panel">
+              <header className="panel-header">
+                <div>
+                  <h2>OpenVoice reference studio</h2>
+                  <p>Capture a short clip (5–15s) of your target voice for cloning & custom voices.</p>
+                </div>
+                <div className={`reference-status-pill reference-status-pill-${referenceStatus}`} aria-live="polite">
+                  {referenceStatusLabel}
+                </div>
+              </header>
+              <div className="openvoice-controls">
+                <div className="openvoice-primary">
+                  <button
+                    type="button"
+                    className={`record-button ${referenceRecording ? 'recording' : ''}`}
+                    onClick={() => {
+                      if (referenceRecording) {
+                        stopReferenceRecording()
+                      } else {
+                        void startReferenceRecording()
+                      }
+                    }}
+                  >
+                    {referenceRecording ? '■ Stop recording' : '⏺ Start recording'}
+                  </button>
+                  <div className="reference-duration" aria-live="polite">
+                    Duration:&nbsp;<strong>{referenceDurationLabel}</strong>
+                  </div>
+                </div>
+                <label className="openvoice-field">
+                  <span>Filename prefix</span>
+                  <input
+                    type="text"
+                    className="reference-name-input"
+                    value={referenceFilename}
+                    onChange={(e) => setReferenceFilename(e.target.value)}
+                    placeholder="openvoice-reference"
+                  />
+                </label>
+              </div>
+              <div className="openvoice-audio-preview">
+                {referenceAudioUrl ? (
+                  <audio controls src={referenceAudioUrl} className="reference-audio-player" />
+                ) : (
+                  <p className="reference-empty-hint">No clip yet. Tap “Start recording” to capture a reference.</p>
+                )}
+              </div>
+              <div className="reference-footer">
+                <button type="button" onClick={downloadReferenceAudio} disabled={!referenceAudioBlob}>
+                  ⬇ Download clip
+                </button>
+                <button type="button" onClick={clearReferenceAudio} disabled={referenceRecording || !referenceAudioBlob}>
+                  ♻ Re-record
+                </button>
+              </div>
+              {referenceRecorderError && (
+                <div className="reference-error" role="alert">
+                  {referenceRecorderError}
+                </div>
+              )}
+            </section>
+          </div>
+        ) : activePanel === 'image-mcp' ? (
+          <div className="image-lab-layout" aria-label="Image MCP studio">
+            <section className="panel-surface image-panel">
+              <header className="panel-header">
+                <div>
+                  <h2>Image MCP studio</h2>
+                  <p>Create reproducible image prompts with guardrails before sending them to the assistant.</p>
+                </div>
+                <div className={`image-status-chip ${imageBusy ? 'busy' : 'ready'}`} aria-live="polite">
+                  {imageBusy ? 'Generating…' : imageResults.length ? 'Ready' : 'Drafting'}
+                </div>
+              </header>
+              <div className="image-lab-grid">
+                <div className="image-form" aria-label="Image generation form">
+                  <label className="image-field">
+                    <span>Prompt *</span>
+                    <textarea
+                      className="image-textarea"
+                      rows={4}
+                      value={imagePrompt}
+                      onChange={(e) => setImagePrompt(e.target.value)}
+                      placeholder="Rain-soaked Bangkok street photography, Leica look, cinematic lighting"
+                    />
+                  </label>
+                  <label className="image-field">
+                    <span>Negative prompt</span>
+                    <textarea
+                      className="image-textarea"
+                      rows={2}
+                      value={imageNegativePrompt}
+                      onChange={(e) => setImageNegativePrompt(e.target.value)}
+                      placeholder="blurry, low quality, extra limbs"
+                    />
+                  </label>
+                  <div className="image-slider-row">
+                    <label htmlFor="guidance-slider">
+                      Guidance scale: <strong>{Number(imageGuidance).toFixed(1)}×</strong>
+                    </label>
+                    <input
+                      id="guidance-slider"
+                      type="range"
+                      min={IMAGE_MIN_GUIDANCE}
+                      max={IMAGE_MAX_GUIDANCE}
+                      step={0.5}
+                      value={imageGuidance}
+                      onChange={(e) => setImageGuidance(Number(e.target.value))}
+                    />
+                  </div>
+                  <div className="image-slider-row">
+                    <label htmlFor="step-slider">
+                      Steps: <strong>{imageSteps}</strong>
+                    </label>
+                    <input
+                      id="step-slider"
+                      type="range"
+                      min={IMAGE_MIN_STEPS}
+                      max={IMAGE_MAX_STEPS}
+                      step={1}
+                      value={imageSteps}
+                      onChange={(e) => setImageSteps(Number(e.target.value))}
+                    />
+                  </div>
+                  <div className="image-size-row">
+                    <label>
+                      Width
+                      <select value={imageWidth} onChange={(e) => setImageWidth(Number(e.target.value) || 512)}>
+                        {imageWidthOptions.map((option) => (
+                          <option key={`w-${option.value}`} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Height
+                      <select value={imageHeight} onChange={(e) => setImageHeight(Number(e.target.value) || 512)}>
+                        {imageHeightOptions.map((option) => (
+                          <option key={`h-${option.value}`} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Seed
+                      <input
+                        type="text"
+                        value={imageSeed}
+                        onChange={(e) => setImageSeed(e.target.value)}
+                        placeholder="auto"
+                      />
+                    </label>
+                  </div>
+                  <div className="image-slider-row">
+                    <label htmlFor="image-accelerator-select">Accelerator</label>
+                    <div className="chip-select-wrapper">
+                      <select
+                        id="image-accelerator-select"
+                        value={imageAccelerator}
+                        onChange={(e) => setImageAccelerator(e.target.value as 'cpu' | 'gpu')}
+                      >
+                        {IMAGE_ACCELERATOR_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                  {imageError ? (
+                    <div className="form-error" role="alert">
+                      {imageError}
+                    </div>
+                  ) : null}
+                  <div className="image-actions">
+                    <button
+                      type="button"
+                      className="pill-button primary"
+                      onClick={handleGenerateImage}
+                      disabled={imageBusy}
+                    >
+                      {imageBusy ? 'Generating…' : 'Generate image'}
+                    </button>
+                    <button
+                      type="button"
+                      className="pill-button secondary"
+                      onClick={resetImageForm}
+                      disabled={imageBusy}
+                    >
+                      Reset form
+                    </button>
+                  </div>
+                </div>
+                <div className="image-results-column">
+                  <div className="image-best-practices" aria-live="polite">
+                    <h3>Best-practice checklist</h3>
+                    <ol>
+                      <li>Describe subject, style, lighting, and camera mood in the main prompt.</li>
+                      <li>List undesirable traits in the negative prompt to prevent artifacts.</li>
+                      <li>Increase inference steps for detail, but watch duration on CPU hosts.</li>
+                      <li>Use seeds to reproduce shots and iterate on improvements.</li>
+                      <li>Switch to GPU for faster drafts; keep CPU handy when GPUs are busy.</li>
+                      <li>Log the aspect ratio when attaching images back into chat sessions.</li>
+                    </ol>
+                  </div>
+                  <div className="image-history" aria-live="polite">
+                    {imageResults.length === 0 ? (
+                      <p className="image-placeholder">No renders yet. Craft a prompt and hit “Generate image”.</p>
+                    ) : (
+                      <div className="image-results-grid" data-testid="image-results">
+                        {imageResults.map((result, idx) => (
+                          <article className="image-result-card" key={`${result.seed ?? idx}-${result.prompt}-${idx}`}>
+                            <div className="image-preview">
+                              <img src={result.image_base64} alt={result.prompt || 'Generated image'} />
+                            </div>
+                            <div className="image-meta">
+                              <div>
+                                <span>Prompt</span>
+                                <p>{result.prompt}</p>
+                              </div>
+                              {result.negative_prompt ? (
+                                <div>
+                                  <span>Negative</span>
+                                  <p>{result.negative_prompt}</p>
+                                </div>
+                              ) : null}
+                              <div className="image-meta-grid">
+                                <span>
+                                  Size <strong>{result.width}×{result.height}</strong>
+                                </span>
+                                <span>
+                                  Guidance{' '}
+                                  <strong>
+                                    {typeof result.guidance_scale === 'number'
+                                      ? result.guidance_scale.toFixed(1)
+                                      : '—'}
+                                  </strong>
+                                </span>
+                                <span>
+                                  Steps <strong>{result.num_inference_steps ?? '—'}</strong>
+                                </span>
+                                <span>
+                                  Seed <strong>{result.seed ?? 'auto'}</strong>
+                                </span>
+                                {formatImageDuration(result.duration_ms) ? (
+                                  <span>
+                                    Duration <strong>{formatImageDuration(result.duration_ms)}</strong>
+                                  </span>
+                                ) : null}
+                                {result.accelerator ? (
+                                  <span>
+                                    Accel <strong>{result.accelerator.toUpperCase()}</strong>
+                                  </span>
+                                ) : null}
+                              </div>
+                            </div>
+                            <div className="image-result-actions">
+                              <button type="button" className="pill-button secondary" onClick={() => handleReuseImagePrompt(result)}>
+                                Reuse settings
+                              </button>
+                              <button type="button" className="pill-button" onClick={() => handleDownloadImageResult(result)}>
+                                Download PNG
+                              </button>
+                            </div>
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        ) : activePanel === 'yolo-detection' ? (
           <div className="vision-panels">
             <section className="vision-panel" aria-label="YOLO detection panel" data-testid="yolo-panel-primary">
               <div className="vision-header">
@@ -1664,6 +4035,13 @@ export function App() {
                 />
                 <button onClick={() => detectFileInputRef.current?.click()} disabled={detecting}>
                   {detecting ? 'Detecting…' : 'Upload image for detection'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRedetectPrimary}
+                  disabled={detecting || !lastDetectionFile}
+                >
+                  Re-run last image
                 </button>
                 {detecting && (
                   <div className="vision-loading">
@@ -1811,6 +4189,13 @@ export function App() {
                 <button onClick={() => detectFileInputRefAlt.current?.click()} disabled={detectingAlt}>
                   {detectingAlt ? 'Detecting…' : 'Upload image for detection'}
                 </button>
+                <button
+                  type="button"
+                  onClick={handleRedetectLinked}
+                  disabled={detectingAlt || !lastDetectionFileAlt}
+                >
+                  Re-run last image
+                </button>
                 {detectingAlt && (
                   <div className="vision-loading">
                     <span className="pulse-dot" /> Linking detections…
@@ -1910,17 +4295,259 @@ export function App() {
               )}
             </section>
           </div>
+        ) : (
+          <div className="vision-panels bank-panels">
+            <section className="vision-panel bank-panel" aria-label="Bank slip vehicle detection panel">
+              <div className="vision-header">
+                <div>
+                  <h2>Bank Slip Vehicle Detection</h2>
+                  <p>Upload a slip photo to detect cars, registration plates, and other vehicle cues.</p>
+                </div>
+                <div className="vision-confidence">
+                  <label htmlFor="bank-confidence-slider">
+                    Confidence threshold: <strong>{Math.round(bankDetectConfidence * 100)}%</strong>
+                  </label>
+                  <input
+                    id="bank-confidence-slider"
+                    type="range"
+                    min={0.1}
+                    max={0.95}
+                    step={0.05}
+                    value={bankDetectConfidence}
+                    onChange={(e) => setBankDetectConfidence(Number(e.target.value))}
+                  />
+                </div>
+              </div>
+
+              <div className="vision-controls">
+                <input
+                  type="file"
+                  accept="image/*"
+                  ref={detectFileInputRefBank}
+                  style={{ display: 'none' }}
+                  onChange={handleDetectFileChangeBank}
+                />
+                <button onClick={() => detectFileInputRefBank.current?.click()} disabled={bankDetecting}>
+                  {bankDetecting ? 'Detecting…' : 'Upload slip image'}
+                </button>
+                <button
+                  type="button"
+                  className="vision-toggle-btn"
+                  onClick={() => setBankShowDetectionBoxes((prev) => !prev)}
+                  disabled={!bankDetectionPreviewUrl && !bankDetectionImage}
+                >
+                  {bankShowDetectionBoxes ? 'Hide boxes' : 'Show boxes'}
+                </button>
+                <label className="vision-select-inline">
+                  <span>OCR language</span>
+                  <select value={bankOcrLang} onChange={(e) => setBankOcrLang(e.target.value)}>
+                    {BANK_OCR_LANG_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!bankDetectionSourceFile) return
+                    void runBankOcr(bankDetectionSourceFile, bankOcrLang)
+                  }}
+                  disabled={!bankDetectionSourceFile || bankOcrBusy}
+                >
+                  {bankOcrBusy ? 'Running OCR…' : bankOcrResult ? 'Re-run OCR' : 'Run OCR'}
+                </button>
+                {bankDetecting && (
+                  <div className="vision-loading">
+                    <span className="pulse-dot" /> Running detection…
+                  </div>
+                )}
+                {bankOcrBusy && !bankDetecting ? (
+                  <div className="vision-loading">
+                    <span className="pulse-dot" /> Extracting text ({resolvedBankOcrLangLabel})…
+                  </div>
+                ) : null}
+              </div>
+
+              {bankDetectionError && <div className="vision-error">{bankDetectionError}</div>}
+              {bankOcrError && <div className="vision-error">{bankOcrError}</div>}
+
+              {bankDetectionImage ? (
+                <div className="vision-result">
+                  <div className="bank-summary-row">
+                    <div className="summary-metric">
+                      <span className="summary-label">Extracted fields</span>
+                      <span className="summary-value">{bankFields.length}</span>
+                    </div>
+                    <div className="summary-metric">
+                      <span className="summary-label">Detections</span>
+                      <span className="summary-value">{bankDetectionResults.length}</span>
+                    </div>
+                    <div className="summary-metric">
+                      <span className="summary-label">Confidence</span>
+                      <span className="summary-value">
+                        {bankFields.length
+                          ? `${(
+                              bankFields.reduce((acc, field) => acc + (field.confidence || 0), 0) / bankFields.length
+                            )
+                              .toFixed(2)
+                              .replace(/\.00$/, '')} avg`
+                          : '—'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="bank-ocr-summary" aria-live="polite">
+                    <div className="bank-ocr-header">
+                      <h3>OCR summary ({resolvedBankOcrLangLabel})</h3>
+                      {typeof bankOcrResult?.confidence === 'number' && (
+                        <span className="confidence-chip">{bankOcrResult.confidence.toFixed(1)}%</span>
+                      )}
+                    </div>
+                    <div className="bank-ocr-body">
+                      {bankOcrResult?.text ? (
+                        <pre className="bank-ocr-text">
+                          {bankOcrResult.text}
+                        </pre>
+                      ) : (
+                        <p className="bank-ocr-placeholder">
+                          {bankOcrBusy
+                            ? 'OCR running...'
+                            : bankDetectionSourceFile
+                              ? 'Run OCR to extract raw text from the slip.'
+                              : 'Upload a slip image to enable OCR.'}
+                        </p>
+                      )}
+                      {bankOcrResult?.lines?.length ? (
+                        <div className="bank-ocr-lines">
+                          <strong>Detected lines ({bankOcrResult.lines.length}):</strong>
+                          <ul>
+                            {bankOcrResult.lines.slice(0, 8).map((line) => (
+                              <li key={line.id}>
+                                <span>{line.text || '—'}</span>
+                                {typeof line.confidence === 'number' && (
+                                  <span className="confidence-chip">{line.confidence.toFixed(1)}%</span>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className={`vision-image ${bankDetectionExpanded ? 'expanded' : ''}`} data-testid="bank-detection-image">
+                    <button
+                      type="button"
+                      className="vision-expand-btn"
+                      onClick={() => setBankDetectionExpanded((prev) => !prev)}
+                      aria-label={bankDetectionExpanded ? 'Collapse preview' : 'Expand preview'}
+                    >
+                      {bankDetectionExpanded ? '⤡' : '⤢'}
+                    </button>
+                    <img
+                      src={
+                        bankShowDetectionBoxes && bankDetectionImage
+                          ? bankDetectionImage
+                          : bankDetectionPreviewUrl || bankDetectionImage
+                      }
+                      alt="Bank slip detection result"
+                      onLoad={handleBankDetectionImageLoad}
+                    />
+                    {renderBankDetectionBoxes()}
+                  </div>
+
+                  <div className="insight-grid">
+                    {(['amount', 'sender', 'receiver', 'account', 'bank', 'date', 'time', 'reference', 'other'] as BankFieldType[]).map((fieldType) => {
+                      const fieldsForType = bankFields.filter((field) => field.type === fieldType)
+                      return (
+                        <div className="insight-card" key={`bank-field-${fieldType}`}>
+                          <div className="insight-card-header">
+                            <h3>{BANK_FIELD_LABELS[fieldType]}</h3>
+                            <span className="insight-count">{fieldsForType.length}</span>
+                          </div>
+                          {fieldsForType.length === 0 ? (
+                            <p className="insight-empty">No {BANK_FIELD_LABELS[fieldType].toLowerCase()} detected.</p>
+                          ) : (
+                            <ul className="insight-list">
+                              {fieldsForType.map((field) => (
+                                <li key={field.id} className="insight-item">
+                                  <div className="insight-item-header">
+                                    <strong>{field.value || field.label}</strong>
+                                    {typeof field.confidence === 'number' && (
+                                      <span className="confidence-chip">{(field.confidence * 100).toFixed(1)}%</span>
+                                    )}
+                                  </div>
+                                  {field.label && field.value && field.value !== field.label && (
+                                    <div className="insight-detail-row">
+                                      <span>Label</span>
+                                      <span className="insight-detail-value">{field.label}</span>
+                                    </div>
+                                  )}
+                                  {field.bbox && field.bbox.length === 4 && (
+                                    <div className="insight-detail-row">
+                                      <span>bbox</span>
+                                      <span className="insight-detail-value">
+                                        {field.bbox.map((n) => Math.round(n)).join(', ')}
+                                      </span>
+                                    </div>
+                                  )}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : bankDetectionPreviewUrl ? (
+                <div className="vision-preview">
+                  <div className={`vision-image ${bankDetectionExpanded ? 'expanded' : ''}`}>
+                    <button
+                      type="button"
+                      className="vision-expand-btn"
+                      onClick={() => setBankDetectionExpanded((prev) => !prev)}
+                      aria-label={bankDetectionExpanded ? 'Collapse preview' : 'Expand preview'}
+                    >
+                      {bankDetectionExpanded ? '⤡' : '⤢'}
+                    </button>
+                    <img src={bankDetectionPreviewUrl} alt="Selected bank slip preview" />
+                  </div>
+                  <p className="vision-preview-hint">
+                    {bankDetecting ? 'Running detection…' : 'Preview ready. Click "Upload slip image" to run the detector.'}
+                  </p>
+                </div>
+              ) : (
+                <div className="vision-placeholder">Upload a bank slip image to start detecting vehicles.</div>
+              )}
+            </section>
+          </div>
         )}
       </main>
 
       {attachmentPreview && (
-        <div className="attachment-preview-overlay" onClick={closeAttachmentPreview}>
+        <div
+          className="attachment-preview-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={attachmentPreview.name || 'Attachment preview'}
+          onClick={closeAttachmentPreview}
+        >
           <div className="attachment-preview-modal" onClick={(e) => e.stopPropagation()}>
-            <img src={attachmentPreview.src} alt={attachmentPreview.name || 'Attachment preview'} />
-            <div className="attachment-preview-name">{attachmentPreview.name}</div>
-            <button type="button" onClick={closeAttachmentPreview}>
-              Close
+            <button
+              type="button"
+              className="attachment-preview-close"
+              onClick={closeAttachmentPreview}
+              aria-label="Close image preview"
+            >
+              ×
             </button>
+            <img
+              src={attachmentPreview.src}
+              alt={attachmentPreview.name || 'Attachment preview'}
+              className="attachment-preview-image"
+            />
+            <div className="attachment-preview-name">{attachmentPreview.name}</div>
           </div>
         </div>
       )}

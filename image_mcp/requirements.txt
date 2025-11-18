@@ -1,0 +1,10 @@
+diffusers
+transformers
+accelerate
+torch
+safetensors
+Pillow
+modelcontextprotocol
+mcp
+starlette
+uvicorn

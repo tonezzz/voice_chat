@@ -19,18 +19,6 @@ services:
     volumes:
       - ${HF_STT_MODELS:-/data/models/huggingface/stt}:/app/models
 
-  tts:
-    volumes:
-      - ${HF_TTS_MODELS:-/data/models/huggingface/tts}:/app/models
-
-  tts-gpu:
-    build:
-      context: ./tts
-      args:
-        BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
-    volumes:
-      - ${HF_TTS_MODELS:-/data/models/huggingface/tts}:/app/models
-
   yolo_mcp:
     build:
       context: ./yolo_mcp

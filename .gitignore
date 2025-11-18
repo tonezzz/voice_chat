@@ -1,0 +1,80 @@
+# Python virtual environments
+/openvoice/inference/.venv
+.venv/
+venv/
+.python-version
+
+# TypeScript / build caches
+*.tsbuildinfo
+.eslintcache
+coverage/
+**/coverage/
+
+# Temporary folders
+tmp/
+temp/
+
+# Runtime uploads & generated audio
+uploads/
+server/public/tts/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Node/JavaScript dependencies and logs
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+pnpm-lock.yaml
+
+# Local package manager state
+.npm/
+.pnpm-store/
+
+# Docker / Compose state
+.docker/
+docker-data/
+*.pid
+
+# Environment files
+.env
+.env.*
+!.env.example
+.envrc
+
+# Frontend build output
+client/dist/
+server/public/assets/
+
+# Model & inference assets (huge downloads mounted via volumes)
+openvoice/inference/.data/
+openvoice/inference/.cache/
+openvoice/inference/checkpoints/
+openvoice/inference/openvoice_v2/
+openvoice_synth/
+openvoice_synth_gpu/
+openvoice_synth*/
+
+# Tooling caches
+.parcel-cache/
+.turbo/
+.vite/
+
+# Editor/OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Miscellaneous
+*.log
+*.local
+*.swp
+*.swo
