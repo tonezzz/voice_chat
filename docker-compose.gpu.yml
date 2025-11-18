@@ -19,9 +19,9 @@ services:
     volumes:
       - ${HF_STT_MODELS:-/data/models/huggingface/stt}:/app/models
 
-  yolo_mcp:
+  mcp_yolo:
     build:
-      context: ./yolo_mcp
+      context: ./mcp_yolo
       args:
         BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
     volumes:

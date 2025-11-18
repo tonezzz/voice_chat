@@ -16,6 +16,174 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+app.post('/verify-slip', upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'file is required' });
+  }
+
+  const baseUrl = normalizeBaseUrl(BSLIP_MCP_URL || '');
+  if (!baseUrl) {
+    return res.status(500).json({ error: 'bslip_mcp_unconfigured' });
+  }
+
+  const form = new FormData();
+  form.append('file', req.file.buffer, {
+    filename: req.file.originalname || 'bankslip.jpg',
+    contentType: req.file.mimetype || 'application/octet-stream'
+  });
+
+  const referenceId = typeof req.body?.reference_id === 'string' ? req.body.reference_id.trim() : '';
+  if (referenceId) {
+    form.append('reference_id', referenceId);
+  }
+
+  try {
+    console.log('[bslip] forwarding verify-slip request', {
+      target: `${baseUrl}/verify`,
+      name: req.file.originalname,
+      referenceId: referenceId || undefined
+    });
+
+    const response = await fetch(`${baseUrl}/verify`, {
+      method: 'POST',
+      headers: form.getHeaders(),
+      body: form
+    });
+
+    if (!response.ok) {
+      const detailText = await response.text();
+      console.error('BSLIP MCP error:', detailText);
+      let detailJson;
+      try {
+        detailJson = JSON.parse(detailText);
+      } catch (parseErr) {
+        detailJson = undefined;
+      }
+
+      return res.status(502).json({
+        error: 'bslip_mcp_error',
+        detail: detailJson || detailText,
+        target: `${baseUrl}/verify`,
+        source: req.file?.originalname,
+        mimetype: req.file?.mimetype
+      });
+    }
+
+    const data = await response.json();
+    return res.json(data);
+  } catch (err) {
+    console.error('Bank slip verification failed:', err);
+    return res.status(500).json({
+      error: 'server_error',
+      message: err?.message || 'Bank slip verification failed',
+      source: req.file?.originalname,
+      mimetype: req.file?.mimetype,
+      stack: process.env.NODE_ENV === 'production' ? undefined : err?.stack
+    });
+  }
+});
+
+app.post('/generate-image-stream', async (req, res) => {
+  const body = req.body || {};
+  const rawAccelerator = typeof body.accelerator === 'string' ? body.accelerator.trim().toLowerCase() : '';
+  const requestedAccelerator = rawAccelerator === 'gpu' ? 'gpu' : 'cpu';
+  const { baseUrl, accelerator: resolvedAccelerator } = pickImageMcpBase(requestedAccelerator);
+  const normalizedBaseUrl = normalizeBaseUrl(baseUrl || '');
+  if (!normalizedBaseUrl) {
+    return res.status(500).json({ error: 'image_mcp_unconfigured' });
+  }
+
+  const { prompt, negative_prompt, guidance_scale, num_inference_steps, width, height, seed } = body;
+
+  if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+    return res.status(400).json({ error: 'prompt is required' });
+  }
+
+  const payload = { prompt: prompt.trim() };
+
+  if (typeof negative_prompt === 'string' && negative_prompt.trim()) {
+    payload.negative_prompt = negative_prompt.trim();
+  }
+  if (typeof guidance_scale !== 'undefined') {
+    const parsed = Number(guidance_scale);
+    if (!Number.isNaN(parsed)) {
+      payload.guidance_scale = parsed;
+    }
+  }
+  if (typeof num_inference_steps !== 'undefined') {
+    const parsed = parseInt(num_inference_steps, 10);
+    if (!Number.isNaN(parsed)) {
+      payload.num_inference_steps = parsed;
+    }
+  }
+  if (typeof width !== 'undefined') {
+    const parsed = parseInt(width, 10);
+    if (!Number.isNaN(parsed)) {
+      payload.width = parsed;
+    }
+  }
+  if (typeof height !== 'undefined') {
+    const parsed = parseInt(height, 10);
+    if (!Number.isNaN(parsed)) {
+      payload.height = parsed;
+    }
+  }
+  if (typeof seed !== 'undefined') {
+    const parsed = parseInt(seed, 10);
+    if (!Number.isNaN(parsed)) {
+      payload.seed = parsed;
+    }
+  }
+
+  try {
+    console.log('[image-mcp] streaming generate-image request', {
+      target: `${normalizedBaseUrl}/generate-stream`,
+      accelerator: resolvedAccelerator,
+      promptLength: payload.prompt.length,
+      width: payload.width,
+      height: payload.height
+    });
+
+    const response = await fetch(`${normalizedBaseUrl}/generate-stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok || !response.body) {
+      const detail = await response.text();
+      console.error('Image MCP stream error:', detail);
+      return res.status(502).json({ error: 'image_mcp_error', detail });
+    }
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const cleanup = () => {
+      if (response.body && typeof response.body.destroy === 'function' && !response.body.destroyed) {
+        response.body.destroy();
+      }
+    };
+
+    req.on('close', cleanup);
+    response.body.on('error', (err) => {
+      console.error('Image MCP stream transport error:', err);
+      cleanup();
+      if (!res.headersSent) {
+        res.status(500).end();
+      } else {
+        res.end();
+      }
+    });
+
+    response.body.pipe(res);
+  } catch (err) {
+    console.error('Streaming image generation failed:', err);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
 const uploadsDir = path.join(__dirname, 'public', 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
@@ -78,6 +246,7 @@ const STT_GPU_URL = process.env.STT_GPU_URL || '';
 const OPENVOICE_URL = process.env.OPENVOICE_URL || '';
 const OPENVOICE_GPU_URL = process.env.OPENVOICE_GPU_URL || '';
 const YOLO_MCP_URL = process.env.YOLO_MCP_URL || 'http://localhost:8000';
+const BSLIP_MCP_URL = process.env.BSLIP_MCP_URL || 'http://localhost:8002';
 const IMAGE_MCP_URL = process.env.IMAGE_MCP_URL || 'http://localhost:8001';
 const IMAGE_MCP_GPU_URL = process.env.IMAGE_MCP_GPU_URL || '';
 const OCR_DEFAULT_LANG = process.env.OCR_LANG || 'eng';
@@ -1086,8 +1255,6 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-});
-
 app.get('/health', async (_req, res) => {
   const serviceChecks = await Promise.all([
     checkServiceHealth({ name: 'ollama', baseUrl: OLLAMA_URL, path: '/' }),
@@ -1097,6 +1264,7 @@ app.get('/health', async (_req, res) => {
     checkServiceHealth({ name: 'openvoice', baseUrl: OPENVOICE_URL, path: '/hc' }),
     checkServiceHealth({ name: 'openvoiceGpu', baseUrl: OPENVOICE_GPU_URL, path: '/hc' }),
     checkServiceHealth({ name: 'yolo', baseUrl: YOLO_MCP_URL, path: '/' }),
+    checkServiceHealth({ name: 'bslip', baseUrl: BSLIP_MCP_URL, path: '/health' }),
     checkServiceHealth({ name: 'image', baseUrl: IMAGE_MCP_URL, path: '/' }),
     checkServiceHealth({ name: 'imageGpu', baseUrl: IMAGE_MCP_GPU_URL, path: '/' }),
     checkAnthropicHealth(),
@@ -1150,16 +1318,32 @@ app.get('/voices', async (req, res) => {
   try {
     const aggregated = [];
     const defaultCandidates = [];
+    const triedBases = new Set();
 
-    try {
-      const openvoiceBase = pickOpenvoiceBase('cpu');
-      if (openvoiceBase) {
-        const { voices, defaultVoice } = await fetchVoicesFromService(openvoiceBase, 'openvoice');
-        aggregated.push(...voices);
-        if (defaultVoice) defaultCandidates.push(defaultVoice);
+    const tryOpenvoiceSource = async (baseUrl, label) => {
+      if (!baseUrl) {
+        return;
       }
-    } catch (err) {
-      console.warn('Failed to fetch OpenVoice voices:', err.message);
+      const normalized = normalizeBaseUrl(baseUrl);
+      if (!normalized || triedBases.has(normalized)) {
+        return;
+      }
+      triedBases.add(normalized);
+      try {
+        const { voices, defaultVoice } = await fetchVoicesFromService(normalized, 'openvoice');
+        aggregated.push(...voices);
+        if (defaultVoice) {
+          defaultCandidates.push(defaultVoice);
+        }
+      } catch (err) {
+        console.warn(`Failed to fetch OpenVoice voices (${label}):`, err.message);
+      }
+    };
+
+    await tryOpenvoiceSource(OPENVOICE_URL, 'cpu');
+
+    if (!aggregated.length) {
+      await tryOpenvoiceSource(OPENVOICE_GPU_URL, 'gpu');
     }
 
     if (!aggregated.length) {

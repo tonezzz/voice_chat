@@ -37,11 +37,11 @@ OLLAMA_MODEL=llama3.2:3b
 ```
 
 ### MCP image generator service
-The stack now ships with an MCP-compatible image generator (`./image_mcp`) that exposes Stable Diffusion (default `runwayml/stable-diffusion-v1-5`) over both MCP and a simple REST shim. Relevant environment knobs (with their compose defaults) are:
+The stack now ships with an MCP-compatible image generator (`./mcp_imagen`) that exposes Stable Diffusion (default `runwayml/stable-diffusion-v1-5`) over both MCP and a simple REST shim. Relevant environment knobs (with their compose defaults) are:
 
 ```
-IMAGE_MCP_URL=http://image_mcp:8001
-IMAGE_MCP_GPU_URL=http://image_mcp_gpu:8001   # optional CUDA path exposed via docker-compose
+IMAGE_MCP_URL=http://mcp_imagen:8001
+IMAGE_MCP_GPU_URL=http://mcp_imagen_gpu:8001   # optional CUDA path exposed via docker-compose
 IMAGE_MODEL_ID=runwayml/stable-diffusion-v1-5
 IMAGE_TORCH_DEVICE=cpu                        # cpu service target
 IMAGE_TORCH_DEVICE_GPU=cuda                   # gpu service target (maps to USE_GPU build arg)
@@ -52,9 +52,35 @@ IMAGE_HEIGHT=512
 IMAGE_MODEL_ROOT=/mnt/c/_dev/_models/diffusers   # host cache path
 ```
 
-The CPU image generator still works out of the box, but GPU hosts get an additional `image_mcp_gpu` service (see `docker-compose.yml`). The server automatically routes `/generate-image` calls to the GPU endpoint when the frontend asks for it. On the UI side, the Image Lab provides a CPU/GPU selector (with persistence) so you can draft quickly on CUDA hardware while falling back to CPU when needed.
+The CPU image generator still works out of the box, but GPU hosts get an additional `mcp_imagen_gpu` service (see `docker-compose.yml`). 
+The server automatically routes `/generate-image` calls to the `mcp_imagen_gpu` endpoint when the frontend asks for it. On the UI side, the Image Lab provides a CPU/GPU selector (with persistence) so you can draft quickly on CUDA hardware while falling back to CPU when needed.
 
 The service is built automatically (`docker-compose.yml`), participates in health checks, and the API server proxies `/generate-image` requests to it. If you update the frontend, remember to run `npm run dev` for live testing and `npm run build:deploy` to sync the static assets served by the backend.
+
+### Bank slip MCP (mock EasySlip proxy)
+
+The stack also ships with a mock bank-slip verification MCP (`./bslip_mcp`). It exposes a `/verify` endpoint that returns canned transaction fields so you can exercise the Bank Slip panel without the real EasySlip API key.
+
+```
+BSLIP_MCP_URL=http://mcp-bslip:8002
+```
+
+- `docker-compose.yml` builds the FastAPI service, runs it on port `8002`, and the Node server proxies `/verify-slip` uploads to it. The mock returns the structured fields rendered in the UI (amount, sender, reference, etc.) plus a base64 preview.
+- Health checks now include a `bslip` entry. When the container is healthy you will see its status in the UI status drawer.
+- The frontend Bank Slip panel now calls `/verify-slip` instead of `/detect-image`, so the mock is the default path.
+
+#### Switching to the real EasySlip API
+
+1. Obtain an API key and store it in `.env` (or `.env.win`) as `EASYSIP_API_KEY=...`.
+2. Update `bslip_mcp/main.py` (or create a new service alongside it) so the FastAPI route forwards the multipart form data to `https://developer.easyslip.com/api/v1/verify` with the `Authorization: Bearer $EASYSIP_API_KEY` header.
+3. Rebuild/restart the `mcp_bslip` service:
+   ```
+   docker compose build mcp_bslip
+   docker compose up -d mcp_bslip
+   ```
+4. No frontend changes are required because `/verify-slip` already proxies to whatever MCP instance is running. Once the real API responds, the UI will show live data instead of the mock payload.
+
+Until you wire the real API, the mock container lets you iterate on the UI/UX and test wiring without external dependencies.
 
 ### Frontend deployment workflow
 

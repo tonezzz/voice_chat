@@ -25,16 +25,16 @@ mcp = FastMCP("StableDiffusionImageGenerator")
 _MODEL_ID = os.getenv("IMAGE_MODEL_ID", "runwayml/stable-diffusion-v1-5")
 _TORCH_DEVICE = os.getenv("TORCH_DEVICE", "cpu").lower()
 _DEFAULT_STEPS = int(os.getenv("IMAGE_STEPS", "25"))
-_MAX_STEPS = int(os.getenv("IMAGE_MAX_STEPS", "60"))
+_MAX_STEPS = int(os.getenv("IMAGE_MAX_STEPS", "50"))
 _MIN_STEPS = 5
 _DEFAULT_WIDTH = int(os.getenv("IMAGE_WIDTH", "512"))
 _DEFAULT_HEIGHT = int(os.getenv("IMAGE_HEIGHT", "512"))
 
 _pipeline: Optional[AutoPipelineForText2Image] = None
-_ACC_LABEL = "gpu" if _TORCH_DEVICE.startswith("cuda") else "cpu"
+_ACCELERATOR_LABEL = "gpu" if _TORCH_DEVICE.startswith("cuda") else "cpu"
 
 
-def _validate_multiple_of_eight(value: Any, fallback: int) -> int:
+def _validate_multiple_of_eight(value: int, fallback: int) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -44,37 +44,23 @@ def _validate_multiple_of_eight(value: Any, fallback: int) -> int:
     return parsed or fallback
 
 
-def _resolve_steps(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = _DEFAULT_STEPS
-    return max(_MIN_STEPS, min(parsed, _MAX_STEPS))
-
-
-def _resolve_seed(seed: Any) -> Optional[int]:
-    if seed is None:
-        return None
-    try:
-        parsed = int(seed)
-    except (TypeError, ValueError):
-        return None
-    return parsed
+def _resolve_dtype() -> torch.dtype:
+    if _TORCH_DEVICE.startswith("cuda"):
+        return torch.float16
+    return torch.float32
 
 
 def _get_pipeline() -> AutoPipelineForText2Image:
     global _pipeline
     if _pipeline is None:
-        torch_dtype = torch.float16 if _TORCH_DEVICE.startswith("cuda") else torch.float32
-        device = torch.device("cuda" if _TORCH_DEVICE.startswith("cuda") and torch.cuda.is_available() else "cpu")
-        pipe = AutoPipelineForText2Image.from_pretrained(
-            _MODEL_ID,
-            torch_dtype=torch_dtype,
-            safety_checker=None,
-        )
-        pipe.enable_attention_slicing()
-        pipe = pipe.to(device)
-        _pipeline = pipe
+        kwargs: Dict[str, Any] = {"torch_dtype": _resolve_dtype()}
+        custom_cache = os.getenv("IMAGE_MODEL_CACHE")
+        if custom_cache:
+            kwargs["cache_dir"] = custom_cache
+        pipeline = AutoPipelineForText2Image.from_pretrained(_MODEL_ID, **kwargs)
+        pipeline = pipeline.to(_TORCH_DEVICE)
+        pipeline.safety_checker = None
+        _pipeline = pipeline
     return _pipeline
 
 
@@ -87,90 +73,16 @@ def _image_to_base64(image: Image.Image) -> str:
 def _latents_to_base64(pipeline: AutoPipelineForText2Image, latents: torch.Tensor) -> Optional[str]:
     try:
         with torch.no_grad():
-            target_device = pipeline.device
-            work = latents.to(target_device)
-            if hasattr(pipeline, "decode_latents"):
-                decoded = pipeline.decode_latents(work)
-                pil_images = pipeline.image_processor.postprocess(decoded, output_type="pil")
-            else:
-                scaled = work / getattr(pipeline.vae.config, "scaling_factor", 0.18215)
-                decoded = pipeline.vae.decode(scaled).sample
-                decoded = (decoded / 2 + 0.5).clamp(0, 1)
-                decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
-                decoded = (decoded * 255).round().astype("uint8")
-                pil_images = [Image.fromarray(arr) for arr in decoded]
-        if not pil_images:
-            return None
-        return _image_to_base64(pil_images[0])
+            device = pipeline.device
+            scaled = (latents.to(device) / pipeline.vae.config.scaling_factor)
+            decoded = pipeline.vae.decode(scaled).sample
+        decoded = (decoded / 2 + 0.5).clamp(0, 1)
+        decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
+        array = (decoded * 255).round().astype("uint8")[0]
+        preview = Image.fromarray(array)
+        return _image_to_base64(preview)
     except Exception:
         return None
-
-
-def _build_image_payload(
-    image_base64: str,
-    prompt: str,
-    *,
-    negative_prompt: Optional[str],
-    guidance_scale: float,
-    steps: int,
-    width: int,
-    height: int,
-    seed: Optional[int],
-    duration_ms: Optional[int],
-) -> Dict[str, Any]:
-    return {
-        "image_base64": image_base64,
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "guidance_scale": guidance_scale,
-        "num_inference_steps": steps,
-        "width": width,
-        "height": height,
-        "seed": seed,
-        "duration_ms": duration_ms,
-        "accelerator": _ACC_LABEL,
-    }
-
-
-def _run_generation(payload: Dict[str, Any]) -> Dict[str, Any]:
-    prompt = payload["prompt"].strip()
-    negative_prompt = payload.get("negative_prompt")
-    if isinstance(negative_prompt, str):
-        negative_prompt = negative_prompt.strip() or None
-    guidance_scale = float(payload.get("guidance_scale", 7.0) or 7.0)
-    steps = _resolve_steps(payload.get("num_inference_steps"))
-    width = _validate_multiple_of_eight(payload.get("width"), _DEFAULT_WIDTH)
-    height = _validate_multiple_of_eight(payload.get("height"), _DEFAULT_HEIGHT)
-    seed = _resolve_seed(payload.get("seed"))
-
-    generator = None
-    if seed is not None:
-        generator = torch.Generator(device=_TORCH_DEVICE if torch.cuda.is_available() else "cpu").manual_seed(seed)
-
-    pipeline = _get_pipeline()
-    started = time.time()
-    result = pipeline(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        guidance_scale=guidance_scale,
-        num_inference_steps=steps,
-        width=width,
-        height=height,
-        generator=generator,
-    )
-    duration_ms = int((time.time() - started) * 1000)
-    image = result.images[0]
-    return _build_image_payload(
-        _image_to_base64(image),
-        prompt,
-        negative_prompt=negative_prompt,
-        guidance_scale=guidance_scale,
-        steps=steps,
-        width=width,
-        height=height,
-        seed=seed,
-        duration_ms=duration_ms,
-    )
 
 
 @mcp.tool()
@@ -183,19 +95,47 @@ def generate_image(
     height: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if not prompt or not isinstance(prompt, str):
+    if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt is required")
 
-    payload = {
+    steps = max(_MIN_STEPS, min(_MAX_STEPS, int(num_inference_steps or _DEFAULT_STEPS)))
+    resolved_width = _validate_multiple_of_eight(width, _DEFAULT_WIDTH)
+    resolved_height = _validate_multiple_of_eight(height, _DEFAULT_HEIGHT)
+
+    pipeline = _get_pipeline()
+    generator = None
+    used_seed = seed
+    if seed is not None:
+        try:
+            used_seed = int(seed)
+            generator = torch.Generator(device=_TORCH_DEVICE).manual_seed(used_seed)
+        except (TypeError, ValueError):
+            used_seed = None
+
+    started = time.time()
+    result = pipeline(
+        prompt=prompt.strip(),
+        negative_prompt=negative_prompt.strip() if isinstance(negative_prompt, str) else None,
+        guidance_scale=float(guidance_scale or 7.0),
+        num_inference_steps=steps,
+        width=resolved_width,
+        height=resolved_height,
+        generator=generator,
+    )
+    duration_ms = int((time.time() - started) * 1000)
+    image = result.images[0]
+
+    return {
+        "image_base64": _image_to_base64(image),
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "guidance_scale": guidance_scale,
-        "num_inference_steps": num_inference_steps,
-        "width": width,
-        "height": height,
-        "seed": seed,
+        "num_inference_steps": steps,
+        "width": resolved_width,
+        "height": resolved_height,
+        "seed": used_seed,
+        "duration_ms": duration_ms,
     }
-    return _run_generation(payload)
 
 
 @mcp.custom_route("/generate", methods=["POST"])
@@ -213,12 +153,21 @@ async def generate_http(request: Request) -> JSONResponse:
         return JSONResponse({"error": "prompt_required"}, status_code=HTTP_400_BAD_REQUEST)
 
     try:
-        data = _run_generation(payload)
-        return JSONResponse(data)
+        data = generate_image(
+            prompt=prompt,
+            negative_prompt=payload.get("negative_prompt"),
+            guidance_scale=float(payload.get("guidance_scale", 7.0)),
+            num_inference_steps=int(payload.get("num_inference_steps", _DEFAULT_STEPS)),
+            width=payload.get("width"),
+            height=payload.get("height"),
+            seed=payload.get("seed"),
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=HTTP_400_BAD_REQUEST)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": "generation_failed", "detail": str(exc)}, status_code=500)
+
+    return JSONResponse(data)
 
 
 @mcp.custom_route("/generate-stream", methods=["POST"])
@@ -235,35 +184,45 @@ async def generate_stream_http(request: Request) -> StreamingResponse:
     if not isinstance(prompt, str) or not prompt.strip():
         return JSONResponse({"error": "prompt_required"}, status_code=HTTP_400_BAD_REQUEST)
 
-    steps = _resolve_steps(payload.get("num_inference_steps"))
-    width = _validate_multiple_of_eight(payload.get("width"), _DEFAULT_WIDTH)
-    height = _validate_multiple_of_eight(payload.get("height"), _DEFAULT_HEIGHT)
-    negative_prompt = payload.get("negative_prompt")
-    if isinstance(negative_prompt, str):
-        negative_prompt = negative_prompt.strip() or None
-    guidance_scale = float(payload.get("guidance_scale", 7.0) or 7.0)
-    seed = _resolve_seed(payload.get("seed"))
+    steps = max(_MIN_STEPS, min(_MAX_STEPS, int(payload.get("num_inference_steps", _DEFAULT_STEPS) or _DEFAULT_STEPS)))
+    resolved_width = _validate_multiple_of_eight(payload.get("width"), _DEFAULT_WIDTH)
+    resolved_height = _validate_multiple_of_eight(payload.get("height"), _DEFAULT_HEIGHT)
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
     started = time.time()
 
     def emit(event: Dict[str, Any]) -> None:
-        event.setdefault("accelerator", _ACC_LABEL)
+        event.setdefault("accelerator", _ACCELERATOR_LABEL)
         serialized = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
         asyncio.run_coroutine_threadsafe(queue.put(serialized), loop)
 
-    def finalize() -> None:
+    def finalize_queue() -> None:
         asyncio.run_coroutine_threadsafe(queue.put(None), loop)
 
     def run_generation() -> None:
         try:
             pipeline = _get_pipeline()
             generator = None
-            used_seed = seed
+            seed = payload.get("seed")
+            used_seed = None
             if seed is not None:
-                generator = torch.Generator(device=_TORCH_DEVICE if torch.cuda.is_available() else "cpu").manual_seed(seed)
-            emit({"type": "status", "status": "starting", "total_steps": steps})
+                try:
+                    used_seed = int(seed)
+                    generator = torch.Generator(device=_TORCH_DEVICE).manual_seed(used_seed)
+                except (TypeError, ValueError):
+                    used_seed = None
+
+            negative_prompt = payload.get("negative_prompt")
+            effective_negative = negative_prompt.strip() if isinstance(negative_prompt, str) else None
+            guidance_scale = float(payload.get("guidance_scale", 7.0) or 7.0)
+
+            emit({
+                "type": "status",
+                "status": "starting",
+                "prompt": prompt.strip(),
+                "total_steps": steps,
+            })
 
             callback_interval = max(1, steps // 6)
 
@@ -272,25 +231,25 @@ async def generate_stream_http(request: Request) -> StreamingResponse:
                     return
                 if step % callback_interval != 0 and step + 1 < steps:
                     return
-                preview = _latents_to_base64(pipeline, latents)
-                if not preview:
+                preview_base64 = _latents_to_base64(pipeline, latents)
+                if not preview_base64:
                     return
                 emit(
                     {
                         "type": "progress",
                         "step": step,
                         "total_steps": steps,
-                        "image_base64": preview,
+                        "image_base64": preview_base64,
                     }
                 )
 
             result = pipeline(
                 prompt=prompt.strip(),
-                negative_prompt=negative_prompt,
+                negative_prompt=effective_negative,
                 guidance_scale=guidance_scale,
                 num_inference_steps=steps,
-                width=width,
-                height=height,
+                width=resolved_width,
+                height=resolved_height,
                 generator=generator,
                 callback=progress_callback,
                 callback_steps=1,
@@ -298,23 +257,23 @@ async def generate_stream_http(request: Request) -> StreamingResponse:
             duration_ms = int((time.time() - started) * 1000)
             image = result.images[0]
             emit(
-                _build_image_payload(
-                    _image_to_base64(image),
-                    prompt.strip(),
-                    negative_prompt=negative_prompt,
-                    guidance_scale=guidance_scale,
-                    steps=steps,
-                    width=width,
-                    height=height,
-                    seed=used_seed,
-                    duration_ms=duration_ms,
-                )
+                {
+                    "type": "complete",
+                    "prompt": prompt,
+                    "negative_prompt": effective_negative,
+                    "guidance_scale": guidance_scale,
+                    "num_inference_steps": steps,
+                    "width": resolved_width,
+                    "height": resolved_height,
+                    "seed": used_seed,
+                    "duration_ms": duration_ms,
+                    "image_base64": _image_to_base64(image),
+                }
             )
-            emit({"type": "complete"})
         except Exception as exc:  # noqa: BLE001
             emit({"type": "error", "error": str(exc)})
         finally:
-            finalize()
+            finalize_queue()
 
     threading.Thread(target=run_generation, daemon=True).start()
 

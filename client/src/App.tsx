@@ -9,6 +9,31 @@ interface ServiceStatus {
   detail?: unknown
 }
 
+interface BankVerificationInfo {
+  referenceId?: string | null
+  provider?: string | null
+  status?: string | null
+}
+
+interface ApiBankField {
+  id?: string
+  type?: string
+  label?: string
+  value?: string | null
+  confidence?: number | null
+  bbox?: number[] | null
+}
+
+interface BankSlipVerificationResponse {
+  fields?: ApiBankField[]
+  image?: string | null
+  verification?: {
+    reference_id?: string
+    provider?: string
+    status?: string
+  }
+}
+
 const BANK_OCR_LANG_OPTIONS = [
   { value: 'eng', label: 'English' },
   { value: 'tha', label: 'ไทย (Thai)' },
@@ -42,7 +67,9 @@ const API_URL = `${API_BASE}/voice-chat`
 const API_AUDIO_URL = `${API_BASE}/voice-chat-audio`
 const HEALTH_URL = `${API_BASE}/health`
 const DETECT_URL = `${API_BASE}/detect-image`
+const VERIFY_SLIP_URL = `${API_BASE}/verify-slip`
 const GENERATE_IMAGE_URL = `${API_BASE}/generate-image`
+const GENERATE_IMAGE_STREAM_URL = `${API_BASE}/generate-image-stream`
 const OCR_URL = `${API_BASE}/ocr-image`
 const VOICES_URL = `${API_BASE}/voices`
 const PREVIEW_VOICE_URL = `${API_BASE}/preview-voice`
@@ -170,6 +197,8 @@ type BankFieldType =
   | 'reference'
   | 'other'
 
+type BankFieldSource = 'yolo' | 'api'
+
 interface TransactionField {
   id: string
   type: BankFieldType
@@ -258,6 +287,13 @@ interface GeneratedImageResult {
   accelerator?: 'cpu' | 'gpu' | null
 }
 
+interface ImagePreviewState {
+  image_base64?: string
+  step?: number | null
+  total_steps?: number | null
+  status?: string
+}
+
 const BANK_FIELD_KEYWORDS: Record<BankFieldType, string[]> = {
   amount: [
     'amount',
@@ -292,6 +328,8 @@ const BANK_FIELD_LABELS: Record<BankFieldType, string> = {
   reference: 'Reference',
   other: 'Other details'
 }
+
+const BANK_FIELD_ORDER: BankFieldType[] = ['amount', 'sender', 'receiver', 'account', 'bank', 'date', 'time', 'reference', 'other']
 
 const BANK_FIELD_CONFIDENCE_FLOOR: Partial<Record<BankFieldType, number>> = {
   amount: 0.35,
@@ -545,6 +583,29 @@ const buildTransactionFields = (
   }, [])
 
   return applyConfidenceFloor(fields)
+}
+
+const mapApiFieldsToTransactionFields = (fields?: ApiBankField[] | null): TransactionField[] => {
+  if (!Array.isArray(fields) || fields.length === 0) {
+    return []
+  }
+
+  return fields.map((field, idx) => {
+    const primaryLabel = typeof field.label === 'string' ? field.label : ''
+    const inferredType = normalizeBankFieldType(field.type || primaryLabel || '')
+    const label = primaryLabel?.trim() || BANK_FIELD_LABELS[inferredType]
+    const value = typeof field.value === 'string' ? field.value.trim() : field.value ?? ''
+    const bbox = Array.isArray(field.bbox) && field.bbox.length === 4 ? (field.bbox as [number, number, number, number]) : null
+
+    return {
+      id: field.id || `mapped-field-${idx}`,
+      type: inferredType,
+      label,
+      value,
+      confidence: typeof field.confidence === 'number' ? field.confidence : undefined,
+      bbox
+    }
+  })
 }
 
 const normalizeOcrBbox = (bbox?: number[] | null): [number, number, number, number] | null => {
@@ -848,10 +909,12 @@ export function App() {
     null
   )
   const [bankFields, setBankFields] = useState<TransactionField[]>([])
+  const [bankFieldSource, setBankFieldSource] = useState<BankFieldSource>('api')
   const [bankDetectionSourceFile, setBankDetectionSourceFile] = useState<File | null>(null)
   const [bankOcrResult, setBankOcrResult] = useState<BankOcrResult | null>(null)
   const [bankOcrLang, setBankOcrLang] = useState('eng')
   const [bankOcrBusy, setBankOcrBusy] = useState(false)
+  const [bankVerificationInfo, setBankVerificationInfo] = useState<BankVerificationInfo>({})
   const [bankOcrError, setBankOcrError] = useState<string | null>(null)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [activePanel, setActivePanel] = useState<'chat' | 'openvoice' | 'image-mcp' | 'yolo-detection' | 'bank-slip'>(() =>
@@ -885,6 +948,17 @@ export function App() {
   const [voicesLoading, setVoicesLoading] = useState(false)
   const [voicePreviewLoading, setVoicePreviewLoading] = useState(false)
   const [voicePreviewError, setVoicePreviewError] = useState<string | null>(null)
+
+  const VOICE_SERVICE_HINT =
+    'Voice service unavailable. Ensure the OpenVoice containers are running (openvoice-tts / openvoice-tts-gpu) and reload.'
+  const appendVoiceServiceHint = (message: string) => {
+    const trimmed = (message || '').trim()
+    if (!trimmed) {
+      return VOICE_SERVICE_HINT
+    }
+    const needsPeriod = !/[.!?]$/.test(trimmed)
+    return `${trimmed}${needsPeriod ? '.' : ''} ${VOICE_SERVICE_HINT}`
+  }
   const [speechLanguage, setSpeechLanguage] = useState(() => {
     if (typeof window === 'undefined') return 'auto'
     try {
@@ -936,7 +1010,9 @@ export function App() {
   const [imageResults, setImageResults] = useState<GeneratedImageResult[]>([])
   const [imageBusy, setImageBusy] = useState(false)
   const [imageError, setImageError] = useState<string | null>(null)
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const imageStreamControllerRef = useRef<AbortController | null>(null)
   const detectFileInputRef = useRef<HTMLInputElement | null>(null)
   const detectFileInputRefAlt = useRef<HTMLInputElement | null>(null)
   const detectFileInputRefBank = useRef<HTMLInputElement | null>(null)
@@ -1377,6 +1453,25 @@ export function App() {
     }
   }, [healthServices])
 
+  const openvoiceCpuHealthy = useMemo(
+    () => healthServices.some((svc) => svc.name === 'openvoice' && svc.status === 'ok'),
+    [healthServices]
+  )
+  const openvoiceGpuHealthy = useMemo(
+    () => healthServices.some((svc) => svc.name === 'openvoiceGpu' && svc.status === 'ok'),
+    [healthServices]
+  )
+  const visibleVoiceOptions = useMemo(() => {
+    if (!voiceOptions.length) return voiceOptions
+    if (!openvoiceCpuHealthy && !openvoiceGpuHealthy && healthServices.length) {
+      return []
+    }
+    if (openvoiceGpuHealthy) {
+      return voiceOptions
+    }
+    return voiceOptions.filter((voice) => (voice.tier || 'standard').toLowerCase() !== 'premium')
+  }, [voiceOptions, openvoiceCpuHealthy, openvoiceGpuHealthy, healthServices.length])
+
   useEffect(() => {
     const current = providerStatuses[llmProvider]
     if (current && !current.available) {
@@ -1536,8 +1631,22 @@ export function App() {
       try {
         const res = await fetch(VOICES_URL)
         if (!res.ok) {
-          const detail = await res.text()
-          throw new Error(detail || 'Failed to load voices')
+          const detailText = await res.text()
+          let parsedMessage: string | null = detailText ? detailText.trim() : null
+          try {
+            const parsed = detailText ? JSON.parse(detailText) : null
+            const serverError = typeof parsed?.error === 'string' ? parsed.error : null
+            const serverDetail = typeof parsed?.detail === 'string' ? parsed.detail : null
+            const serverMessage = typeof parsed?.message === 'string' ? parsed.message : null
+            parsedMessage = serverDetail || serverMessage || serverError || parsedMessage
+            if (serverError === 'voices_unavailable') {
+              parsedMessage = appendVoiceServiceHint(parsedMessage || 'Voice service unavailable')
+            }
+          } catch (jsonErr) {
+            console.warn('Failed to parse voice error payload', jsonErr)
+          }
+          const statusMsg = `Voice fetch failed (HTTP ${res.status}).`
+          throw new Error([statusMsg, parsedMessage].filter(Boolean).join(' '))
         }
         const data = await res.json()
         if (cancelled) return
@@ -1548,7 +1657,14 @@ export function App() {
       } catch (err: any) {
         if (cancelled) return
         console.error('Voice fetch failed', err)
-        setVoiceFetchError(err?.message || 'Failed to load voices')
+        let friendlyMessage = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : ''
+        if (!friendlyMessage || /failed to fetch/i.test(friendlyMessage) || /network/i.test(friendlyMessage)) {
+          friendlyMessage = appendVoiceServiceHint('Cannot reach the voice service')
+        }
+        if (!friendlyMessage.toLowerCase().includes('voice service unavailable')) {
+          friendlyMessage = appendVoiceServiceHint(friendlyMessage)
+        }
+        setVoiceFetchError(friendlyMessage)
         setVoiceOptions([])
       } finally {
         if (!cancelled) {
@@ -1567,26 +1683,29 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    if (!voiceOptions.length) {
+    if (!visibleVoiceOptions.length) {
+      if (selectedVoice !== null) {
+        setSelectedVoice(null)
+      }
       return
     }
-    if (selectedVoice && voiceOptions.some((voice) => voice.id === selectedVoice)) {
+    if (selectedVoice && visibleVoiceOptions.some((voice) => voice.id === selectedVoice)) {
       return
     }
     const fallback =
-      (defaultVoiceId && voiceOptions.find((voice) => voice.id === defaultVoiceId)?.id) || voiceOptions[0].id
+      (defaultVoiceId && visibleVoiceOptions.find((voice) => voice.id === defaultVoiceId)?.id) || visibleVoiceOptions[0].id
     setSelectedVoice(fallback)
-  }, [voiceOptions, defaultVoiceId, selectedVoice])
+  }, [visibleVoiceOptions, defaultVoiceId, selectedVoice])
 
   useEffect(() => {
-    if (!voiceOptions.length) return
+    if (!visibleVoiceOptions.length) return
     if (speechLanguage === 'th') {
-      const thaiVoice = voiceOptions.find((voice) => voice.id.toLowerCase().includes('th'))
+      const thaiVoice = visibleVoiceOptions.find((voice) => voice.id.toLowerCase().includes('th'))
       if (thaiVoice && thaiVoice.id !== selectedVoice) {
         setSelectedVoice(thaiVoice.id)
       }
     }
-  }, [speechLanguage, voiceOptions, selectedVoice])
+  }, [speechLanguage, visibleVoiceOptions, selectedVoice])
 
   useEffect(() => {
     if (activePanel !== 'chat') {
@@ -1729,7 +1848,10 @@ export function App() {
             sessionId,
             history: historyPayload,
             provider: llmProvider,
-            voice: selectedVoice && voiceOptions.some((voice) => voice.id === selectedVoice) ? selectedVoice : undefined
+            voice:
+              selectedVoice && visibleVoiceOptions.some((voice) => voice.id === selectedVoice)
+                ? selectedVoice
+                : undefined
           })
         })
         if (!res.ok) {
@@ -1891,7 +2013,7 @@ export function App() {
         formData.append('whisper_model', whisperModel)
         formData.append('accelerator', acc)
         formData.append('provider', llmProvider)
-        if (selectedVoice && voiceOptions.some((voice) => voice.id === selectedVoice)) {
+        if (selectedVoice && visibleVoiceOptions.some((voice) => voice.id === selectedVoice)) {
           formData.append('voice', selectedVoice)
         }
         if (speechLanguage) {
@@ -2479,44 +2601,64 @@ export function App() {
   const handleBankDetectFile = async (rawFile: File) => {
     const file = ensureFileHasName(rawFile)
     const formData = new FormData()
-    formData.append('image', file, file.name)
-    formData.append('confidence', bankDetectConfidence.toString())
+    formData.append('file', file, file.name)
 
+    setBankFieldSource('api')
     setBankDetecting(true)
     setBankDetectionError(null)
     setBankDetectionSourceFile(file)
     setBankOcrResult(null)
     setBankOcrError(null)
+    setBankVerificationInfo({})
+    setBankFields([])
+    setBankDetectionResults([])
 
     try {
-      const res = await fetch(DETECT_URL, {
+      const res = await fetch(VERIFY_SLIP_URL, {
         method: 'POST',
         body: formData
       })
 
       if (!res.ok) {
         const detail = await res.text()
-        throw new Error(detail || 'Detection failed')
+        throw new Error(detail || 'Verification failed')
       }
 
-      const data = await res.json()
+      const data = (await res.json()) as BankSlipVerificationResponse
       const imageData = typeof data?.image === 'string' && data.image ? data.image : null
-      const detections = Array.isArray(data?.detections) ? (data.detections as DetectionResult[]) : []
+      const mappedFields = mapApiFieldsToTransactionFields(data?.fields)
 
-      setBankDetectionImage(imageData)
-      setBankDetectionResults(detections)
+      setBankFields(mappedFields)
+
+      const derivedDetections: DetectionResult[] = mappedFields
+        .filter((field) => Array.isArray(field.bbox) && field.bbox.length === 4)
+        .map((field, idx) => ({
+          bbox: field.bbox as [number, number, number, number],
+          class_name: field.label,
+          class_id: idx,
+          confidence: typeof field.confidence === 'number' ? field.confidence : undefined
+        }))
+
+      setBankDetectionResults(derivedDetections)
+      setBankDetectionImage(imageData || null)
       setBankDetectionPreviewUrl((prev) => {
         if (imageData && prev && prev.startsWith('blob:')) {
           URL.revokeObjectURL(prev)
         }
         return imageData || prev || null
       })
+      setBankVerificationInfo({
+        referenceId: data?.verification?.reference_id || null,
+        provider: data?.verification?.provider || null,
+        status: data?.verification?.status || null
+      })
     } catch (err: any) {
-      console.error('Bank detection failed', err)
-      setBankDetectionError(err?.message || 'Detection failed')
+      console.error('Bank slip verification failed', err)
+      setBankDetectionError(err?.message || 'Verification failed')
       setBankDetectionImage(null)
       setBankDetectionResults([])
       setBankFields([])
+      setBankVerificationInfo({})
     } finally {
       setBankDetecting(false)
       if (detectFileInputRefBank.current) {
@@ -2539,6 +2681,8 @@ export function App() {
       setBankOcrResult(null)
       setBankOcrError(null)
       setBankOcrBusy(false)
+      setBankVerificationInfo({})
+      setBankFieldSource('api')
       setBankDetectionPreviewUrl((prev) => {
         if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev)
         return URL.createObjectURL(file)
@@ -2691,7 +2835,23 @@ export function App() {
     stopCamera()
   }
 
+  const cancelImageStream = useCallback(() => {
+    if (imageStreamControllerRef.current) {
+      imageStreamControllerRef.current.abort()
+      imageStreamControllerRef.current = null
+    }
+    setImagePreview(null)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      cancelImageStream()
+    }
+  }, [cancelImageStream])
+
   const resetImageForm = () => {
+    cancelImageStream()
+    setImageBusy(false)
     setImagePrompt('')
     setImageNegativePrompt('')
     setImageGuidance(7)
@@ -2753,14 +2913,20 @@ export function App() {
       payload.seed = imageSeedValue
     }
 
+    cancelImageStream()
     setImageBusy(true)
     setImageError(null)
+    setImagePreview(null)
+
+    const controller = new AbortController()
+    imageStreamControllerRef.current = controller
 
     try {
-      const response = await fetch(GENERATE_IMAGE_URL, {
+      const response = await fetch(GENERATE_IMAGE_STREAM_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: controller.signal
       })
 
       if (!response.ok) {
@@ -2768,17 +2934,92 @@ export function App() {
         throw new Error(detail || 'Image MCP unavailable')
       }
 
-      const data = await response.json()
-      const mapped = mapImageResponse(data)
-      if (!mapped.image_base64) {
-        throw new Error('Image generator returned no pixels')
+      if (!response.body) {
+        throw new Error('Streaming not supported in this browser')
       }
 
-      setImageResults((prev) => [mapped, ...prev].slice(0, IMAGE_HISTORY_LIMIT))
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let completed = false
+
+      while (true) {
+        const { done, value } = await reader.read()
+        const chunk = value ?? new Uint8Array()
+        buffer += decoder.decode(chunk, { stream: !done })
+
+        let newlineIndex = buffer.indexOf('\n')
+        while (newlineIndex >= 0) {
+          const rawLine = buffer.slice(0, newlineIndex).trim()
+          buffer = buffer.slice(newlineIndex + 1)
+          if (rawLine.length === 0) {
+            newlineIndex = buffer.indexOf('\n')
+            continue
+          }
+
+          let event: any
+          try {
+            event = JSON.parse(rawLine)
+          } catch (err) {
+            console.warn('Skipping malformed image stream chunk', rawLine)
+            newlineIndex = buffer.indexOf('\n')
+            continue
+          }
+
+          if (event?.type === 'status') {
+            setImagePreview((prev) => ({ ...(prev || {}), status: String(event.status || 'starting') }))
+            newlineIndex = buffer.indexOf('\n')
+            continue
+          }
+
+          if (event?.type === 'progress' && typeof event.image_base64 === 'string') {
+            setImagePreview({
+              image_base64: event.image_base64,
+              step: typeof event.step === 'number' ? event.step : null,
+              total_steps: typeof event.total_steps === 'number' ? event.total_steps : null,
+              status: 'progress'
+            })
+            newlineIndex = buffer.indexOf('\n')
+            continue
+          }
+
+          if (event?.type === 'complete') {
+            const mapped = mapImageResponse(event)
+            if (!mapped.image_base64) {
+              throw new Error('Image generator returned no pixels')
+            }
+            setImageResults((prev) => [mapped, ...prev].slice(0, IMAGE_HISTORY_LIMIT))
+            setImagePreview(null)
+            completed = true
+            break
+          }
+
+          if (event?.type === 'error') {
+            throw new Error(event.error || 'Image generation failed')
+          }
+
+          newlineIndex = buffer.indexOf('\n')
+        }
+
+        if (completed || done) {
+          break
+        }
+      }
+
+      if (!completed) {
+        throw new Error('Image stream ended before completion')
+      }
     } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        return
+      }
       console.error('Image generation failed', err)
+      setImagePreview(null)
       setImageError(err?.message || 'Image generation failed')
     } finally {
+      if (imageStreamControllerRef.current === controller) {
+        imageStreamControllerRef.current = null
+      }
       setImageBusy(false)
     }
   }
@@ -2802,17 +3043,21 @@ export function App() {
       setBankOcrResult(null)
       setBankOcrError(null)
       setBankOcrBusy(false)
+      setBankVerificationInfo({})
     }
   }, [bankDetectionImage])
 
   useEffect(() => {
+    if (bankFieldSource !== 'yolo') {
+      return
+    }
     if (!bankDetectionResults.length) {
       setBankFields([])
       return
     }
     const fields = buildTransactionFields(bankDetectionResults, bankDetectionImageSize, bankOcrResult?.words)
     setBankFields(fields)
-  }, [bankDetectionResults, bankDetectionImageSize, bankOcrResult])
+  }, [bankDetectionResults, bankDetectionImageSize, bankOcrResult, bankFieldSource])
 
   const filteredLinkedDetections = useMemo(() => {
     if (!secondaryDetectionTargets.length) {
@@ -2849,18 +3094,32 @@ export function App() {
   const imageWidthOptions = IMAGE_DIMENSION_OPTIONS.map((value) => ({ value, label: `${value}px` }))
   const imageHeightOptions = imageWidthOptions
 
+  const imageStatusLabel = useMemo(() => {
+    if (imageBusy) {
+      if (imagePreview?.step && imagePreview?.total_steps) {
+        return `Step ${imagePreview.step}/${imagePreview.total_steps}`
+      }
+      if (imagePreview?.status) {
+        return imagePreview.status.replace(/_/g, ' ')
+      }
+      return 'Generating…'
+    }
+    return imageResults.length ? 'Ready' : 'Drafting'
+  }, [imageBusy, imagePreview, imageResults.length])
+
   useEffect(() => {
     writeToStorage(STORAGE_KEYS.imageAccelerator, imageAccelerator)
   }, [imageAccelerator])
 
   const selectedVoiceInfo = useMemo(() => {
     if (!selectedVoice) return null
-    return voiceOptions.find((voice) => voice.id === selectedVoice) || null
-  }, [selectedVoice, voiceOptions])
+    const availableVoices = visibleVoiceOptions.filter((voice) => voice.tier !== 'premium' || health === 'ok')
+    return availableVoices.find((voice) => voice.id === selectedVoice) || null
+  }, [selectedVoice, visibleVoiceOptions, health])
 
   const premiumVoiceNames = useMemo(
-    () => voiceOptions.filter((voice) => (voice.tier || 'standard') === 'premium').map((voice) => voice.name),
-    [voiceOptions]
+    () => visibleVoiceOptions.filter((voice) => (voice.tier || 'standard') === 'premium' && health === 'ok').map((voice) => voice.name),
+    [visibleVoiceOptions, health]
   )
 
   const premiumVoiceSummary = useMemo(() => {
@@ -3486,12 +3745,12 @@ export function App() {
                       value={selectedVoice || ''}
                       onChange={(e) => setSelectedVoice(e.target.value || null)}
                       className="chip-select voice-select"
-                      disabled={!voiceOptions.length || voicesLoading}
+                      disabled={!visibleVoiceOptions.length || voicesLoading}
                     >
-                      {voiceOptions.length === 0 ? (
+                      {visibleVoiceOptions.length === 0 ? (
                         <option value="">{voicesLoading ? 'Loading voices…' : 'No voices available'}</option>
                       ) : (
-                        voiceOptions.map((voice) => {
+                        visibleVoiceOptions.map((voice) => {
                           const parts = [voice.name]
                           if ((voice.tier || 'standard') === 'premium') {
                             parts.push('Premium')
@@ -3797,7 +4056,7 @@ export function App() {
                   <p>Create reproducible image prompts with guardrails before sending them to the assistant.</p>
                 </div>
                 <div className={`image-status-chip ${imageBusy ? 'busy' : 'ready'}`} aria-live="polite">
-                  {imageBusy ? 'Generating…' : imageResults.length ? 'Ready' : 'Drafting'}
+                  {imageStatusLabel}
                 </div>
               </header>
               <div className="image-lab-grid">
@@ -3922,6 +4181,27 @@ export function App() {
                   </div>
                 </div>
                 <div className="image-results-column">
+                  {imagePreview ? (
+                    <article className="image-progress-preview" role="status" aria-live="polite">
+                      <div className="image-preview">
+                        {imagePreview.image_base64 ? (
+                          <img src={imagePreview.image_base64} alt="In-progress render" />
+                        ) : (
+                          <div className="image-placeholder">Preparing preview…</div>
+                        )}
+                      </div>
+                      <footer>
+                        <span>
+                          {imagePreview.step && imagePreview.total_steps
+                            ? `Step ${imagePreview.step}/${imagePreview.total_steps}`
+                            : 'Generating…'}
+                        </span>
+                        <span className={`image-status-chip ${imageBusy ? 'busy' : 'ready'}`}>
+                          {imageStatusLabel}
+                        </span>
+                      </footer>
+                    </article>
+                  ) : null}
                   <div className="image-best-practices" aria-live="polite">
                     <h3>Best-practice checklist</h3>
                     <ol>
@@ -4378,7 +4658,7 @@ export function App() {
                   <div className="bank-summary-row">
                     <div className="summary-metric">
                       <span className="summary-label">Extracted fields</span>
-                      <span className="summary-value">{bankFields.length}</span>
+                      <span className="summary-value">{bankSummaryFieldCount}</span>
                     </div>
                     <div className="summary-metric">
                       <span className="summary-label">Detections</span>
@@ -4386,15 +4666,19 @@ export function App() {
                     </div>
                     <div className="summary-metric">
                       <span className="summary-label">Confidence</span>
-                      <span className="summary-value">
-                        {bankFields.length
-                          ? `${(
-                              bankFields.reduce((acc, field) => acc + (field.confidence || 0), 0) / bankFields.length
-                            )
-                              .toFixed(2)
-                              .replace(/\.00$/, '')} avg`
-                          : '—'}
-                      </span>
+                      <span className="summary-value">{bankSummaryAvgConfidence}</span>
+                    </div>
+                    <div className="summary-metric">
+                      <span className="summary-label">Provider</span>
+                      <span className="summary-value">{bankVerificationProviderLabel}</span>
+                    </div>
+                    <div className="summary-metric">
+                      <span className="summary-label">Status</span>
+                      <span className="summary-value">{bankVerificationStatusLabel}</span>
+                    </div>
+                    <div className="summary-metric">
+                      <span className="summary-label">Reference</span>
+                      <span className="summary-value">{bankVerificationReferenceLabel}</span>
                     </div>
                   </div>
                   <div className="bank-ocr-summary" aria-live="polite">
@@ -4457,43 +4741,87 @@ export function App() {
                   </div>
 
                   <div className="insight-grid">
-                    {(['amount', 'sender', 'receiver', 'account', 'bank', 'date', 'time', 'reference', 'other'] as BankFieldType[]).map((fieldType) => {
-                      const fieldsForType = bankFields.filter((field) => field.type === fieldType)
+                    {BANK_FIELD_ORDER.map((fieldType) => {
+                      const sortedFields = bankFields
+                        .filter((field) => field.type === fieldType)
+                        .sort((a, b) => {
+                          const confDelta = (b.confidence ?? 0) - (a.confidence ?? 0)
+                          if (confDelta !== 0) return confDelta
+                          return (b.value?.length ?? 0) - (a.value?.length ?? 0)
+                        })
+                      const [primaryField, ...alternateFields] = sortedFields
+                      const fieldCount = sortedFields.length
+
                       return (
                         <div className="insight-card" key={`bank-field-${fieldType}`}>
                           <div className="insight-card-header">
-                            <h3>{BANK_FIELD_LABELS[fieldType]}</h3>
-                            <span className="insight-count">{fieldsForType.length}</span>
+                            <div>
+                              <h3>{BANK_FIELD_LABELS[fieldType]}</h3>
+                              <span className="insight-count">{fieldCount}</span>
+                            </div>
+                            {primaryField && typeof primaryField.confidence === 'number' ? (
+                              <span className="confidence-chip" title="Highest-confidence match">
+                                {(primaryField.confidence * 100).toFixed(1)}%
+                              </span>
+                            ) : null}
                           </div>
-                          {fieldsForType.length === 0 ? (
+
+                          {!primaryField ? (
                             <p className="insight-empty">No {BANK_FIELD_LABELS[fieldType].toLowerCase()} detected.</p>
                           ) : (
-                            <ul className="insight-list">
-                              {fieldsForType.map((field) => (
-                                <li key={field.id} className="insight-item">
-                                  <div className="insight-item-header">
-                                    <strong>{field.value || field.label}</strong>
-                                    {typeof field.confidence === 'number' && (
-                                      <span className="confidence-chip">{(field.confidence * 100).toFixed(1)}%</span>
-                                    )}
+                            <>
+                              <div className="insight-primary">
+                                <div className="insight-item-header">
+                                  <strong>{primaryField.value || primaryField.label || '—'}</strong>
+                                </div>
+                                {primaryField.label && primaryField.value && primaryField.value !== primaryField.label && (
+                                  <div className="insight-detail-row">
+                                    <span>Label</span>
+                                    <span className="insight-detail-value">{primaryField.label}</span>
                                   </div>
-                                  {field.label && field.value && field.value !== field.label && (
-                                    <div className="insight-detail-row">
-                                      <span>Label</span>
-                                      <span className="insight-detail-value">{field.label}</span>
-                                    </div>
-                                  )}
-                                  {field.bbox && field.bbox.length === 4 && (
-                                    <div className="insight-detail-row">
-                                      <span>bbox</span>
-                                      <span className="insight-detail-value">
-                                        {field.bbox.map((n) => Math.round(n)).join(', ')}
-                                      </span>
-                                    </div>
-                                  )}
-                                </li>
-                              ))}
-                            </ul>
+                                )}
+                                {primaryField.bbox && primaryField.bbox.length === 4 && (
+                                  <div className="insight-detail-row">
+                                    <span>bbox</span>
+                                    <span className="insight-detail-value">
+                                      {primaryField.bbox.map((n) => Math.round(n)).join(', ')}
+                                    </span>
+                                  </div>
+                                )}
+                              </div>
+
+                              {alternateFields.length ? (
+                                <details className="insight-alt">
+                                  <summary>Alternates ({alternateFields.length})</summary>
+                                  <ul className="insight-list">
+                                    {alternateFields.map((field) => (
+                                      <li key={field.id} className="insight-item">
+                                        <div className="insight-item-header">
+                                          <strong>{field.value || field.label}</strong>
+                                          {typeof field.confidence === 'number' && (
+                                            <span className="confidence-chip">{(field.confidence * 100).toFixed(1)}%</span>
+                                          )}
+                                        </div>
+                                        {field.label && field.value && field.value !== field.label && (
+                                          <div className="insight-detail-row">
+                                            <span>Label</span>
+                                            <span className="insight-detail-value">{field.label}</span>
+                                          </div>
+                                        )}
+                                        {field.bbox && field.bbox.length === 4 && (
+                                          <div className="insight-detail-row">
+                                            <span>bbox</span>
+                                            <span className="insight-detail-value">
+                                              {field.bbox.map((n) => Math.round(n)).join(', ')}
+                                            </span>
+                                          </div>
+                                        )}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </details>
+                              ) : null}
+                            </>
                           )}
                         </div>
                       )

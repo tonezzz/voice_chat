@@ -250,6 +250,39 @@
   margin-top: 0.15rem;
 }
 
+.insight-detail-row + .insight-detail-row.image-history {
+  margin-top: 1rem;
+}
+
+.image-progress-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 1rem;
+  border-radius: 0.85rem;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px dashed rgba(59, 130, 246, 0.4);
+}
+
+.image-progress-preview .image-preview {
+  width: 100%;
+  border-radius: 0.65rem;
+  overflow: hidden;
+  background: #e0e7ff;
+}
+
+.image-progress-preview footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  color: #1d4ed8;
+}
+
+.image-progress-preview .image-status-chip {
+  align-self: flex-start;
+}
+
 .insight-detail-value {
   font-weight: 600;
   color: #0f172a;

@@ -1,21 +1,36 @@
 services:
-  openvoice-tts:
-    build: C:/_dev/_models/openvoice/openvoice
-    container_name: voice-chat-openvoice
+  # openvoice-tts:
+  #   build: C:/_dev/_models/openvoice/openvoice
+  #   container_name: voice-chat-openvoice
+  #   profiles: ["cpu"]
+  #   environment:
+  #     - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
+  #     - OPENVOICE_CHECKPOINT_DIR=/app/inference/checkpoints
+  #   volumes:
+  #     - C:/_dev/_models/openvoice_v2:/app/inference/openvoice_v2
+  #     - C:/_dev/_models/openvoice/data:/app/inference/.data
+  #     - C:/_dev/_models/openvoice/checkpoints:/app/inference/checkpoints
+  #     - C:/_dev/_models/openvoice/references:/app/inference/references
+  #     - C:/_dev/_models/openvoice/conf/openvoice:/app/conf/openvoice
+  #     #- ./server/conf/openvoice:/app/conf/openvoice
+  #   ports:
+  #     - "8100:80"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "curl -sf http://localhost/hc || exit 1"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #   restart: unless-stopped
+
+  mcp_bslip:
+    build: ./bslip_mcp
+    container_name: mcp-bslip
     environment:
-      - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
-      - OPENVOICE_CHECKPOINT_DIR=/app/inference/checkpoints
-    volumes:
-      - C:/_dev/_models/openvoice_v2:/app/inference/openvoice_v2
-      - C:/_dev/_models/openvoice/data:/app/inference/.data
-      - C:/_dev/_models/openvoice/checkpoints:/app/inference/checkpoints
-      - C:/_dev/_models/openvoice/references:/app/inference/references
-      - C:/_dev/_models/openvoice/conf/openvoice:/app/conf/openvoice
-      #- ./server/conf/openvoice:/app/conf/openvoice
+      - PORT=8002
     ports:
-      - "8100:80"
+      - "8002:8002"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost/hc || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -51,6 +66,7 @@ services:
   ollama:
     image: ollama/ollama
     container_name: ollama
+    profiles: ["cpu"]
     ports:
       - "11434:11434"
     volumes:
@@ -79,6 +95,7 @@ services:
   stt:
     build: ./stt
     container_name: stt-whisper
+    profiles: ["cpu"]
     environment:
       - WHISPER_MODEL=tiny
       - WHISPER_DEVICE=cpu
@@ -128,19 +145,14 @@ services:
       - MODEL=${OLLAMA_MODEL:-llama3.2:3b}
       - PORT=3001
       - STT_URL=http://stt:5001
-      - STT_GPU_URL=http://stt:5001
-      - OPENVOICE_URL=http://openvoice-tts:80
+      - STT_GPU_URL=http://stt-gpu:5001
       - OPENVOICE_GPU_URL=http://openvoice-tts-gpu:80
-      - YOLO_MCP_URL=http://yolo-mcp:8000
-      - IMAGE_MCP_URL=http://image-mcp:8001
-      - IMAGE_MCP_GPU_URL=http://image-mcp-gpu:8001
+      - YOLO_MCP_URL=http://mcp-yolo:8000
+      - BSLIP_MCP_URL=http://mcp-bslip:8002
+      - IMAGE_MCP_URL=http://mcp-imagen:8001
+      - IMAGE_MCP_GPU_URL=http://mcp-imagen-gpu:8001
     ports:
       - "3002:3001"
-    depends_on:
-      - ollama
-      - stt
-      - yolo_mcp
-      - image_mcp
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3001/health || exit 1"]
       interval: 30s
@@ -161,9 +173,9 @@ services:
       - server
     restart: unless-stopped
 
-  yolo_mcp:
-    build: ./yolo_mcp
-    container_name: yolo-mcp
+  mcp_yolo:
+    build: ./mcp_yolo
+    container_name: mcp-yolo
     environment:
       - YOLO_MODEL=yolov8n.pt
     volumes:
@@ -177,9 +189,10 @@ services:
       retries: 5
     restart: unless-stopped
 
-  image_mcp:
-    build: ./image_mcp
-    container_name: image-mcp
+  mcp_imagen:
+    build: ./mcp_imagen
+    container_name: mcp-imagen
+    profiles: ["cpu"]
     environment:
       - IMAGE_MODEL_ID=${IMAGE_MODEL_ID:-runwayml/stable-diffusion-v1-5}
       - TORCH_DEVICE=${IMAGE_TORCH_DEVICE:-cpu}
@@ -199,13 +212,13 @@ services:
       retries: 5
     restart: unless-stopped
 
-  image_mcp_gpu:
+  mcp_imagen_gpu:
     build:
-      context: ./image_mcp
+      context: ./mcp_imagen
       args:
         BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
         USE_GPU: "true"
-    container_name: image-mcp-gpu
+    container_name: mcp-imagen-gpu
     environment:
       - IMAGE_MODEL_ID=${IMAGE_MODEL_ID:-runwayml/stable-diffusion-v1-5}
       - TORCH_DEVICE=${IMAGE_TORCH_DEVICE_GPU:-cuda}
