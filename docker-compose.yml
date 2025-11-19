@@ -23,7 +23,7 @@ services:
   #   restart: unless-stopped
 
   mcp_bslip:
-    build: ./bslip_mcp
+    build: ./mcp-bslip
     container_name: mcp-bslip
     environment:
       - PORT=8002
@@ -36,9 +36,101 @@ services:
       retries: 5
     restart: unless-stopped
 
+  mcp_idp:
+    build: ./mcp_idp
+    container_name: mcp-idp
+    profiles: ["cpu"]
+    environment:
+      - IDP_DEVICE=${IDP_DEVICE:-cpu}
+      - IDP_REFERENCE_DIR=/app/reference_faces
+      - IDP_MODEL_STORAGE=/app/models
+      - PORT=8004
+    volumes:
+      - ${IDP_REFERENCE_ROOT:-C:/_dev/_models/idp/references}:/app/reference_faces
+      - ${IDP_MODEL_ROOT:-C:/_dev/_models/idp/models}:/app/models
+    ports:
+      - "8004:8004"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8004/health || exit 1"]
+      interval: 60s
+      timeout: 15s
+      retries: 5
+    restart: unless-stopped
+
+  mcp_idp_gpu:
+    build:
+      context: ./mcp_idp
+      args:
+        BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
+        USE_GPU: "true"
+    container_name: mcp-idp-gpu
+    profiles: ["gpu"]
+    environment:
+      - IDP_DEVICE=cuda
+      - IDP_REFERENCE_DIR=/app/reference_faces
+      - IDP_MODEL_STORAGE=/app/models
+      - PORT=8004
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    runtime: nvidia
+    volumes:
+      - ${IDP_REFERENCE_ROOT:-C:/_dev/_models/idp/references}:/app/reference_faces
+      - ${IDP_MODEL_ROOT:-C:/_dev/_models/idp/models}:/app/models
+    ports:
+      - "8104:8004"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8004/health || exit 1"]
+      interval: 60s
+      timeout: 15s
+      retries: 5
+    restart: unless-stopped
+
+  mcp_0:
+    build: ./mcp_0
+    container_name: mcp-0
+    profiles: ["cpu", "gpu"]
+    init: true
+    environment:
+      - MCP0_HOST=0.0.0.0
+      - MCP0_PORT=8010
+      - MCP0_TIMEOUT_SECONDS=10
+      - GITHUB_MCP_URL=${GITHUB_MCP_URL:-http://mcp-github:8080}
+      - GITHUB_MCP_HEALTH_PATH=${GITHUB_MCP_HEALTH_PATH:-/health}
+      - GITHUB_MCP_TOOLS=${GITHUB_MCP_TOOLS:-list_models+run_space}
+      - GITHUB_MCP_TOKEN=${GITHUB_MCP_TOKEN:-}
+      - GITHUB_PERSONAL_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
+      - MCP0_PROVIDERS=yolo:http://mcp-yolo:8000|health=/|capabilities=|tools=detect_objects+detect_http,bslip:http://mcp-bslip:8002|health=/health|capabilities=|tools=verify_slip,image:http://mcp-imagen:8001|health=/|capabilities=|tools=generate_image+generate_stream,image_gpu:http://mcp-imagen-gpu:8001|health=/|capabilities=|tools=generate_image+generate_stream,idp:http://mcp-idp:8004|health=/health|capabilities=|tools=identify_people+list_identity_references+refresh_identity_references,idp_gpu:http://mcp-idp-gpu:8004|health=/health|capabilities=|tools=identify_people+list_identity_references+refresh_identity_references,github:${GITHUB_MCP_URL:-http://mcp-github:8080}|health=${GITHUB_MCP_HEALTH_PATH:-/health}|health_method=GET|capabilities=/.well-known/mcp.json|tools=${GITHUB_MCP_TOOLS:-list_models+run_space}
+    ports:
+      - "8010:8010"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8010/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  mcp-github:
+    build: ./mcp_github_bridge
+    container_name: mcp-github
+    profiles: ["cpu", "gpu"]
+    environment:
+      - GITHUB_PERSONAL_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
+      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_ACCESS_TOKEN:-}
+      - GITHUB_TOOLSETS=${GITHUB_TOOLSETS:-default}
+      - LOG_LEVEL=${GITHUB_MCP_BRIDGE_LOG_LEVEL:-INFO}
+    ports:
+      - "8200:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+    restart: unless-stopped
+
   openvoice-tts-gpu:
     build: C:/_dev/_models/openvoice/openvoice
     container_name: voice-chat-openvoice-gpu
+    profiles: ["gpu"]
     environment:
       - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
       - NVIDIA_VISIBLE_DEVICES=all
@@ -76,6 +168,7 @@ services:
   ollama-gpu:
     image: ollama/ollama
     container_name: ollama-gpu
+    profiles: ["gpu"]
     ports:
       - "11435:11434"
     volumes:
@@ -114,6 +207,8 @@ services:
   stt-gpu:
     build: ./stt
     container_name: stt-whisper-gpu
+    profiles: ["gpu"]
+    init: true
     environment:
       - WHISPER_MODEL=base
       - WHISPER_DEVICE=cuda
@@ -138,6 +233,7 @@ services:
   server:
     build: ./server
     container_name: voice-chat-server
+    init: true
     environment:
       - NODE_ENV=production
       - OLLAMA_URL=http://ollama:11434
@@ -151,6 +247,13 @@ services:
       - BSLIP_MCP_URL=http://mcp-bslip:8002
       - IMAGE_MCP_URL=http://mcp-imagen:8001
       - IMAGE_MCP_GPU_URL=http://mcp-imagen-gpu:8001
+      - IDP_MCP_URL=http://mcp-idp:8004
+      - IDP_MCP_GPU_URL=http://mcp-idp-gpu:8004
+      - MCP0_URL=http://mcp-0:8010
+      - GITHUB_MCP_URL=${GITHUB_MCP_URL:-http://mcp-github:8080}
+      - GITHUB_MCP_HEALTH_PATH=${GITHUB_MCP_HEALTH_PATH:-/health}
+      - GITHUB_MCP_TOKEN=${GITHUB_MCP_TOKEN:-}
+      - GITHUB_PERSONAL_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
     ports:
       - "3002:3001"
     healthcheck:
@@ -189,8 +292,8 @@ services:
       retries: 5
     restart: unless-stopped
 
-  mcp_imagen:
-    build: ./mcp_imagen
+  mcp-imagen:
+    build: ./mcp-imagen
     container_name: mcp-imagen
     profiles: ["cpu"]
     environment:
@@ -212,13 +315,14 @@ services:
       retries: 5
     restart: unless-stopped
 
-  mcp_imagen_gpu:
+  mcp-imagen-gpu:
     build:
-      context: ./mcp_imagen
+      context: ./mcp-imagen
       args:
         BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
         USE_GPU: "true"
     container_name: mcp-imagen-gpu
+    profiles: ["gpu"]
     environment:
       - IMAGE_MODEL_ID=${IMAGE_MODEL_ID:-runwayml/stable-diffusion-v1-5}
       - TORCH_DEVICE=${IMAGE_TORCH_DEVICE_GPU:-cuda}

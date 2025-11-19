@@ -1,0 +1,39 @@
+# Docker Slim-Down Playbook
+
+## 1. Goals
+- Minimize final image size for MCP services.
+- Keep runtime layers free of compilers/headers.
+- Reuse builder stages across CPU/GPU variants where possible.
+
+## 2. Baseline Multi-Stage Pattern
+1. **Builder Stage**
+   - Base: `python:3.11-slim` or CUDA runtime when GPU.
+   - Install build tooling (curl, build-essential, cmake, headers).
+   - Create venv (`/opt/venv`) and install dependencies (torch/onnxruntime, requirements).
+   - Copy application source.
+2. **Runtime Stage**
+   - Base: same slim image, no compilers.
+   - Install only runtime libs (libgl1, libglib2.0-0, ffmpeg, OpenBLAS, etc.).
+   - Copy venv + app from builder.
+   - Create non-root user, expose volumes/ports.
+
+Pattern now implemented for:
+- `mcp_idp` (CPU/GPU aware via `BASE_IMAGE`/`USE_GPU`).
+- `mcp_imagen`.
+
+## 3. Reusing Builder Artifacts
+- **Shared Builder Image**: publish `voice-chat/builder:py311` with toolchain/venv bootstrap, use `FROM ... as builder` across services.
+- **Wheelhouse Image**: pre-build torch/onnxruntime wheels, copy into each build and install via `--find-links=/wheelhouse`.
+- **Buildx Bake Targets**: define a common `builder` target reused by Compose services to share layers automatically.
+
+## 4. Next Candidates
+- `mcp_yolo`, `bslip_mcp`: move ultralytics/tesseract installs into builder stage.
+- `server` image: separate npm install (builder) from runtime (with pruned `node_modules`).
+- `stt` CUDA image: ensure CUDA toolkit stays in builder, runtime only has NVIDIA runtime libs.
+
+## 5. Practical Tips
+- Set `VENV_PATH` and extend `PATH` in both stages so runtime uses builder venv.
+- Keep `DEBIAN_FRONTEND=noninteractive` to avoid interactive apt prompts.
+- Always `rm -rf /var/lib/apt/lists*` after apt steps.
+- Use `--mount=type=cache,target=/root/.cache/pip` for faster pip installs.
+- Document per-service runtime libs to avoid shipping dev headers.

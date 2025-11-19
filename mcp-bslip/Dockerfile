@@ -1,8 +1,7 @@
-ARG BASE_IMAGE=python:3.11-slim
+ARG BASE_IMAGE=python:3.10-slim
 
 FROM ${BASE_IMAGE} AS builder
 
-ARG USE_GPU=false
 ENV DEBIAN_FRONTEND=noninteractive \
     VENV_PATH=/opt/venv
 
@@ -10,7 +9,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
         git \
-        ffmpeg \
         python3 \
         python3-pip \
         python3-venv \
@@ -26,30 +24,22 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt \
-    && if [ "$USE_GPU" = "true" ]; then \
-        pip install --no-cache-dir "ctranslate2[cuda]==4.4.0"; \
-    fi
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY . ./
 
 FROM ${BASE_IMAGE} AS runtime
 
-ARG USE_GPU=false
 ENV DEBIAN_FRONTEND=noninteractive \
-    USE_GPU=${USE_GPU} \
     VENV_PATH=/opt/venv \
     PATH="${VENV_PATH}/bin:${PATH}" \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=on \
-    PIP_CACHE_DIR=/root/.cache/pip \
-    WHISPER_MODEL=tiny \
-    WHISPER_DEVICE=cpu
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        ca-certificates \
         curl \
-        ffmpeg \
     && rm -rf /var/lib/apt/lists*
 
 WORKDIR /app
@@ -57,6 +47,9 @@ WORKDIR /app
 COPY --from=builder ${VENV_PATH} ${VENV_PATH}
 COPY --from=builder /app /app
 
-EXPOSE 5001
+RUN useradd --create-home --shell /bin/bash appuser
+USER appuser
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5001"]
+EXPOSE 8002
+
+CMD ["python", "main.py"]

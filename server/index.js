@@ -83,14 +83,100 @@ app.post('/verify-slip', upload.single('file'), async (req, res) => {
   }
 });
 
+app.post('/identify-people', upload.single('image'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'image file is required' });
+  }
+
+  const requestedAccelerator = typeof req.body?.accelerator === 'string' ? req.body.accelerator.trim().toLowerCase() : 'cpu';
+  const { baseUrl, accelerator } = pickIdpBase(requestedAccelerator);
+  const normalizedBaseUrl = normalizeBaseUrl(baseUrl || '');
+  if (!normalizedBaseUrl) {
+    return res.status(500).json({ error: 'idp_mcp_unconfigured' });
+  }
+
+  const imageBase64 = `data:${req.file.mimetype || 'application/octet-stream'};base64,${req.file.buffer.toString('base64')}`;
+  const payload = { image_base64: imageBase64 };
+
+  const parseScore = (value) => {
+    const parsed = Number(value);
+    if (Number.isNaN(parsed)) {
+      return null;
+    }
+    return Math.max(0, Math.min(1, parsed));
+  };
+
+  if (typeof req.body?.min_detection_score !== 'undefined') {
+    const score = parseScore(req.body.min_detection_score);
+    if (score !== null) {
+      payload.min_detection_score = score;
+    }
+  }
+
+  if (typeof req.body?.min_identity_score !== 'undefined') {
+    const score = parseScore(req.body.min_identity_score);
+    if (score !== null) {
+      payload.min_identity_score = score;
+    }
+  }
+
+  try {
+    console.log('[idp] forwarding identify request', {
+      target: `${normalizedBaseUrl}/identify`,
+      accelerator,
+      payloadSizeBytes: imageBase64.length
+    });
+
+    const response = await fetch(`${normalizedBaseUrl}/identify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const detailText = await response.text();
+      console.error('IDP MCP error:', detailText);
+      let detailJson;
+      try {
+        detailJson = JSON.parse(detailText);
+      } catch (parseErr) {
+        detailJson = undefined;
+      }
+
+      return res.status(502).json({
+        error: 'idp_mcp_error',
+        detail: detailJson || detailText,
+        target: `${normalizedBaseUrl}/identify`,
+        source: req.file?.originalname,
+        mimetype: req.file?.mimetype,
+        accelerator
+      });
+    }
+
+    const data = await response.json();
+    return res.json({ ...data, accelerator });
+  } catch (err) {
+    console.error('IDP identification failed:', err);
+    return res.status(500).json({
+      error: 'server_error',
+      message: err?.message || 'IDP identification failed',
+      source: req.file?.originalname,
+      mimetype: req.file?.mimetype,
+      accelerator,
+      payloadSizeBytes: imageBase64.length,
+      stack: process.env.NODE_ENV === 'production' ? undefined : err?.stack
+    });
+  }
+});
+
 app.post('/generate-image-stream', async (req, res) => {
   const body = req.body || {};
   const rawAccelerator = typeof body.accelerator === 'string' ? body.accelerator.trim().toLowerCase() : '';
   const requestedAccelerator = rawAccelerator === 'gpu' ? 'gpu' : 'cpu';
-  const { baseUrl, accelerator: resolvedAccelerator } = pickImageMcpBase(requestedAccelerator);
+  const { baseUrl, accelerator: resolvedAccelerator } = pickMcpImagenBase(requestedAccelerator);
   const normalizedBaseUrl = normalizeBaseUrl(baseUrl || '');
   if (!normalizedBaseUrl) {
-    return res.status(500).json({ error: 'image_mcp_unconfigured' });
+    return res.status(500).json({ error: 'image_service_unconfigured' });
   }
 
   const { prompt, negative_prompt, guidance_scale, num_inference_steps, width, height, seed } = body;
@@ -152,8 +238,8 @@ app.post('/generate-image-stream', async (req, res) => {
 
     if (!response.ok || !response.body) {
       const detail = await response.text();
-      console.error('Image MCP stream error:', detail);
-      return res.status(502).json({ error: 'image_mcp_error', detail });
+      console.error('Image generator stream error:', detail);
+      return res.status(502).json({ error: 'image_service_error', detail });
     }
 
     res.setHeader('Content-Type', 'application/json');
@@ -249,6 +335,11 @@ const YOLO_MCP_URL = process.env.YOLO_MCP_URL || 'http://localhost:8000';
 const BSLIP_MCP_URL = process.env.BSLIP_MCP_URL || 'http://localhost:8002';
 const IMAGE_MCP_URL = process.env.IMAGE_MCP_URL || 'http://localhost:8001';
 const IMAGE_MCP_GPU_URL = process.env.IMAGE_MCP_GPU_URL || '';
+const IDP_MCP_URL = process.env.IDP_MCP_URL || 'http://localhost:8004';
+const IDP_MCP_GPU_URL = process.env.IDP_MCP_GPU_URL || 'http://localhost:8104';
+const MCP0_URL = process.env.MCP0_URL || '';
+const GITHUB_MCP_URL = process.env.GITHUB_MCP_URL || 'https://mcp.github.com';
+const GITHUB_MCP_HEALTH_PATH = process.env.GITHUB_MCP_HEALTH_PATH || '/health';
 const OCR_DEFAULT_LANG = process.env.OCR_LANG || 'eng';
 const RAW_LLM_PROVIDER = (process.env.LLM_PROVIDER || 'ollama').toLowerCase();
 const NORMALIZED_BASE_PROVIDER =
@@ -272,6 +363,16 @@ const OPENAI_MODELS_URL = process.env.OPENAI_MODELS_URL || 'https://api.openai.c
 const parsedOpenAiTemp = Number(process.env.OPENAI_TEMPERATURE);
 const OPENAI_TEMPERATURE = Number.isFinite(parsedOpenAiTemp) ? parsedOpenAiTemp : 0.2;
 const OPENAI_MAX_TOKENS = Number(process.env.OPENAI_MAX_TOKENS) || 1024;
+const GITHUB_MODEL_TOKEN = process.env.GITHUB_MODEL_TOKEN || '';
+const GITHUB_MODEL = process.env.GITHUB_MODEL || 'gpt-4o-mini';
+const GITHUB_MODEL_DEPLOYMENT = process.env.GITHUB_MODEL_DEPLOYMENT || GITHUB_MODEL;
+const DEFAULT_GITHUB_CHAT_BASE = 'https://api.github.com/openai/deployments';
+const GITHUB_MODEL_CHAT_BASE_URL = process.env.GITHUB_MODEL_CHAT_BASE_URL || DEFAULT_GITHUB_CHAT_BASE;
+const GITHUB_MODEL_CHAT_URL = process.env.GITHUB_MODEL_CHAT_URL || '';
+const parsedGithubTemp = Number(process.env.GITHUB_MODEL_TEMPERATURE);
+const GITHUB_MODEL_TEMPERATURE = Number.isFinite(parsedGithubTemp) ? parsedGithubTemp : 0.2;
+const GITHUB_MODEL_MAX_TOKENS = Number(process.env.GITHUB_MODEL_MAX_TOKENS) || 1024;
+const GITHUB_API_VERSION = process.env.GITHUB_API_VERSION || '2023-07-01';
 
 const shouldUseGpu = (accelerator) => accelerator === 'gpu';
 const normalizeProvider = (provider) => {
@@ -284,6 +385,7 @@ const normalizeProvider = (provider) => {
 
 const isAnthropicProvider = (provider = NORMALIZED_BASE_PROVIDER) => normalizeProvider(provider) === 'anthropic';
 const isOpenAiProvider = (provider = NORMALIZED_BASE_PROVIDER) => normalizeProvider(provider) === 'openai';
+const isGithubProvider = (provider = NORMALIZED_BASE_PROVIDER) => normalizeProvider(provider) === 'github';
 
 const providerRequiresKey = (provider) => {
   const normalized = normalizeProvider(provider);
@@ -292,6 +394,9 @@ const providerRequiresKey = (provider) => {
   }
   if (normalized === 'openai') {
     return !!OPENAI_API_KEY;
+  }
+  if (normalized === 'github') {
+    return !!GITHUB_MODEL_TOKEN;
   }
   return true;
 };
@@ -548,6 +653,25 @@ const resolveOpenAiTemperature = (override) => {
   return OPENAI_TEMPERATURE;
 };
 
+const resolveGithubMaxTokens = (override) => {
+  const parsed = Number(override);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return GITHUB_MODEL_MAX_TOKENS;
+};
+
+const resolveGithubTemperature = (override) => {
+  if (typeof override === 'number' && Number.isFinite(override)) {
+    return override;
+  }
+  const parsed = Number(override);
+  if (Number.isFinite(parsed)) {
+    return parsed;
+  }
+  return GITHUB_MODEL_TEMPERATURE;
+};
+
 const callAnthropicMessages = async ({ messages, model, maxTokens, temperature }) => {
   if (!ANTHROPIC_API_KEY) {
     throw new Error('anthropic_api_key_missing');
@@ -584,6 +708,60 @@ const callAnthropicMessages = async ({ messages, model, maxTokens, temperature }
     ? data.content
         .filter((part) => part && part.type === 'text')
         .map((part) => part.text || '')
+        .join('\n')
+        .trim()
+    : '';
+
+  return { text, data };
+};
+
+const callGithubModelMessages = async ({ messages, model, maxTokens, temperature, deployment }) => {
+  if (!GITHUB_MODEL_TOKEN) {
+    throw new Error('github_model_token_missing');
+  }
+
+  if (!Array.isArray(messages) || !messages.length) {
+    throw new Error('github_messages_missing');
+  }
+
+  const resolvedDeployment = typeof deployment === 'string' && deployment.trim() ? deployment.trim() : GITHUB_MODEL_DEPLOYMENT;
+  if (!resolvedDeployment) {
+    throw new Error('github_deployment_missing');
+  }
+
+  const resolvedModel = typeof model === 'string' && model.trim() ? model.trim() : GITHUB_MODEL;
+  const baseUrl = normalizeBaseUrl(GITHUB_MODEL_CHAT_BASE_URL || DEFAULT_GITHUB_CHAT_BASE);
+  const endpoint = GITHUB_MODEL_CHAT_URL
+    ? GITHUB_MODEL_CHAT_URL
+    : `${baseUrl}/${encodeURIComponent(resolvedDeployment)}/chat/completions`;
+
+  const payload = {
+    model: resolvedModel,
+    max_tokens: maxTokens || GITHUB_MODEL_MAX_TOKENS,
+    temperature: typeof temperature === 'number' ? temperature : GITHUB_MODEL_TEMPERATURE,
+    messages
+  };
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${GITHUB_MODEL_TOKEN}`,
+      'X-GitHub-Api-Version': GITHUB_API_VERSION
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`github_model_error: ${detail || response.status}`);
+  }
+
+  const data = await response.json();
+  const text = Array.isArray(data?.choices)
+    ? data.choices
+        .map((choice) => choice?.message?.content || '')
+        .filter(Boolean)
         .join('\n')
         .trim()
     : '';
@@ -683,6 +861,25 @@ app.post('/sessions/:id/messages', (req, res) => {
   return res.json({ session: sessionToResponse(session) });
 });
 
+app.post('/github-model/chat', async (req, res) => {
+  const { messages, model, maxTokens, max_tokens, temperature, deployment } = req.body || {};
+
+  try {
+    const response = await callGithubModelMessages({
+      messages,
+      model,
+      maxTokens: maxTokens || max_tokens,
+      temperature,
+      deployment
+    });
+    return res.json(response);
+  } catch (err) {
+    console.error('GitHub model proxy failed:', err);
+    const status = err.message === 'github_model_token_missing' || err.message === 'github_messages_missing' ? 400 : 500;
+    return res.status(status).json({ error: 'github_model_error', detail: err.message });
+  }
+});
+
 const pickSttBase = (accelerator) => {
   if (shouldUseGpu(accelerator) && STT_GPU_URL) {
     return STT_GPU_URL;
@@ -697,11 +894,18 @@ const pickOpenvoiceBase = (accelerator) => {
   return OPENVOICE_URL || OPENVOICE_GPU_URL || '';
 };
 
-const pickImageMcpBase = (accelerator) => {
+const pickMcpImagenBase = (accelerator) => {
   if (shouldUseGpu(accelerator) && IMAGE_MCP_GPU_URL) {
     return { baseUrl: IMAGE_MCP_GPU_URL, accelerator: 'gpu' };
   }
   return { baseUrl: IMAGE_MCP_URL, accelerator: 'cpu' };
+};
+
+const pickIdpBase = (accelerator) => {
+  if (shouldUseGpu(accelerator) && IDP_MCP_GPU_URL) {
+    return { baseUrl: IDP_MCP_GPU_URL, accelerator: 'gpu' };
+  }
+  return { baseUrl: IDP_MCP_URL || IDP_MCP_GPU_URL || '', accelerator: IDP_MCP_URL ? 'cpu' : 'gpu' };
 };
 
 const ttsDir = path.join(__dirname, 'public', 'tts');
@@ -847,6 +1051,20 @@ app.post('/voice-chat', async (req, res) => {
         temperature: resolveOpenAiTemperature(req.body?.openai_temperature)
       });
       reply = text;
+    } else if (isGithubProvider(session.provider)) {
+      const githubMessages = formatMessagesForOpenAi(session);
+      const { text } = await callGithubModelMessages({
+        messages: githubMessages,
+        model: modelToUse,
+        maxTokens: resolveGithubMaxTokens(
+          req.body?.github_max_tokens ?? req.body?.githubMaxTokens ?? req.body?.max_tokens
+        ),
+        temperature: resolveGithubTemperature(
+          req.body?.github_temperature ?? req.body?.githubTemperature ?? req.body?.temperature
+        ),
+        deployment: req.body?.github_deployment || req.body?.githubDeployment
+      });
+      reply = text;
     } else {
       const baseUrl = pickOllamaBase(accelerator);
       const response = await fetch(`${baseUrl}/api/chat`, {
@@ -949,7 +1167,9 @@ app.post('/voice-chat-audio', upload.single('audio'), async (req, res) => {
     });
 
     let reply = '';
-    if (isAnthropicProvider()) {
+    const providerForSession = session.provider || requestedProvider || NORMALIZED_BASE_PROVIDER;
+
+    if (isAnthropicProvider(providerForSession)) {
       const anthropicMessages = formatMessagesForAnthropic(session);
       const { text } = await callAnthropicMessages({
         messages: anthropicMessages,
@@ -958,13 +1178,27 @@ app.post('/voice-chat-audio', upload.single('audio'), async (req, res) => {
         temperature: resolveAnthropicTemperature(req.body?.anthropic_temperature)
       });
       reply = text;
-    } else if (isOpenAiProvider()) {
+    } else if (isOpenAiProvider(providerForSession)) {
       const openAiMessages = formatMessagesForOpenAi(session);
       const { text } = await callOpenAiMessages({
         messages: openAiMessages,
         model: modelToUse,
         maxTokens: resolveOpenAiMaxTokens(req.body?.openai_max_tokens),
         temperature: resolveOpenAiTemperature(req.body?.openai_temperature)
+      });
+      reply = text;
+    } else if (isGithubProvider(providerForSession)) {
+      const githubMessages = formatMessagesForOpenAi(session);
+      const { text } = await callGithubModelMessages({
+        messages: githubMessages,
+        model: modelToUse,
+        maxTokens: resolveGithubMaxTokens(
+          req.body?.github_max_tokens ?? req.body?.githubMaxTokens ?? req.body?.max_tokens
+        ),
+        temperature: resolveGithubTemperature(
+          req.body?.github_temperature ?? req.body?.githubTemperature ?? req.body?.temperature
+        ),
+        deployment: req.body?.github_deployment || req.body?.githubDeployment
       });
       reply = text;
     } else {
@@ -1169,7 +1403,7 @@ app.post('/generate-image', async (req, res) => {
   const { baseUrl, accelerator: resolvedAccelerator } = pickImageMcpBase(requestedAccelerator);
   const normalizedBaseUrl = normalizeBaseUrl(baseUrl || '');
   if (!normalizedBaseUrl) {
-    return res.status(500).json({ error: 'image_mcp_unconfigured' });
+    return res.status(500).json({ error: 'image_service_unconfigured' });
   }
 
   const {
@@ -1223,7 +1457,7 @@ app.post('/generate-image', async (req, res) => {
   }
 
   try {
-    console.log('[image-mcp] forwarding generate-image request', {
+    console.log('[mcp-imagen] forwarding generate-image request', {
       target: `${normalizedBaseUrl}/generate`,
       accelerator: resolvedAccelerator,
       promptLength: payload.prompt.length,
@@ -1239,8 +1473,8 @@ app.post('/generate-image', async (req, res) => {
 
     if (!response.ok) {
       const detail = await response.text();
-      console.error('Image MCP error:', detail);
-      return res.status(502).json({ error: 'image_mcp_error', detail });
+      console.error('Image generator error:', detail);
+      return res.status(502).json({ error: 'image_service_error', detail });
     }
 
     const data = await response.json();
@@ -1265,8 +1499,12 @@ app.get('/health', async (_req, res) => {
     checkServiceHealth({ name: 'openvoiceGpu', baseUrl: OPENVOICE_GPU_URL, path: '/hc' }),
     checkServiceHealth({ name: 'yolo', baseUrl: YOLO_MCP_URL, path: '/' }),
     checkServiceHealth({ name: 'bslip', baseUrl: BSLIP_MCP_URL, path: '/health' }),
-    checkServiceHealth({ name: 'image', baseUrl: IMAGE_MCP_URL, path: '/' }),
-    checkServiceHealth({ name: 'imageGpu', baseUrl: IMAGE_MCP_GPU_URL, path: '/' }),
+    checkServiceHealth({ name: 'mcpImagen', baseUrl: IMAGE_MCP_URL, path: '/' }),
+    checkServiceHealth({ name: 'mcpImagenGpu', baseUrl: IMAGE_MCP_GPU_URL, path: '/' }),
+    checkServiceHealth({ name: 'idp', baseUrl: IDP_MCP_URL, path: '/health' }),
+    checkServiceHealth({ name: 'idpGpu', baseUrl: IDP_MCP_GPU_URL, path: '/health' }),
+    checkServiceHealth({ name: 'mcp0', baseUrl: MCP0_URL, path: '/health' }),
+    checkServiceHealth({ name: 'githubMcp', baseUrl: GITHUB_MCP_URL, path: GITHUB_MCP_HEALTH_PATH }),
     checkAnthropicHealth(),
     checkOpenAiHealth()
   ]);
@@ -1284,8 +1522,12 @@ app.get('/health', async (_req, res) => {
     openvoiceUrl: OPENVOICE_URL || null,
     openvoiceGpuUrl: OPENVOICE_GPU_URL || null,
     yoloUrl: YOLO_MCP_URL || null,
-    imageUrl: IMAGE_MCP_URL || null,
-    imageGpuUrl: IMAGE_MCP_GPU_URL || null,
+    mcpImagenUrl: IMAGE_MCP_URL || null,
+    mcpImagenGpuUrl: IMAGE_MCP_GPU_URL || null,
+    idpUrl: IDP_MCP_URL || null,
+    idpGpuUrl: IDP_MCP_GPU_URL || null,
+    mcp0Url: MCP0_URL || null,
+    githubMcpUrl: GITHUB_MCP_URL || null,
     services: serviceChecks,
     timestamp: new Date().toISOString()
   });

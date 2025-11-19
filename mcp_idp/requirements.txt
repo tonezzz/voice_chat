@@ -1,0 +1,7 @@
+insightface==0.7.3
+Pillow>=10.0.0
+numpy>=1.26,<2.0
+modelcontextprotocol>=0.1.0
+mcp>=0.1.0
+starlette>=0.37.2
+uvicorn>=0.30.0

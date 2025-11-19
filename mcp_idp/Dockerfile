@@ -7,14 +7,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VENV_PATH=/opt/venv
 
 RUN rm -f /etc/apt/sources.list.d/cuda* \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
         curl \
+        build-essential \
+        cmake \
+        pkg-config \
+        libopenblas-dev \
+        libomp-dev \
+        libgl1-mesa-dev \
+        libglib2.0-dev \
+        libxrender-dev \
+        python3-dev \
         python3 \
         python3-pip \
         python3-venv \
         git \
-        libgl1 \
-        libglib2.0-0 \
+        ffmpeg \
     && ln -sf python3 /usr/bin/python \
     && ln -sf pip3 /usr/bin/pip \
     && python -m venv ${VENV_PATH} \
@@ -28,10 +37,9 @@ COPY requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip \
     && if [ "$USE_GPU" = "true" ]; then \
-        pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu123 \
-            torch torchvision torchaudio; \
+        pip install --no-cache-dir onnxruntime-gpu==1.18.1; \
     else \
-        pip install --no-cache-dir torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0; \
+        pip install --no-cache-dir onnxruntime==1.18.1; \
     fi \
     && pip install --no-cache-dir -r requirements.txt
 
@@ -44,15 +52,22 @@ ENV USE_GPU=${USE_GPU} \
     DEBIAN_FRONTEND=noninteractive \
     VENV_PATH=/opt/venv \
     PATH="${VENV_PATH}/bin:${PATH}" \
-    IMAGE_MODEL_ID=runwayml/stable-diffusion-v1-5 \
-    TORCH_DEVICE=cpu \
-    IMAGE_MODEL_CACHE=/app/models
+    IDP_DEVICE=cpu \
+    IDP_REFERENCE_DIR=/app/reference_faces \
+    IDP_MODEL_STORAGE=/app/models \
+    PORT=8004
 
 RUN rm -f /etc/apt/sources.list.d/cuda* \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
         curl \
+        libopenblas0 \
+        libomp5 \
         libgl1 \
         libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        ffmpeg \
     && ln -sf python3 /usr/bin/python \
     && ln -sf pip3 /usr/bin/pip \
     && rm -rf /var/lib/apt/lists*
@@ -65,7 +80,7 @@ COPY --from=builder /app /app
 RUN useradd --create-home --shell /bin/bash appuser
 USER appuser
 
-VOLUME ["/app/models"]
-EXPOSE 8001
+VOLUME ["/app/reference_faces", "/app/models"]
+EXPOSE 8004
 
 CMD ["python", "main.py"]

@@ -56,7 +56,9 @@ const resolveDefaultApiBase = () => {
 
   const { protocol, hostname, port } = window.location
   const localPreviewPorts = new Set(['5173', '4173', '4174'])
-  if (port && localPreviewPorts.has(port)) {
+  const isViteDevServer = typeof import.meta !== 'undefined' && !!import.meta.env?.DEV
+
+  if (isViteDevServer || (port && localPreviewPorts.has(port))) {
     return `${protocol}//${hostname}:3002`
   }
   return window.location.origin
@@ -129,6 +131,8 @@ interface PlayAudioOptions {
   onStart?: () => void
   onEnded?: () => void
 }
+
+const AUTO_SPEECH_REPLIES_ENABLED = false
 
 const detectionTargetOptions = [
   { label: 'People', value: 'person' },
@@ -257,7 +261,8 @@ const serviceMeta: Record<string, { label: string; group: StatusGroupKey; type: 
   openvoiceGpu: { label: 'OpenVoice (GPU)', group: 'voice', type: 'GPU' },
   yolo: { label: 'YOLO MCP', group: 'vision', type: 'Service' },
   image: { label: 'Image MCP (CPU)', group: 'vision', type: 'CPU' },
-  imageGpu: { label: 'Image MCP (GPU)', group: 'vision', type: 'GPU' }
+  imageGpu: { label: 'Image MCP (GPU)', group: 'vision', type: 'GPU' },
+  githubMcp: { label: 'GitHub MCP', group: 'other', type: 'Service' }
 }
 
 const formatStatusDetail = (detail: unknown): string => {
@@ -712,20 +717,22 @@ const STORAGE_KEYS = {
   micMode: 'chaba.micMode',
   activePanel: 'chaba.activePanel',
   detectConfidence: 'chaba.detectConfidence',
-  detectConfidenceAlt: 'chaba.detectConfidenceAlt',
-  bankDetectConfidence: 'chaba.bankDetectConfidence',
-  showDetectionBoxes: 'chaba.showDetectionBoxes',
-  showDetectionBoxesAlt: 'chaba.showDetectionBoxesAlt',
-  bankShowDetectionBoxes: 'chaba.bankShowDetectionBoxes',
-  detectionTargets: 'chaba.secondaryDetectionTargets',
-  imagePrompt: 'chaba.imagePrompt',
-  imageNegativePrompt: 'chaba.imageNegativePrompt',
-  imageGuidance: 'chaba.imageGuidance',
-  imageSteps: 'chaba.imageSteps',
-  imageWidth: 'chaba.imageWidth',
-  imageHeight: 'chaba.imageHeight',
-  imageSeed: 'chaba.imageSeed',
-  imageAccelerator: 'chaba.imageAccelerator'
+  detectionTargets: 'chaba.detect.targets',
+  detectConfidenceAlt: 'chaba.detect.confidence.alt',
+  showDetectionBoxes: 'chaba.detect.boxes',
+  showDetectionBoxesAlt: 'chaba.detect.boxes.alt',
+  bankDetectConfidence: 'chaba.bank.confidence',
+  bankShowDetectionBoxes: 'chaba.bank.boxes',
+  imagePrompt: 'chaba.image.prompt',
+  imageNegativePrompt: 'chaba.image.negativePrompt',
+  imageGuidance: 'chaba.image.guidance',
+  imageSteps: 'chaba.image.steps',
+  imageWidth: 'chaba.image.width',
+  imageHeight: 'chaba.image.height',
+  imageSeed: 'chaba.image.seed',
+  imageAccelerator: 'chaba.image.accelerator',
+  imageControlsCollapsed: 'chaba.image.controlsCollapsed',
+  imageTipsVisible: 'chaba.image.tipsVisible'
 }
 
 const IMAGE_DIMENSION_OPTIONS = [384, 512, 640, 768, 896, 1024] as const
@@ -746,6 +753,16 @@ const normalizeImageDimension = (value: number) => {
   return clampNumeric(rounded || 512, 256, 1024)
 }
 
+const normalizeImageDataUrl = (value: string) => {
+  if (!value) return ''
+  const trimmed = value.trim()
+  if (!trimmed) return ''
+  if (trimmed.startsWith('data:image')) {
+    return trimmed
+  }
+  return `data:image/png;base64,${trimmed}`
+}
+
 const parseSeedValue = (seed: string) => {
   if (!seed) return null
   const trimmed = seed.trim()
@@ -758,8 +775,9 @@ const parseSeedValue = (seed: string) => {
 const mapImageResponse = (payload: any): GeneratedImageResult => {
   const accelerator = typeof payload?.accelerator === 'string' ? payload.accelerator.toLowerCase() : null
   const normalizedAccelerator = accelerator === 'gpu' || accelerator === 'cpu' ? accelerator : null
+  const imageBase64 = typeof payload?.image_base64 === 'string' ? normalizeImageDataUrl(payload.image_base64) : ''
   return {
-    image_base64: typeof payload?.image_base64 === 'string' ? payload.image_base64 : '',
+    image_base64: imageBase64,
     prompt: String(payload?.prompt || ''),
     negative_prompt:
       typeof payload?.negative_prompt === 'string' && payload.negative_prompt.trim()
@@ -782,24 +800,101 @@ const mapImageResponse = (payload: any): GeneratedImageResult => {
   }
 }
 
-const readFromStorage = <T,>(key: string, fallback: T): T => {
-  if (typeof window === 'undefined') return fallback
+type StorageScope = 'local' | 'session'
+
+const storagePreference = new Map<string, StorageScope>()
+const disabledStorageKeys = new Set<string>()
+
+const getStorage = (scope: StorageScope): Storage | null => {
+  if (typeof window === 'undefined') return null
   try {
-    const raw = window.localStorage.getItem(key)
-    if (raw === null) return fallback
-    return JSON.parse(raw) as T
+    return scope === 'local' ? window.localStorage : window.sessionStorage
   } catch (err) {
-    console.warn('Failed to read storage key', key, err)
-    return fallback
+    console.warn(`Storage unavailable for ${scope}Storage`, err)
+    return null
   }
 }
 
+const isQuotaExceededError = (error: unknown) => {
+  if (!error || typeof error !== 'object') return false
+  const domAvailable = typeof DOMException !== 'undefined'
+  if (domAvailable && error instanceof DOMException) {
+    return (
+      error.name === 'QuotaExceededError' ||
+      error.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+      error.code === 22 ||
+      error.code === 1014
+    )
+  }
+  const code = (error as { code?: number }).code
+  return code === 22 || code === 1014
+}
+
+const getStorageOrder = (key: string): StorageScope[] => {
+  return storagePreference.get(key) === 'session' ? ['session', 'local'] : ['local', 'session']
+}
+
+const readFromStorage = <T,>(key: string, fallback: T): T => {
+  if (typeof window === 'undefined') return fallback
+  const scopes = getStorageOrder(key)
+  for (const scope of scopes) {
+    const storage = getStorage(scope)
+    if (!storage) continue
+    try {
+      const raw = storage.getItem(key)
+      if (raw === null) continue
+      const parsed = JSON.parse(raw) as T
+      storagePreference.set(key, scope)
+      return parsed
+    } catch (err) {
+      console.warn('Failed to read storage key', key, err)
+    }
+  }
+  return fallback
+}
+
 const writeToStorage = (key: string, value: unknown) => {
-  if (typeof window === 'undefined') return
+  if (typeof window === 'undefined' || disabledStorageKeys.has(key)) return
+  let serialized: string
   try {
-    window.localStorage.setItem(key, JSON.stringify(value))
+    serialized = JSON.stringify(value)
   } catch (err) {
-    console.error('Failed to persist storage key', key, err)
+    console.error('Failed to serialize storage value', key, err)
+    return
+  }
+
+  const scopes = getStorageOrder(key)
+  let lastError: unknown = null
+  const startedWithSession = storagePreference.get(key) === 'session'
+
+  for (const scope of scopes) {
+    const storage = getStorage(scope)
+    if (!storage) continue
+    try {
+      storage.setItem(key, serialized)
+      storagePreference.set(key, scope)
+      if (scope === 'session' && !startedWithSession) {
+        console.warn(`Persisted ${key} to sessionStorage after localStorage quota exceeded`)
+      }
+      return
+    } catch (err) {
+      lastError = err
+      if (isQuotaExceededError(err)) {
+        if (scope === 'local') {
+          console.warn(`localStorage quota exceeded for ${key}; attempting sessionStorage fallback`)
+          continue
+        }
+        console.error(`Storage quota exceeded for ${key}; disabling persistence`, err)
+        break
+      }
+      console.error('Failed to persist storage key', key, err)
+      break
+    }
+  }
+
+  disabledStorageKeys.add(key)
+  if (lastError) {
+    console.error('Disabling persistence due to repeated failures for key', key, lastError)
   }
 }
 
@@ -841,6 +936,8 @@ export function App() {
   const [health, setHealth] = useState<'unknown' | 'ok' | 'error'>('unknown')
   const [healthInfo, setHealthInfo] = useState<any>(null)
   const [statusExpanded, setStatusExpanded] = useState(false)
+  const [appMenuOpen, setAppMenuOpen] = useState(false)
+  const [popupVisible, setPopupVisible] = useState(false)
   const [llmProvider, setLlmProvider] = useState<LlmProvider>(() => readFromStorage(STORAGE_KEYS.llmProvider, 'ollama'))
   const [llmModel, setLlmModel] = useState<string>(() => readFromStorage(STORAGE_KEYS.llmModel, defaultModels.llm))
   const [whisperModel, setWhisperModel] = useState(() =>
@@ -915,6 +1012,26 @@ export function App() {
   const [bankOcrLang, setBankOcrLang] = useState('eng')
   const [bankOcrBusy, setBankOcrBusy] = useState(false)
   const [bankVerificationInfo, setBankVerificationInfo] = useState<BankVerificationInfo>({})
+  const bankSummaryFieldCount = useMemo(() => bankFields.length, [bankFields])
+  const bankSummaryAvgConfidence = useMemo(() => {
+    if (!bankFields.length) return '—'
+    const total = bankFields.reduce(
+      (acc, field) => acc + (typeof field.confidence === 'number' ? field.confidence : 0),
+      0
+    )
+    if (total <= 0) return '—'
+    const avg = total / bankFields.length
+    return `${(avg * 100).toFixed(1).replace(/\.0$/, '')}% avg`
+  }, [bankFields])
+  const bankVerificationProviderLabel = useMemo(() => {
+    return bankVerificationInfo.provider?.trim() || '—'
+  }, [bankVerificationInfo.provider])
+  const bankVerificationStatusLabel = useMemo(() => {
+    return bankVerificationInfo.status?.trim() || '—'
+  }, [bankVerificationInfo.status])
+  const bankVerificationReferenceLabel = useMemo(() => {
+    return bankVerificationInfo.referenceId?.trim() || '—'
+  }, [bankVerificationInfo.referenceId])
   const [bankOcrError, setBankOcrError] = useState<string | null>(null)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [activePanel, setActivePanel] = useState<'chat' | 'openvoice' | 'image-mcp' | 'yolo-detection' | 'bank-slip'>(() =>
@@ -959,15 +1076,7 @@ export function App() {
     const needsPeriod = !/[.!?]$/.test(trimmed)
     return `${trimmed}${needsPeriod ? '.' : ''} ${VOICE_SERVICE_HINT}`
   }
-  const [speechLanguage, setSpeechLanguage] = useState(() => {
-    if (typeof window === 'undefined') return 'auto'
-    try {
-      return window.localStorage.getItem(STORAGE_KEYS.speechLang) || 'auto'
-    } catch (err) {
-      console.warn('Failed to read stored speech language', err)
-      return 'auto'
-    }
-  })
+  const [speechLanguage, setSpeechLanguage] = useState(() => readFromStorage(STORAGE_KEYS.speechLang, 'auto'))
   const [browserDetectedLanguage, setBrowserDetectedLanguage] = useState<string | null>(null)
 
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null)
@@ -1007,6 +1116,12 @@ export function App() {
     }
     return 'gpu'
   })
+  const [imageControlsCollapsed, setImageControlsCollapsed] = useState(() =>
+    readFromStorage(STORAGE_KEYS.imageControlsCollapsed, false)
+  )
+  const [imageTipsVisible, setImageTipsVisible] = useState(() =>
+    readFromStorage(STORAGE_KEYS.imageTipsVisible, false)
+  )
   const [imageResults, setImageResults] = useState<GeneratedImageResult[]>([])
   const [imageBusy, setImageBusy] = useState(false)
   const [imageError, setImageError] = useState<string | null>(null)
@@ -1018,6 +1133,8 @@ export function App() {
   const detectFileInputRefBank = useRef<HTMLInputElement | null>(null)
   const chatMessagesRef = useRef<HTMLDivElement | null>(null)
   const statusWrapperRef = useRef<HTMLDivElement | null>(null)
+  const appMenuRef = useRef<HTMLDivElement | null>(null)
+  const appMenuButtonRef = useRef<HTMLButtonElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const textInputRef = useRef<HTMLTextAreaElement | null>(null)
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null)
@@ -1078,6 +1195,41 @@ export function App() {
   useEffect(() => {
     setHoveredDetectionAlt(null)
   }, [secondaryDetectionTargets])
+
+  useEffect(() => {
+    if (!appMenuOpen) return
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node
+      if (appMenuRef.current?.contains(target) || appMenuButtonRef.current?.contains(target)) {
+        return
+      }
+      setAppMenuOpen(false)
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [appMenuOpen])
+
+  useEffect(() => {
+    if (!popupVisible) return
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setPopupVisible(false)
+      }
+    }
+    document.addEventListener('keydown', handleEscape)
+    return () => document.removeEventListener('keydown', handleEscape)
+  }, [popupVisible])
+
+  useEffect(() => {
+    if (!appMenuOpen) return
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setAppMenuOpen(false)
+      }
+    }
+    document.addEventListener('keydown', handleEscape)
+    return () => document.removeEventListener('keydown', handleEscape)
+  }, [appMenuOpen])
 
   useEffect(() => {
     return () => {
@@ -1883,7 +2035,7 @@ export function App() {
       }
       const reply = data.reply || ''
       addMessage({ role: 'assistant', text: reply, model: llmModel, accelerator: acceleratorUsed })
-      if (reply) {
+      if (AUTO_SPEECH_REPLIES_ENABLED && reply) {
         const played = playResponseAudio(data.audioUrl)
         if (!played) {
           speak(reply)
@@ -2074,9 +2226,11 @@ export function App() {
           sttLanguage: detectedLanguage,
           accelerator: acceleratorUsed
         })
-        const played = playResponseAudio(data.audioUrl)
-        if (!played) {
-          speak(data.reply)
+        if (AUTO_SPEECH_REPLIES_ENABLED) {
+          const played = playResponseAudio(data.audioUrl)
+          if (!played) {
+            speak(data.reply)
+          }
         }
       }
     } catch (e) {
@@ -2983,7 +3137,10 @@ export function App() {
             continue
           }
 
-          if (event?.type === 'complete') {
+          const isCompletePayload =
+            event?.type === 'complete' || (!event?.type && typeof event?.image_base64 === 'string' && event.image_base64)
+
+          if (isCompletePayload) {
             const mapped = mapImageResponse(event)
             if (!mapped.image_base64) {
               throw new Error('Image generator returned no pixels')
@@ -2991,7 +3148,11 @@ export function App() {
             setImageResults((prev) => [mapped, ...prev].slice(0, IMAGE_HISTORY_LIMIT))
             setImagePreview(null)
             completed = true
-            break
+            if (event?.type === 'complete') {
+              break
+            }
+            newlineIndex = buffer.indexOf('\n')
+            continue
           }
 
           if (event?.type === 'error') {
@@ -3383,7 +3544,39 @@ export function App() {
     <div className="app-root">
       <header className="app-header">
         <div className="title">Chaba – Voice Chat</div>
-        <div className="status-wrapper" ref={statusWrapperRef}>
+        <div className="header-actions">
+          <div className="app-menu" ref={appMenuRef}>
+            <button
+              type="button"
+              className={`menu-trigger ${appMenuOpen ? 'active' : ''}`}
+              onClick={() => setAppMenuOpen((prev) => !prev)}
+              aria-haspopup="true"
+              aria-expanded={appMenuOpen}
+              aria-label="Open quick actions menu"
+              ref={appMenuButtonRef}
+            >
+              <span className="menu-trigger-dot" />
+              <span className="menu-trigger-dot" />
+              <span className="menu-trigger-dot" />
+            </button>
+            {appMenuOpen ? (
+              <div className="menu-dropdown" role="menu" aria-label="Quick actions">
+                <button type="button" role="menuitem" onClick={() => handleMenuAction('popup')}>
+                  Quick tips panel
+                  <span className="menu-item-subtitle">Cheat sheet with usage ideas</span>
+                </button>
+                <button type="button" role="menuitem" onClick={() => handleMenuAction('status')}>
+                  View service status
+                  <span className="menu-item-subtitle">Open detailed health dialog</span>
+                </button>
+                <button type="button" role="menuitem" onClick={() => handleMenuAction('reset')}>
+                  Reset conversation
+                  <span className="menu-item-subtitle">Clear local history & session</span>
+                </button>
+              </div>
+            ) : null}
+          </div>
+          <div className="status-wrapper" ref={statusWrapperRef}>
           <button
             type="button"
             className={`status-pill status-${health}`}
@@ -3462,6 +3655,7 @@ export function App() {
               </div>
             </div>
           ) : null}
+          </div>
         </div>
       </header>
 
@@ -4048,138 +4242,47 @@ export function App() {
             </section>
           </div>
         ) : activePanel === 'image-mcp' ? (
-          <div className="image-lab-layout" aria-label="Image MCP studio">
+          <div className="image-lab-layout" aria-label="Imagen Studio">
             <section className="panel-surface image-panel">
               <header className="panel-header">
                 <div>
-                  <h2>Image MCP studio</h2>
+                  <h2>Imagen Studio</h2>
                   <p>Create reproducible image prompts with guardrails before sending them to the assistant.</p>
                 </div>
-                <div className={`image-status-chip ${imageBusy ? 'busy' : 'ready'}`} aria-live="polite">
-                  {imageStatusLabel}
+                <div className="image-header-actions">
+                  <button
+                    type="button"
+                    className={`pill-button secondary image-tips-toggle ${imageTipsVisible ? 'active' : ''}`.trim()}
+                    onClick={() => setImageTipsVisible((prev) => !prev)}
+                  >
+                    {imageTipsVisible ? 'Hide tips' : 'Best-practice tips'}
+                  </button>
+                  <div className={`image-status-chip ${imageBusy ? 'busy' : 'ready'}`} aria-live="polite">
+                    {imageStatusLabel}
+                  </div>
                 </div>
               </header>
+              {imageTipsVisible && (
+                <aside className="image-tips-popup" role="dialog" aria-label="Imagen Studio best practices">
+                  <div className="image-best-practices">
+                    <div className="image-tips-header">
+                      <h3>Best-practice checklist</h3>
+                      <button type="button" className="pill-button secondary" onClick={() => setImageTipsVisible(false)}>
+                        Close
+                      </button>
+                    </div>
+                    <ol>
+                      <li>Describe subject, style, lighting, and camera mood in the main prompt.</li>
+                      <li>List undesirable traits in the negative prompt to prevent artifacts.</li>
+                      <li>Increase inference steps for detail, but watch duration on CPU hosts.</li>
+                      <li>Use seeds to reproduce shots and iterate on improvements.</li>
+                      <li>Switch to GPU for faster drafts; keep CPU handy when GPUs are busy.</li>
+                      <li>Log the aspect ratio when attaching images back into chat sessions.</li>
+                    </ol>
+                  </div>
+                </aside>
+              )}
               <div className="image-lab-grid">
-                <div className="image-form" aria-label="Image generation form">
-                  <label className="image-field">
-                    <span>Prompt *</span>
-                    <textarea
-                      className="image-textarea"
-                      rows={4}
-                      value={imagePrompt}
-                      onChange={(e) => setImagePrompt(e.target.value)}
-                      placeholder="Rain-soaked Bangkok street photography, Leica look, cinematic lighting"
-                    />
-                  </label>
-                  <label className="image-field">
-                    <span>Negative prompt</span>
-                    <textarea
-                      className="image-textarea"
-                      rows={2}
-                      value={imageNegativePrompt}
-                      onChange={(e) => setImageNegativePrompt(e.target.value)}
-                      placeholder="blurry, low quality, extra limbs"
-                    />
-                  </label>
-                  <div className="image-slider-row">
-                    <label htmlFor="guidance-slider">
-                      Guidance scale: <strong>{Number(imageGuidance).toFixed(1)}×</strong>
-                    </label>
-                    <input
-                      id="guidance-slider"
-                      type="range"
-                      min={IMAGE_MIN_GUIDANCE}
-                      max={IMAGE_MAX_GUIDANCE}
-                      step={0.5}
-                      value={imageGuidance}
-                      onChange={(e) => setImageGuidance(Number(e.target.value))}
-                    />
-                  </div>
-                  <div className="image-slider-row">
-                    <label htmlFor="step-slider">
-                      Steps: <strong>{imageSteps}</strong>
-                    </label>
-                    <input
-                      id="step-slider"
-                      type="range"
-                      min={IMAGE_MIN_STEPS}
-                      max={IMAGE_MAX_STEPS}
-                      step={1}
-                      value={imageSteps}
-                      onChange={(e) => setImageSteps(Number(e.target.value))}
-                    />
-                  </div>
-                  <div className="image-size-row">
-                    <label>
-                      Width
-                      <select value={imageWidth} onChange={(e) => setImageWidth(Number(e.target.value) || 512)}>
-                        {imageWidthOptions.map((option) => (
-                          <option key={`w-${option.value}`} value={option.value}>
-                            {option.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      Height
-                      <select value={imageHeight} onChange={(e) => setImageHeight(Number(e.target.value) || 512)}>
-                        {imageHeightOptions.map((option) => (
-                          <option key={`h-${option.value}`} value={option.value}>
-                            {option.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      Seed
-                      <input
-                        type="text"
-                        value={imageSeed}
-                        onChange={(e) => setImageSeed(e.target.value)}
-                        placeholder="auto"
-                      />
-                    </label>
-                  </div>
-                  <div className="image-slider-row">
-                    <label htmlFor="image-accelerator-select">Accelerator</label>
-                    <div className="chip-select-wrapper">
-                      <select
-                        id="image-accelerator-select"
-                        value={imageAccelerator}
-                        onChange={(e) => setImageAccelerator(e.target.value as 'cpu' | 'gpu')}
-                      >
-                        {IMAGE_ACCELERATOR_OPTIONS.map((option) => (
-                          <option key={option.value} value={option.value}>
-                            {option.label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                  {imageError ? (
-                    <div className="form-error" role="alert">
-                      {imageError}
-                    </div>
-                  ) : null}
-                  <div className="image-actions">
-                    <button
-                      type="button"
-                      className="pill-button primary"
-                      onClick={handleGenerateImage}
-                      disabled={imageBusy}
-                    >
-                      {imageBusy ? 'Generating…' : 'Generate image'}
-                    </button>
-                    <button
-                      type="button"
-                      className="pill-button secondary"
-                      onClick={resetImageForm}
-                      disabled={imageBusy}
-                    >
-                      Reset form
-                    </button>
-                  </div>
-                </div>
                 <div className="image-results-column">
                   {imagePreview ? (
                     <article className="image-progress-preview" role="status" aria-live="polite">
@@ -4202,17 +4305,6 @@ export function App() {
                       </footer>
                     </article>
                   ) : null}
-                  <div className="image-best-practices" aria-live="polite">
-                    <h3>Best-practice checklist</h3>
-                    <ol>
-                      <li>Describe subject, style, lighting, and camera mood in the main prompt.</li>
-                      <li>List undesirable traits in the negative prompt to prevent artifacts.</li>
-                      <li>Increase inference steps for detail, but watch duration on CPU hosts.</li>
-                      <li>Use seeds to reproduce shots and iterate on improvements.</li>
-                      <li>Switch to GPU for faster drafts; keep CPU handy when GPUs are busy.</li>
-                      <li>Log the aspect ratio when attaching images back into chat sessions.</li>
-                    </ol>
-                  </div>
                   <div className="image-history" aria-live="polite">
                     {imageResults.length === 0 ? (
                       <p className="image-placeholder">No renders yet. Craft a prompt and hit “Generate image”.</p>
@@ -4276,6 +4368,184 @@ export function App() {
                         ))}
                       </div>
                     )}
+                  </div>
+                </div>
+                <div className="image-form" aria-label="Image generation form">
+                  <label className="image-field">
+                    <span>Prompt *</span>
+                    <textarea
+                      className="image-textarea"
+                      rows={4}
+                      value={imagePrompt}
+                      onChange={(e) => setImagePrompt(e.target.value)}
+                      placeholder="Rain-soaked Bangkok street photography, Leica look, cinematic lighting"
+                    />
+                  </label>
+                  <label className="image-field">
+                    <span>Negative prompt</span>
+                    <textarea
+                      className="image-textarea"
+                      rows={2}
+                      value={imageNegativePrompt}
+                      onChange={(e) => setImageNegativePrompt(e.target.value)}
+                      placeholder="blurry, low quality, extra limbs"
+                    />
+                  </label>
+                  <div className="image-controls-panel">
+                    <div className="image-controls-header">
+                      <span>Controls</span>
+                      <button
+                        type="button"
+                        className="image-controls-toggle"
+                        onClick={() => setImageControlsCollapsed((prev) => !prev)}
+                        aria-expanded={!imageControlsCollapsed}
+                        aria-controls="image-control-grid"
+                      >
+                        {imageControlsCollapsed ? 'Expand controls' : 'Collapse controls'}
+                      </button>
+                    </div>
+                    {!imageControlsCollapsed && (
+                      <div
+                        id="image-control-grid"
+                        className="control-chips image-chip-grid"
+                        role="group"
+                        aria-label="Imagen Studio controls"
+                      >
+                        <label className="control-chip image-chip" htmlFor="guidance-slider">
+                          <span className="chip-header">
+                            <span className="chip-icon" aria-hidden>
+                              🧭
+                            </span>
+                            <span className="chip-label">Guidance</span>
+                          </span>
+                          <span className="chip-helper">{Number(imageGuidance).toFixed(1)}× intensity</span>
+                          <input
+                            id="guidance-slider"
+                            type="range"
+                            min={IMAGE_MIN_GUIDANCE}
+                            max={IMAGE_MAX_GUIDANCE}
+                            step={0.5}
+                            value={imageGuidance}
+                            onChange={(e) => setImageGuidance(Number(e.target.value))}
+                          />
+                        </label>
+                        <label className="control-chip image-chip" htmlFor="step-slider">
+                          <span className="chip-header">
+                            <span className="chip-icon" aria-hidden>
+                              📈
+                            </span>
+                            <span className="chip-label">Steps</span>
+                          </span>
+                          <span className="chip-helper">{imageSteps} iterations</span>
+                          <input
+                            id="step-slider"
+                            type="range"
+                            min={IMAGE_MIN_STEPS}
+                            max={IMAGE_MAX_STEPS}
+                            step={1}
+                            value={imageSteps}
+                            onChange={(e) => setImageSteps(Number(e.target.value))}
+                          />
+                        </label>
+                        <label className="control-chip image-chip">
+                          <span className="chip-header">
+                            <span className="chip-icon" aria-hidden>
+                              ↔️
+                            </span>
+                            <span className="chip-label">Width</span>
+                          </span>
+                          <select
+                            className="chip-select"
+                            value={imageWidth}
+                            onChange={(e) => setImageWidth(Number(e.target.value) || 512)}
+                          >
+                            {imageWidthOptions.map((option) => (
+                              <option key={`w-${option.value}`} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="control-chip image-chip">
+                          <span className="chip-header">
+                            <span className="chip-icon" aria-hidden>
+                              ↕️
+                            </span>
+                            <span className="chip-label">Height</span>
+                          </span>
+                          <select
+                            className="chip-select"
+                            value={imageHeight}
+                            onChange={(e) => setImageHeight(Number(e.target.value) || 512)}
+                          >
+                            {imageHeightOptions.map((option) => (
+                              <option key={`h-${option.value}`} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="control-chip image-chip">
+                          <span className="chip-header">
+                            <span className="chip-icon" aria-hidden>
+                              🎲
+                            </span>
+                            <span className="chip-label">Seed</span>
+                          </span>
+                          <input
+                            className="chip-input"
+                            type="text"
+                            value={imageSeed}
+                            onChange={(e) => setImageSeed(e.target.value)}
+                            placeholder="auto"
+                            inputMode="numeric"
+                          />
+                        </label>
+                        <label className="control-chip image-chip" htmlFor="image-accelerator-select">
+                          <span className="chip-header">
+                            <span className="chip-icon" aria-hidden>
+                              ⚡
+                            </span>
+                            <span className="chip-label">Accelerator</span>
+                          </span>
+                          <select
+                            id="image-accelerator-select"
+                            className="chip-select"
+                            value={imageAccelerator}
+                            onChange={(e) => setImageAccelerator(e.target.value as 'cpu' | 'gpu')}
+                          >
+                            {IMAGE_ACCELERATOR_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                  {imageError ? (
+                    <div className="form-error" role="alert">
+                      {imageError}
+                    </div>
+                  ) : null}
+                  <div className="image-actions">
+                    <button
+                      type="button"
+                      className="pill-button primary"
+                      onClick={handleGenerateImage}
+                      disabled={imageBusy}
+                    >
+                      {imageBusy ? 'Generating…' : 'Generate image'}
+                    </button>
+                    <button
+                      type="button"
+                      className="pill-button secondary"
+                      onClick={resetImageForm}
+                      disabled={imageBusy}
+                    >
+                      Reset form
+                    </button>
                   </div>
                 </div>
               </div>

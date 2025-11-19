@@ -36,12 +36,40 @@ YOLO_MODEL_ROOT=/mnt/c/_dev/_models/yolo
 OLLAMA_MODEL=llama3.2:3b
 ```
 
-### MCP image generator service
-The stack now ships with an MCP-compatible image generator (`./mcp_imagen`) that exposes Stable Diffusion (default `runwayml/stable-diffusion-v1-5`) over both MCP and a simple REST shim. Relevant environment knobs (with their compose defaults) are:
+### Environment files & secrets
+
+- `.env` (tracked) contains shareable defaults like host paths and container URLs.
+- `.env.secure` (gitignored) holds everything sensitive: API keys (OpenAI, Anthropic, EasySlip, ngrok, etc.) and any machine-specific secrets.
+
+Create `.env.secure` next to `.env` and add your secrets:
 
 ```
-IMAGE_MCP_URL=http://mcp_imagen:8001
-IMAGE_MCP_GPU_URL=http://mcp_imagen_gpu:8001   # optional CUDA path exposed via docker-compose
+NGROK_AUTHTOKEN=xxx
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=...
+EASYSIP_API_KEY=...
+```
+
+When running Docker Compose or other tooling that relies on these variables, load both files. On Unix shells or PowerShell you can use `dotenv` (ships with the repo via npm scripts):
+
+```
+npx dotenv -e .env -e .env.secure -- docker compose up -d
+```
+
+On Windows `cmd.exe` (the default in this repo):
+
+```
+cmd /c npx dotenv -e .env -e .env.secure -- docker compose up -d
+```
+
+This keeps the committed `.env` stable for collaborators while letting you rotate credentials locally.
+
+### mcp-imagen (Stable Diffusion service)
+The stack now ships with an MCP-compatible image generator service (`./mcp-imagen`) that exposes Stable Diffusion (default `runwayml/stable-diffusion-v1-5`) over both MCP and a simple REST shim. Relevant environment knobs (with their compose defaults) are:
+
+```
+IMAGE_MCP_URL=http://mcp-imagen:8001
+IMAGE_MCP_GPU_URL=http://mcp-imagen-gpu:8001   # optional CUDA path exposed via docker-compose
 IMAGE_MODEL_ID=runwayml/stable-diffusion-v1-5
 IMAGE_TORCH_DEVICE=cpu                        # cpu service target
 IMAGE_TORCH_DEVICE_GPU=cuda                   # gpu service target (maps to USE_GPU build arg)
@@ -52,10 +80,9 @@ IMAGE_HEIGHT=512
 IMAGE_MODEL_ROOT=/mnt/c/_dev/_models/diffusers   # host cache path
 ```
 
-The CPU image generator still works out of the box, but GPU hosts get an additional `mcp_imagen_gpu` service (see `docker-compose.yml`). 
-The server automatically routes `/generate-image` calls to the `mcp_imagen_gpu` endpoint when the frontend asks for it. On the UI side, the Image Lab provides a CPU/GPU selector (with persistence) so you can draft quickly on CUDA hardware while falling back to CPU when needed.
+The CPU service still works out of the box, but GPU hosts get an additional `mcp-imagen-gpu` container (see `docker-compose.yml`). The server automatically routes `/generate-image` calls to the GPU endpoint when the frontend asks for it. On the UI side, the Image Lab provides a CPU/GPU selector (with persistence) so you can draft quickly on CUDA hardware while falling back to CPU when needed.
 
-The service is built automatically (`docker-compose.yml`), participates in health checks, and the API server proxies `/generate-image` requests to it. If you update the frontend, remember to run `npm run dev` for live testing and `npm run build:deploy` to sync the static assets served by the backend.
+Both endpoints are built automatically via `docker-compose.yml`, participate in health checks as `mcpImagen`/`mcpImagenGpu`, and the API server proxies `/generate-image` requests to them. Make sure your `.env` + `.env.secure` include the `IMAGE_MCP_*` URLs (especially when syncing environments) so the server knows where to route requests. If you update the frontend, remember to run `npm run dev` for live testing and `npm run build:deploy` to sync the static assets served by the backend.
 
 ### Bank slip MCP (mock EasySlip proxy)
 
@@ -71,7 +98,7 @@ BSLIP_MCP_URL=http://mcp-bslip:8002
 
 #### Switching to the real EasySlip API
 
-1. Obtain an API key and store it in `.env` (or `.env.win`) as `EASYSIP_API_KEY=...`.
+1. Obtain an API key and store it in `.env.secure` as `EASYSIP_API_KEY=...`.
 2. Update `bslip_mcp/main.py` (or create a new service alongside it) so the FastAPI route forwards the multipart form data to `https://developer.easyslip.com/api/v1/verify` with the `Authorization: Bearer $EASYSIP_API_KEY` header.
 3. Rebuild/restart the `mcp_bslip` service:
    ```
@@ -113,8 +140,8 @@ If you prefer running Docker directly on Windows (without WSL), follow these ste
 
 1. Install Docker Desktop and make sure it is using the Windows container backend.
 2. Clone this repository somewhere on your Windows filesystem.
-3. Use the provided `.env` (or `.env.win`) as the Windows profile and update host paths if your directories differ.
-4. From the repo root run `docker compose --env-file .env.win up -d` (or rely on the default `.env`).
+3. Use `.env` for host paths and mirror any secrets (ngrok, OpenAI, etc.) inside `.env.secure`.
+4. From the repo root load both files when starting the stack, e.g. `cmd /c npx dotenv -e .env -e .env.secure -- docker compose up -d`.
 
 ### Host model paths (Windows)
 

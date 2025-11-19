@@ -1,0 +1,108 @@
+# MCP Aggregator & Identity Provider Integration Plan
+
+## 1. Purpose
+`mcp-0` acts as a single aggregation point for all MCP-compatible providers that the stack exposes (YOLO detections, Stable Diffusion image generation, bank-slip verification, future services, etc.). Instead of wiring every consumer directly to each MCP service, clients speak to `mcp-0`, which fans out to the registered MCP servers, collects their capabilities, health, and metadata, and exposes a consolidated API plus a real MCP interface for upstream tools.
+
+## 2. High-level responsibilities
+1. **Registry & discovery** – Maintain a catalog of downstream MCP services (static via env/compose for v0, dynamic registration in vNext).
+2. **Health aggregation** – Poll `/health` (or custom) routes and expose a single `/health` payload summarizing the entire MCP network.
+3. **Capability introspection** – Use each provider’s MCP manifest (via `GET /.well-known/ai-plugin.json` or FastMCP metadata) to build a merged capability map (tools, prompts, file systems, etc.).
+4. **Proxy router** – Offer REST/MCP endpoints that forward tool calls to the correct downstream service while normalizing auth, tracing IDs, and error envelopes.
+5. **Audit & metrics** – Emit structured logs/events so the server UI (and future dashboards) can display which providers are connected, their latency, and version info.
+
+## 3. Proposed FastAPI layout (mcp_0/)
+```
+mcp_0/
+├─ main.py             # FastAPI entrypoint + uvicorn main()
+├─ registry.py         # Service definitions, adapters, health polling helpers
+├─ routers/
+│   ├─ health.py       # /health, /status endpoints
+│   ├─ registry.py     # CRUD for providers (future)
+│   └─ proxy.py        # /tools/{tool_name}, /mcp/* fan-out
+├─ schemas.py          # Pydantic models shared across routers
+├─ clients/
+│   ├─ base.py         # Shared HTTP/MCP client utilities (timeouts, retries)
+│   ├─ fastmcp.py      # Helpers for FastMCP-specific metadata fetches
+│   └─ rest.py         # Plain REST bridges (e.g., BSLIP verify)
+└─ requirements.txt    # FastAPI + httpx + pydantic-settings
+```
+
+## 4. API surface (initial)
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` | Aggregated status of all registered MCP services including latency and latest error.
+| `GET /providers` | List known providers with metadata (name, base URL, MCP manifest, supported tools).
+| `POST /proxy/{provider}/{tool}` | Fire-and-forget proxy to a named provider/tool with request payload passthrough.
+| `POST /proxy/tools/{tool}` | Broadcast a tool call to all providers that advertise that tool name, returning each response (fan-in pattern).
+| `POST /register` (vNext) | Allow services to self-register at runtime (requires token).
+
+Internally, `mcp-0` will also expose an actual MCP server interface using `FastMCP` or a slim adapter, so upstream orchestrators can connect just once and gain visibility into every downstream MCP provider.
+
+## 5. Configuration & discovery
+- Static config via env vars in `docker-compose.yml` (e.g., `MCP0_PROVIDERS=yolo:http://mcp-yolo:8000,bslip:http://mcp-bslip:8002,image:http://mcp-imagen:8001`).
+- Each provider descriptor includes:
+  ```json
+  {
+    "name": "yolo",
+    "base_url": "http://mcp-yolo:8000",
+    "health_path": "/",
+    "capabilities_path": "/.well-known/mcp.json",
+    "default_tools": ["detect_objects"]
+  }
+  ```
+- On boot, `mcp-0` loads descriptors, fetches manifests in parallel, caches them (redis/ttl cache optional later), and exposes consolidated info.
+
+### 5.1 Options for collecting downstream MCP information
+1. **Static manifests (baseline)** – Fetch paths such as `/.well-known/mcp.json`, `/.well-known/ai-plugin.json`, or provider-specific FastMCP metadata immediately after startup. Cache the raw manifest plus a parsed summary (tools, prompts, models) so repeated health checks don’t refetch bulky payloads.
+2. **Active handshake (FastMCP client)** – Open a lightweight MCP client connection (e.g., via WebSocket) to each provider on a schedule, call `listTools/listPrompts`, then close. This validates the provider speaks MCP correctly and yields richer metadata (parameter schemas, auth requirements) than the static manifest alone.
+3. **Health probe enrichment** – Extend the existing `/health` polling to request additional headers (version, git sha, accelerator) or query params (e.g., `?detail=full`). Providers can return structured insight that `mcp-0` stores alongside latency/error metrics.
+4. **Self-registration payloads** – When a provider calls `POST /register`, require it to send its manifest plus optional signed capabilities bundle. `mcp-0` merges that info into the registry without having to refetch until TTL expiry.
+5. **Service discovery backends** – For larger deployments, let `mcp-0` watch a discovery source (Consul, etcd, Kubernetes endpoints) and scrape annotations/labels that describe MCP features. Useful when new providers come and go dynamically.
+6. **Observability taps** – Tail structured logs or metrics (e.g., OTLP spans) emitted by downstream services to derive availability+latency without polling them aggressively. `mcp-0` correlates trace IDs so operations staff can drill in from a single dashboard.
+
+### 5.2 Mitigations for static-list downsides
+- **Reduce staleness** – Pair the static list with `POST /register` so new MCPs can announce themselves at runtime (token-protected), or watch discovery systems (Consul/etcd/Kubernetes) to auto-refresh the registry without redeploys.
+- **Keep startup fast** – Fetch manifests concurrently with bounded workers, return partial `/providers` results while slow endpoints load, and hydrate from the last-known-good cache (disk/Redis) so metadata is available immediately.
+- **Capture richer metadata** – Schedule periodic FastMCP handshake sessions (`listTools`, `listPrompts`) after bootstrap and ask providers to support `/health?detail=full` so polling yields schema-level detail, auth hints, and accelerator tags.
+- **Isolate failures** – Apply per-provider timeouts, retries, and circuit breakers so one stuck MCP only marks itself degraded instead of blocking the entire aggregator. Health collection should stream incremental updates so other services remain visible even when one fails.
+
+## 6. Interaction with existing stack
+1. **Server → MCP**: instead of wiring the Node server to `YOLO_MCP_URL`, `BSLIP_MCP_URL`, `IMAGE_MCP_URL`, etc., point it to `MCP0_URL`. The server queries `/providers` to populate dropdowns and hits `/proxy/...` for tool invocations.
+2. **Frontend**: Gains a single MCP selector (e.g., “Bank Slip via mcp-0”) but receives richer metadata (status, version) via existing `/health` fan-out.
+3. **Docker Compose**: Add a new `mcp_0` service built from `./mcp_0` with FastAPI + uvicorn, expose port 8010, and mount any shared config file if needed.
+
+## 7. Draft FastAPI snippets
+```python
+app = FastAPI(title="mcp-0", version="0.1.0")
+registry = ProviderRegistry.from_env("MCP0_PROVIDERS")
+
+@app.get("/health", response_model=AggregatedHealth)
+async def health():
+    return await registry.collect_health()
+
+@app.get("/providers", response_model=List[ProviderInfo])
+async def list_providers():
+    return registry.list()
+
+@app.post("/proxy/{provider}/{tool}")
+async def proxy_tool(provider: str, tool: str, payload: Dict[str, Any]):
+    client = registry.get_client(provider)
+    return await client.invoke_tool(tool, payload)
+```
+
+`ProviderRegistry` keeps async httpx clients with per-provider auth tokens and fallback logic (retry with exponential backoff, degrade status if repeated failures occur).
+
+## 8. Observability hooks
+- Emit structured logs (JSON) for each proxy call with `trace_id`, provider, tool, latency, and success/error flag.
+- Optional integration with the Node server’s `/health` aggregator via WebSocket or SSE for live UI updates.
+- Provide `/metrics` (Prometheus) once FastAPI instrumentation is added.
+
+## 9. Roadmap / open questions
+1. How should auth work between `mcp-0` and downstream providers? (mTLS, bearer tokens, or shared secret header?)
+2. Do we need per-tenant isolation in registry entries? Potentially store provider credentials per tenant.
+3. Should `mcp-0` persist provider metadata (redis/sqlite) or is in-memory enough?
+4. Should the Node server migrate to pure MCP calls (using `mcp-0` as the only provider) or keep REST fallbacks? Recommendation: keep REST proxy for now while we experiment.
+5. Versioning strategy for provider contracts (e.g., pinned schema vs. introspected capabilities).
+
+---
+This document captures the initial concept so we can iterate before wiring the actual code paths. Let me know what to adjust and I can start scaffolding the FastAPI package + Compose service.
