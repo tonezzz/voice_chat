@@ -1,3 +1,9 @@
+x-build-cache: &build_cache
+  cache_from:
+    - type=local,src=${DOCKER_CACHE_DIR:-.docker-cache}
+  cache_to:
+    - type=local,dest=${DOCKER_CACHE_DIR:-.docker-cache},mode=max
+
 services:
   ollama:
     volumes:
@@ -14,6 +20,7 @@ services:
   stt-gpu:
     build:
       context: ./stt
+      <<: *build_cache
       args:
         BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
     volumes:
@@ -22,6 +29,7 @@ services:
   mcp_yolo:
     build:
       context: ./mcp_yolo
+      <<: *build_cache
       args:
         BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
     volumes:

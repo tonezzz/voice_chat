@@ -9,8 +9,10 @@ const crypto = require('crypto');
 const Tesseract = require('tesseract.js');
 
 const app = express();
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '1mb';
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
+app.use(express.urlencoded({ limit: JSON_BODY_LIMIT, extended: true }));
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -80,6 +82,128 @@ app.post('/verify-slip', upload.single('file'), async (req, res) => {
       mimetype: req.file?.mimetype,
       stack: process.env.NODE_ENV === 'production' ? undefined : err?.stack
     });
+  }
+});
+
+app.post('/voice-chat-stream', async (req, res) => {
+  setupSse(res);
+  const { message, model, accelerator, sessionId, sessionName, history, voice, provider } = req.body || {};
+  if (!message) {
+    sendSseEvent(res, { type: 'error', error: 'message is required' });
+    closeSse(res);
+    return;
+  }
+
+  const requestedProvider = normalizeProvider(provider);
+  const modelToUse = resolveModelForProvider(requestedProvider, model);
+  const selectedVoice = typeof voice === 'string' ? voice.trim() : '';
+
+  if (!providerRequiresKey(requestedProvider)) {
+    sendSseEvent(res, { type: 'error', error: 'provider_unavailable' });
+    closeSse(res);
+    return;
+  }
+
+  let session = getSession(sessionId);
+  if (!session) {
+    session = createSession(sessionName, requestedProvider);
+    hydrateSessionHistory(session, history);
+  } else if (provider) {
+    session.provider = requestedProvider;
+  }
+
+  addSessionMessage(session, {
+    role: 'user',
+    content: message,
+    model: modelToUse,
+    accelerator,
+    voiceId: typeof voice === 'string' ? voice : null
+  });
+
+  const streamingEnabled = providerSupportsStreaming(session.provider);
+
+  try {
+    let reply = '';
+    let resolvedServer = '';
+    let toolRuns = [];
+
+    if (streamingEnabled) {
+      const streamResult = await streamOllamaCompletion({
+        session,
+        modelToUse,
+        accelerator,
+        onDelta: (delta, accumulated) => {
+          sendSseEvent(res, { type: 'delta', delta, full: accumulated });
+        }
+      });
+      reply = streamResult.reply;
+      resolvedServer = streamResult.resolvedServer;
+      if (reply && MCP0_BASE_URL) {
+        const { cleanText, instructions } = extractMcpToolInstructions(reply);
+        reply = cleanText || reply;
+        toolRuns = await executeMcpInstructions(instructions);
+      }
+    } else {
+      const { reply: fullReply, resolvedServer: usedServer, toolRuns: resolvedTools } = await executeChatCompletion({
+        session,
+        modelToUse,
+        accelerator,
+        body: req.body
+      });
+      reply = fullReply;
+      resolvedServer = usedServer;
+      toolRuns = resolvedTools;
+      if (reply) {
+        sendSseEvent(res, { type: 'delta', delta: reply, full: reply });
+      }
+    }
+
+    addSessionMessage(session, {
+      role: 'assistant',
+      content: reply,
+      model: modelToUse,
+      accelerator,
+      voiceId: typeof selectedVoice === 'string' ? selectedVoice : null
+    });
+
+    const audioUrl = await synthesizeSpeech(reply, accelerator, selectedVoice);
+    const diagnosticsPayload = buildDiagnostics({
+      provider: session.provider,
+      model: modelToUse,
+      accelerator,
+      server:
+        resolvedServer ||
+        resolveProviderServerInfo(session.provider, {
+          accelerator,
+          githubDeployment: req.body?.github_deployment || req.body?.githubDeployment
+        })
+    });
+
+    sendSseEvent(res, {
+      type: 'complete',
+      reply,
+      audioUrl,
+      session: sessionToResponse(session),
+      provider: session.provider,
+      voiceId: typeof selectedVoice === 'string' ? selectedVoice : null,
+      diagnostics: diagnosticsPayload,
+      mcpTools: toolRuns
+    });
+  } catch (err) {
+    console.error('Streaming server error:', err);
+    sendSseEvent(res, { type: 'error', error: err?.message || 'server error' });
+  } finally {
+    closeSse(res);
+  }
+});
+
+app.get('/github-model/health', async (_req, res) => {
+  try {
+    const status = await checkGithubModelHealth();
+    return res.json(status);
+  } catch (err) {
+    console.error('GitHub model health check failed:', err);
+    return res.status(500).json({ name: 'githubModel', status: 'error', detail: err?.message || 'unknown_error' });
   }
 });
 
@@ -288,6 +412,9 @@ const safeJsonParse = (value, fallback) => {
 };
 
 app.post('/preview-voice', async (req, res) => {
+  if (!VOICE_FEATURE_ENABLED) {
+    return res.status(503).json({ error: 'voice_feature_disabled' });
+  }
   const { voiceId, accelerator, text } = req.body || {};
   const selectedVoice = typeof voiceId === 'string' && voiceId.trim() ? voiceId.trim() : '';
   if (!selectedVoice) {
@@ -323,21 +450,35 @@ const attachmentUpload = multer({
   }
 });
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
-const OLLAMA_GPU_URL = process.env.OLLAMA_GPU_URL || '';
+const resolveServiceUrl = (value, fallback = '') => {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.toLowerCase() === 'disabled') {
+      return '';
+    }
+    return trimmed;
+  }
+  return fallback;
+};
+
+const OLLAMA_URL = resolveServiceUrl(process.env.OLLAMA_URL, 'http://localhost:11434');
+const OLLAMA_GPU_URL = resolveServiceUrl(process.env.OLLAMA_GPU_URL);
 const MODEL = process.env.MODEL || 'llama3';
 const PORT = process.env.PORT || 3001;
-const STT_URL = process.env.STT_URL || 'http://localhost:5001';
-const STT_GPU_URL = process.env.STT_GPU_URL || '';
-const OPENVOICE_URL = process.env.OPENVOICE_URL || '';
-const OPENVOICE_GPU_URL = process.env.OPENVOICE_GPU_URL || '';
-const YOLO_MCP_URL = process.env.YOLO_MCP_URL || 'http://localhost:8000';
-const BSLIP_MCP_URL = process.env.BSLIP_MCP_URL || 'http://localhost:8002';
-const IMAGE_MCP_URL = process.env.IMAGE_MCP_URL || 'http://localhost:8001';
-const IMAGE_MCP_GPU_URL = process.env.IMAGE_MCP_GPU_URL || '';
-const IDP_MCP_URL = process.env.IDP_MCP_URL || 'http://localhost:8004';
-const IDP_MCP_GPU_URL = process.env.IDP_MCP_GPU_URL || 'http://localhost:8104';
+const STT_URL = resolveServiceUrl(process.env.STT_URL, 'http://localhost:5001');
+const STT_GPU_URL = resolveServiceUrl(process.env.STT_GPU_URL);
+const OPENVOICE_URL = resolveServiceUrl(process.env.OPENVOICE_URL);
+const OPENVOICE_GPU_URL = resolveServiceUrl(process.env.OPENVOICE_GPU_URL);
+const YOLO_MCP_URL = resolveServiceUrl(process.env.YOLO_MCP_URL, 'http://localhost:8000');
+const BSLIP_MCP_URL = resolveServiceUrl(process.env.BSLIP_MCP_URL, 'http://localhost:8002');
+const IMAGE_MCP_URL = resolveServiceUrl(process.env.IMAGE_MCP_URL, 'http://localhost:8001');
+const IMAGE_MCP_GPU_URL = resolveServiceUrl(process.env.IMAGE_MCP_GPU_URL);
+const IDP_MCP_URL = resolveServiceUrl(process.env.IDP_MCP_URL, 'http://localhost:8004');
+const IDP_MCP_GPU_URL = resolveServiceUrl(process.env.IDP_MCP_GPU_URL, 'http://localhost:8104');
+const MEMENTO_MCP_URL = resolveServiceUrl(process.env.MEMENTO_MCP_URL, 'http://localhost:8005');
 const MCP0_URL = process.env.MCP0_URL || '';
+const MCP0_BASE_URL = MCP0_URL ? MCP0_URL.replace(/\/$/, '') : '';
+const MCP0_TIMEOUT_MS = Number(process.env.MCP0_TIMEOUT_MS) || 10000;
 const GITHUB_MCP_URL = process.env.GITHUB_MCP_URL || 'https://mcp.github.com';
 const GITHUB_MCP_HEALTH_PATH = process.env.GITHUB_MCP_HEALTH_PATH || '/health';
 const OCR_DEFAULT_LANG = process.env.OCR_LANG || 'eng';
@@ -374,6 +515,25 @@ const GITHUB_MODEL_TEMPERATURE = Number.isFinite(parsedGithubTemp) ? parsedGithu
 const GITHUB_MODEL_MAX_TOKENS = Number(process.env.GITHUB_MODEL_MAX_TOKENS) || 1024;
 const GITHUB_API_VERSION = process.env.GITHUB_API_VERSION || '2023-07-01';
 
+const VOICE_FEATURE_ENABLED =
+  (process.env.ENABLE_VOICE_FEATURE || process.env.VOICE_FEATURE_ENABLED || '').toLowerCase() === 'true';
+
+const MCP_AUTOMATION_PROMPT = `You can request external tool executions via MCP0.
+When a GitHub operation is needed, emit a fenced code block labeled mcp0 using strict JSON:
+\`\`\`mcp0
+{
+  "provider": "githubModel",
+  "tool": "list_models",
+  "arguments": { }
+}
+\`\`\`
+Keep your natural language reply outside the fenced block. Only include tool blocks when the user explicitly asks for GitHub automation (repos, workflows, issues, etc.).`;
+const MCP_ALLOWED_PROVIDERS = new Set(['githubModel']);
+const MCP_TOOL_BLOCK_PATTERN = '```mcp0\\s+([\\s\\S]*?)```';
+const MCP_TOOL_BLOCK_REGEX = new RegExp(MCP_TOOL_BLOCK_PATTERN, 'gi');
+const buildMcpToolBlockRegex = () => new RegExp(MCP_TOOL_BLOCK_PATTERN, 'gi');
+const getAutomationSystemMessage = () => (MCP0_BASE_URL ? MCP_AUTOMATION_PROMPT : null);
+
 const shouldUseGpu = (accelerator) => accelerator === 'gpu';
 const normalizeProvider = (provider) => {
   if (!provider) return NORMALIZED_BASE_PROVIDER;
@@ -382,6 +542,8 @@ const normalizeProvider = (provider) => {
   if (lowered === 'chatgpt') return 'openai';
   return lowered;
 };
+
+const providerSupportsStreaming = (provider) => normalizeProvider(provider) === 'ollama';
 
 const isAnthropicProvider = (provider = NORMALIZED_BASE_PROVIDER) => normalizeProvider(provider) === 'anthropic';
 const isOpenAiProvider = (provider = NORMALIZED_BASE_PROVIDER) => normalizeProvider(provider) === 'openai';
@@ -403,6 +565,168 @@ const providerRequiresKey = (provider) => {
 
 const normalizeBaseUrl = (url) => (url || '').replace(/\/$/, '');
 
+const getDefaultModelForProvider = (provider) => {
+  const normalized = normalizeProvider(provider);
+  if (normalized === 'anthropic') {
+    return ANTHROPIC_MODEL;
+  }
+  if (normalized === 'openai') {
+    return OPENAI_MODEL;
+  }
+  if (normalized === 'github') {
+    return GITHUB_MODEL;
+  }
+  return MODEL;
+};
+
+const resolveModelForProvider = (provider, requestedModel) => {
+  const normalized = normalizeProvider(provider);
+  const trimmed = typeof requestedModel === 'string' ? requestedModel.trim() : '';
+
+  if (normalized === 'github') {
+    const allowedGithubModels = [GITHUB_MODEL, GITHUB_MODEL_DEPLOYMENT]
+      .map((value) => (typeof value === 'string' ? value.trim() : ''))
+      .filter(Boolean);
+    if (trimmed && allowedGithubModels.includes(trimmed)) {
+      return trimmed;
+    }
+    return allowedGithubModels[0] || GITHUB_MODEL || GITHUB_MODEL_DEPLOYMENT || 'gpt-4o-mini';
+  }
+
+  if (trimmed) {
+    return trimmed;
+  }
+
+  return getDefaultModelForProvider(normalized);
+};
+
+const resolveGithubEndpoint = (deploymentOverride) => {
+  if (GITHUB_MODEL_CHAT_URL) {
+    return GITHUB_MODEL_CHAT_URL;
+  }
+  const baseUrl = normalizeBaseUrl(GITHUB_MODEL_CHAT_BASE_URL || DEFAULT_GITHUB_CHAT_BASE);
+  const resolvedDeployment =
+    typeof deploymentOverride === 'string' && deploymentOverride.trim()
+      ? deploymentOverride.trim()
+      : GITHUB_MODEL_DEPLOYMENT;
+  if (!baseUrl || !resolvedDeployment) {
+    return '';
+  }
+  return `${baseUrl}/${encodeURIComponent(resolvedDeployment)}/chat/completions`;
+};
+
+const resolveProviderServerInfo = (provider, { accelerator, githubDeployment } = {}) => {
+  const normalized = normalizeProvider(provider);
+  if (normalized === 'anthropic') {
+    return ANTHROPIC_API_URL;
+  }
+  if (normalized === 'openai') {
+    return OPENAI_API_URL;
+  }
+  if (normalized === 'github') {
+    return resolveGithubEndpoint(githubDeployment);
+  }
+  return pickOllamaBase(accelerator);
+};
+
+const buildDiagnostics = ({ provider, model, accelerator, server }) => ({
+  provider,
+  model,
+  accelerator: accelerator || null,
+  server: server || null,
+  mcp0: MCP0_URL || null,
+  timestamp: new Date().toISOString()
+});
+
+const setupSse = (res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+};
+
+const sendSseEvent = (res, payload) => {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+};
+
+const closeSse = (res) => {
+  res.write('data: {"type":"done"}\n\n');
+  res.end();
+};
+
+const parseSseStream = async function* (readableStream) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+
+      let separatorIndex;
+      while ((separatorIndex = buffer.indexOf('\n\n')) >= 0) {
+        const rawEvent = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        if (!rawEvent.trim()) {
+          continue;
+        }
+        const lines = rawEvent.split(/\r?\n/);
+        const dataLines = lines
+          .filter((line) => line.startsWith('data:'))
+          .map((line) => line.slice(5).trim());
+        if (!dataLines.length) {
+          continue;
+        }
+        yield dataLines.join('\n');
+      }
+    }
+
+    const remaining = buffer.trim();
+    if (remaining.startsWith('data:')) {
+      yield remaining.slice(5).trim();
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+};
+
+const parseNewlineJsonStream = async function* (readableStream) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+        const rawLine = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (!rawLine) {
+          continue;
+        }
+        yield rawLine;
+      }
+    }
+
+    const tail = buffer.trim();
+    if (tail) {
+      yield tail;
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+};
+
 const HEALTH_CHECK_TIMEOUT_MS = Number(process.env.HEALTH_CHECK_TIMEOUT_MS) || 2000;
 
 const joinServicePath = (baseUrl, path = '/health') => {
@@ -413,9 +737,6 @@ const joinServicePath = (baseUrl, path = '/health') => {
 };
 
 const checkAnthropicHealth = async () => {
-  if (!isAnthropicProvider()) {
-    return { name: 'anthropic', status: 'disabled' };
-  }
   if (!ANTHROPIC_API_KEY) {
     return { name: 'anthropic', status: 'unconfigured' };
   }
@@ -439,9 +760,6 @@ const checkAnthropicHealth = async () => {
 };
 
 const checkOpenAiHealth = async () => {
-  if (!isOpenAiProvider()) {
-    return { name: 'openai', status: 'disabled' };
-  }
   if (!OPENAI_API_KEY) {
     return { name: 'openai', status: 'unconfigured' };
   }
@@ -465,6 +783,52 @@ const checkOpenAiHealth = async () => {
   }
 };
 
+const checkGithubModelHealth = async () => {
+  if (!isGithubProvider()) {
+    return { name: 'githubModel', status: 'disabled' };
+  }
+  if (!GITHUB_MODEL_TOKEN) {
+    return { name: 'githubModel', status: 'unconfigured' };
+  }
+
+  const baseUrl = normalizeBaseUrl(GITHUB_MODEL_CHAT_BASE_URL || DEFAULT_GITHUB_CHAT_BASE);
+  const targetEndpoint = GITHUB_MODEL_CHAT_URL
+    ? GITHUB_MODEL_CHAT_URL
+    : baseUrl && GITHUB_MODEL_DEPLOYMENT
+    ? `${baseUrl}/${encodeURIComponent(GITHUB_MODEL_DEPLOYMENT)}/chat/completions`
+    : '';
+
+  if (!targetEndpoint) {
+    return { name: 'githubModel', status: 'unconfigured' };
+  }
+
+  const payload = {
+    model: GITHUB_MODEL || GITHUB_MODEL_DEPLOYMENT,
+    max_tokens: 4,
+    messages: [{ role: 'user', content: 'ping' }]
+  };
+
+  try {
+    const response = await requestWithTimeout(targetEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${GITHUB_MODEL_TOKEN}`,
+        'X-GitHub-Api-Version': GITHUB_API_VERSION
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      return { name: 'githubModel', status: 'error', detail: `HTTP ${response.status}` };
+    }
+
+    return { name: 'githubModel', status: 'ok' };
+  } catch (err) {
+    return { name: 'githubModel', status: 'error', detail: err.message };
+  }
+};
+
 const requestWithTimeout = (url, options = {}) => {
   const { timeoutMs = HEALTH_CHECK_TIMEOUT_MS, ...rest } = options;
   return new Promise((resolve, reject) => {
@@ -482,6 +846,117 @@ const requestWithTimeout = (url, options = {}) => {
         reject(err);
       });
   });
+};
+
+const buildMcpProxyUrl = (provider, relativePath = '') => {
+  if (!MCP0_BASE_URL || !provider) {
+    return '';
+  }
+  const cleanRelative = relativePath ? `/${relativePath.replace(/^\/+/, '')}` : '';
+  return `${MCP0_BASE_URL}/proxy/${encodeURIComponent(provider)}${cleanRelative}`;
+};
+
+const callMcpProxy = async ({ provider, relativePath = '', payload = {} }) => {
+  if (!MCP0_BASE_URL) {
+    throw new Error('mcp0_unconfigured');
+  }
+  if (!provider) {
+    throw new Error('mcp_provider_missing');
+  }
+
+  const target = buildMcpProxyUrl(provider, relativePath);
+  if (!target) {
+    throw new Error('mcp_proxy_unavailable');
+  }
+
+  const response = await requestWithTimeout(target, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload ?? {}),
+    timeoutMs: MCP0_TIMEOUT_MS
+  });
+
+  const text = await response.text();
+  let parsed;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      parsed = text;
+    }
+  } else {
+    parsed = null;
+  }
+
+  if (!response.ok) {
+    const detail = typeof parsed === 'string' ? parsed : JSON.stringify(parsed);
+    throw new Error(detail || 'mcp_proxy_error');
+  }
+
+  return parsed;
+};
+
+const callMcpTool = async ({ provider, tool, args = {} }) => {
+  if (!tool || typeof tool !== 'string') {
+    throw new Error('mcp_tool_missing');
+  }
+  return callMcpProxy({ provider, relativePath: 'invoke', payload: { tool, arguments: args || {} } });
+};
+
+const extractMcpToolInstructions = (text) => {
+  if (typeof text !== 'string' || !text.trim()) {
+    return { cleanText: text || '', instructions: [] };
+  }
+
+  const regex = buildMcpToolBlockRegex();
+  const instructions = [];
+  let match;
+  while ((match = regex.exec(text))) {
+    const raw = match[1] || '';
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      instructions.push({ raw, error: `invalid_json: ${err.message}` });
+      continue;
+    }
+
+    const provider = typeof parsed?.provider === 'string' ? parsed.provider.trim() : '';
+    const tool = typeof parsed?.tool === 'string' ? parsed.tool.trim() : '';
+    const args = parsed?.arguments && typeof parsed.arguments === 'object' ? parsed.arguments : {};
+    if (!provider || !MCP_ALLOWED_PROVIDERS.has(provider)) {
+      instructions.push({ raw, provider, tool, args, error: 'provider_not_allowed' });
+      continue;
+    }
+    if (!tool) {
+      instructions.push({ raw, provider, tool, args, error: 'tool_missing' });
+      continue;
+    }
+    instructions.push({ raw, provider, tool, args });
+  }
+
+  const cleanText = text.replace(buildMcpToolBlockRegex(), '').trim();
+  return { cleanText, instructions };
+};
+
+const executeMcpInstructions = async (instructions = []) => {
+  if (!Array.isArray(instructions) || !instructions.length) {
+    return [];
+  }
+  const results = [];
+  for (const instruction of instructions) {
+    if (instruction.error) {
+      results.push({ ...instruction, result: null });
+      continue;
+    }
+    try {
+      const response = await callMcpTool({ provider: instruction.provider, tool: instruction.tool, args: instruction.args });
+      results.push({ ...instruction, result: response || null });
+    } catch (err) {
+      results.push({ ...instruction, error: err?.message || 'mcp_execution_failed', result: null });
+    }
+  }
+  return results;
 };
 
 const checkServiceHealth = async ({ name, baseUrl, path = '/health', method = 'GET' }) => {
@@ -571,6 +1046,25 @@ const addSessionMessage = (session, payload) => {
   return message;
 };
 
+const ensureAutomationSystemMessage = (session) => {
+  if (!session || !MCP0_BASE_URL) {
+    return;
+  }
+  const alreadyHasAutomation = session.messages?.some(
+    (msg) => msg.role === 'system' && typeof msg.content === 'string' && msg.content.includes('MCP0')
+  );
+  if (alreadyHasAutomation) {
+    return;
+  }
+  addSessionMessage(session, {
+    role: 'system',
+    content: MCP_AUTOMATION_PROMPT,
+    model: null,
+    sttModel: null,
+    accelerator: null
+  });
+};
+
 const hydrateSessionHistory = (session, history) => {
   if (!Array.isArray(history) || !history.length) return;
   history.slice(-MAX_SESSION_MESSAGES).forEach((entry) => {
@@ -614,6 +1108,125 @@ const formatMessagesForOpenAi = (session) =>
       role: msg.role === 'assistant' ? 'assistant' : msg.role === 'system' ? 'system' : 'user',
       content: msg.content || ''
     }));
+
+const executeChatCompletion = async ({ session, modelToUse, accelerator, body }) => {
+  const providerForSession = session.provider || NORMALIZED_BASE_PROVIDER;
+  let reply = '';
+  let resolvedServer = '';
+
+  ensureAutomationSystemMessage(session);
+
+  if (isAnthropicProvider(providerForSession)) {
+    resolvedServer = ANTHROPIC_API_URL;
+    const anthropicMessages = formatMessagesForAnthropic(session);
+    const { text } = await callAnthropicMessages({
+      messages: anthropicMessages,
+      model: modelToUse,
+      maxTokens: resolveAnthropicMaxTokens(body?.anthropic_max_tokens),
+      temperature: resolveAnthropicTemperature(body?.anthropic_temperature)
+    });
+    reply = text;
+  } else if (isOpenAiProvider(providerForSession)) {
+    resolvedServer = OPENAI_API_URL;
+    const openAiMessages = formatMessagesForOpenAi(session);
+    const { text } = await callOpenAiMessages({
+      messages: openAiMessages,
+      model: modelToUse,
+      maxTokens: resolveOpenAiMaxTokens(body?.openai_max_tokens),
+      temperature: resolveOpenAiTemperature(body?.openai_temperature)
+    });
+    reply = text;
+  } else if (isGithubProvider(providerForSession)) {
+    const githubMessages = formatMessagesForOpenAi(session);
+    const { text, endpoint } = await callGithubModelMessages({
+      messages: githubMessages,
+      model: modelToUse,
+      maxTokens: resolveGithubMaxTokens(
+        body?.github_max_tokens ?? body?.githubMaxTokens ?? body?.max_tokens
+      ),
+      temperature: resolveGithubTemperature(
+        body?.github_temperature ?? body?.githubTemperature ?? body?.temperature
+      ),
+      deployment: body?.github_deployment || body?.githubDeployment
+    });
+    reply = text;
+    resolvedServer = endpoint;
+  } else {
+    const baseUrl = pickOllamaBase(accelerator);
+    resolvedServer = baseUrl;
+    const response = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: modelToUse,
+        messages: formatMessagesForOllama(session),
+        stream: false
+      })
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error('Ollama error:', text);
+      throw new Error(text || 'ollama_error');
+    }
+
+    const data = await response.json();
+    reply = (data.message && data.message.content) || data.response || '';
+  }
+
+  let toolRuns = [];
+  if (reply && MCP0_BASE_URL) {
+    const { cleanText, instructions } = extractMcpToolInstructions(reply);
+    reply = cleanText || reply;
+    toolRuns = await executeMcpInstructions(instructions);
+  }
+
+  return { reply, resolvedServer, toolRuns };
+};
+
+const streamOllamaCompletion = async ({ session, modelToUse, accelerator, onDelta }) => {
+  const baseUrl = pickOllamaBase(accelerator);
+  const response = await fetch(`${baseUrl}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: modelToUse,
+      messages: formatMessagesForOllama(session),
+      stream: true
+    })
+  });
+
+  if (!response.ok || !response.body) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(detail || 'ollama_stream_error');
+  }
+
+  let accumulated = '';
+  for await (const rawLine of parseNewlineJsonStream(response.body)) {
+    if (!rawLine) continue;
+    let payload;
+    try {
+      payload = JSON.parse(rawLine);
+    } catch (err) {
+      console.warn('Skipping malformed Ollama stream chunk', rawLine, err);
+      continue;
+    }
+    const chunkText =
+      (payload?.message && typeof payload.message.content === 'string' && payload.message.content) ||
+      (typeof payload?.response === 'string' ? payload.response : '');
+    if (chunkText) {
+      accumulated += chunkText;
+      if (typeof onDelta === 'function') {
+        onDelta(chunkText, accumulated);
+      }
+    }
+    if (payload?.done) {
+      break;
+    }
+  }
+
+  return { reply: accumulated, resolvedServer: baseUrl };
+};
 
 const resolveAnthropicMaxTokens = (override) => {
   const parsed = Number(override);
@@ -712,7 +1325,7 @@ const callAnthropicMessages = async ({ messages, model, maxTokens, temperature }
         .trim()
     : '';
 
-  return { text, data };
+  return { text, data, endpoint: resolvedEndpoint };
 };
 
 const callGithubModelMessages = async ({ messages, model, maxTokens, temperature, deployment }) => {
@@ -725,16 +1338,12 @@ const callGithubModelMessages = async ({ messages, model, maxTokens, temperature
   }
 
   const resolvedDeployment = typeof deployment === 'string' && deployment.trim() ? deployment.trim() : GITHUB_MODEL_DEPLOYMENT;
-  if (!resolvedDeployment) {
+  const resolvedEndpoint = resolveGithubEndpoint(resolvedDeployment);
+  if (!resolvedEndpoint) {
     throw new Error('github_deployment_missing');
   }
 
   const resolvedModel = typeof model === 'string' && model.trim() ? model.trim() : GITHUB_MODEL;
-  const baseUrl = normalizeBaseUrl(GITHUB_MODEL_CHAT_BASE_URL || DEFAULT_GITHUB_CHAT_BASE);
-  const endpoint = GITHUB_MODEL_CHAT_URL
-    ? GITHUB_MODEL_CHAT_URL
-    : `${baseUrl}/${encodeURIComponent(resolvedDeployment)}/chat/completions`;
-
   const payload = {
     model: resolvedModel,
     max_tokens: maxTokens || GITHUB_MODEL_MAX_TOKENS,
@@ -742,7 +1351,7 @@ const callGithubModelMessages = async ({ messages, model, maxTokens, temperature
     messages
   };
 
-  const response = await fetch(endpoint, {
+  const response = await fetch(resolvedEndpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -888,6 +1497,9 @@ const pickSttBase = (accelerator) => {
 };
 
 const pickOpenvoiceBase = (accelerator) => {
+  if (!VOICE_FEATURE_ENABLED) {
+    return '';
+  }
   if (shouldUseGpu(accelerator) && OPENVOICE_GPU_URL) {
     return OPENVOICE_GPU_URL;
   }
@@ -943,6 +1555,9 @@ const requestOpenvoiceSynthesis = async (baseUrl, text, voiceId) => {
 };
 
 const synthesizeWithOpenvoice = async (text, accelerator, voiceId) => {
+  if (!VOICE_FEATURE_ENABLED) {
+    throw new Error('openvoice_disabled');
+  }
   const prefersGpu = shouldUseGpu(accelerator) && !!OPENVOICE_GPU_URL;
   const hasCpu = !!OPENVOICE_URL;
 
@@ -990,6 +1605,10 @@ const synthesizeSpeech = async (text, accelerator, voice) => {
     return null;
   }
 
+  if (!VOICE_FEATURE_ENABLED) {
+    return null;
+  }
+
   const selectedVoice = typeof voice === 'string' ? voice.trim() : '';
 
   try {
@@ -1010,9 +1629,9 @@ app.post('/voice-chat', async (req, res) => {
   const { message, model, accelerator, sessionId, sessionName, history, voice, provider } = req.body || {};
   if (!message) return res.status(400).json({ error: 'message is required' });
 
-  const modelToUse = model || MODEL;
-  const selectedVoice = typeof voice === 'string' ? voice.trim() : '';
   const requestedProvider = normalizeProvider(provider);
+  const modelToUse = resolveModelForProvider(requestedProvider, model);
+  const selectedVoice = typeof voice === 'string' ? voice.trim() : '';
   if (!providerRequiresKey(requestedProvider)) {
     return res.status(400).json({ error: 'provider_unavailable' });
   }
@@ -1032,60 +1651,13 @@ app.post('/voice-chat', async (req, res) => {
   });
 
   try {
-    let reply = '';
-    if (isAnthropicProvider(session.provider)) {
-      const anthropicMessages = formatMessagesForAnthropic(session);
-      const { text } = await callAnthropicMessages({
-        messages: anthropicMessages,
-        model: modelToUse,
-        maxTokens: resolveAnthropicMaxTokens(req.body?.anthropic_max_tokens),
-        temperature: resolveAnthropicTemperature(req.body?.anthropic_temperature)
-      });
-      reply = text;
-    } else if (isOpenAiProvider(session.provider)) {
-      const openAiMessages = formatMessagesForOpenAi(session);
-      const { text } = await callOpenAiMessages({
-        messages: openAiMessages,
-        model: modelToUse,
-        maxTokens: resolveOpenAiMaxTokens(req.body?.openai_max_tokens),
-        temperature: resolveOpenAiTemperature(req.body?.openai_temperature)
-      });
-      reply = text;
-    } else if (isGithubProvider(session.provider)) {
-      const githubMessages = formatMessagesForOpenAi(session);
-      const { text } = await callGithubModelMessages({
-        messages: githubMessages,
-        model: modelToUse,
-        maxTokens: resolveGithubMaxTokens(
-          req.body?.github_max_tokens ?? req.body?.githubMaxTokens ?? req.body?.max_tokens
-        ),
-        temperature: resolveGithubTemperature(
-          req.body?.github_temperature ?? req.body?.githubTemperature ?? req.body?.temperature
-        ),
-        deployment: req.body?.github_deployment || req.body?.githubDeployment
-      });
-      reply = text;
-    } else {
-      const baseUrl = pickOllamaBase(accelerator);
-      const response = await fetch(`${baseUrl}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: modelToUse,
-          messages: formatMessagesForOllama(session),
-          stream: false
-        })
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        console.error('Ollama error:', text);
-        return res.status(500).json({ error: 'ollama error', detail: text });
-      }
-
-      const data = await response.json();
-      reply = (data.message && data.message.content) || data.response || '';
-    }
+    const { reply, resolvedServer: serverUsed, toolRuns } = await executeChatCompletion({
+      session,
+      modelToUse,
+      accelerator,
+      body: req.body
+    });
+    const resolvedServer = serverUsed;
 
     addSessionMessage(session, {
       role: 'assistant',
@@ -1095,12 +1667,24 @@ app.post('/voice-chat', async (req, res) => {
       voiceId: typeof selectedVoice === 'string' ? selectedVoice : null
     });
     const audioUrl = await synthesizeSpeech(reply, accelerator, selectedVoice);
+    const diagnosticsPayload = buildDiagnostics({
+      provider: session.provider,
+      model: modelToUse,
+      accelerator,
+      server: resolvedServer ||
+        resolveProviderServerInfo(session.provider, {
+          accelerator,
+          githubDeployment: req.body?.github_deployment || req.body?.githubDeployment
+        })
+    });
     return res.json({
       reply,
       audioUrl,
       session: sessionToResponse(session),
       provider: session.provider,
-      voiceId: typeof selectedVoice === 'string' ? selectedVoice : null
+      voiceId: typeof selectedVoice === 'string' ? selectedVoice : null,
+      diagnostics: diagnosticsPayload,
+      mcpTools: toolRuns
     });
   } catch (err) {
     console.error('Server error:', err);
@@ -1113,7 +1697,9 @@ app.post('/voice-chat-audio', upload.single('audio'), async (req, res) => {
 
   try {
     const modelFromForm = req.body && req.body.model;
-    const modelToUse = modelFromForm || MODEL;
+    const baseProvider = normalizeProvider(
+      req.body?.provider || req.body?.sessionProvider || NORMALIZED_BASE_PROVIDER
+    );
     const whisperFromForm =
       req.body && (req.body.whisper_model || req.body.whisperModel);
     const formData = new FormData();
@@ -1152,7 +1738,8 @@ app.post('/voice-chat-audio', upload.single('audio'), async (req, res) => {
       return res.status(500).json({ error: 'no transcript returned from STT' });
     }
 
-    const requestedProvider = normalizeProvider(req.body?.provider || session?.provider || NORMALIZED_BASE_PROVIDER);
+    const requestedProvider = normalizeProvider(req.body?.provider || session?.provider || baseProvider);
+    const modelToUse = resolveModelForProvider(requestedProvider, modelFromForm);
     if (!providerRequiresKey(requestedProvider)) {
       return res.status(400).json({ error: 'provider_unavailable' });
     }
@@ -1166,62 +1753,14 @@ app.post('/voice-chat-audio', upload.single('audio'), async (req, res) => {
       voiceId: typeof req.body?.voice === 'string' ? req.body.voice : null
     });
 
-    let reply = '';
     const providerForSession = session.provider || requestedProvider || NORMALIZED_BASE_PROVIDER;
-
-    if (isAnthropicProvider(providerForSession)) {
-      const anthropicMessages = formatMessagesForAnthropic(session);
-      const { text } = await callAnthropicMessages({
-        messages: anthropicMessages,
-        model: modelToUse,
-        maxTokens: resolveAnthropicMaxTokens(req.body?.anthropic_max_tokens),
-        temperature: resolveAnthropicTemperature(req.body?.anthropic_temperature)
-      });
-      reply = text;
-    } else if (isOpenAiProvider(providerForSession)) {
-      const openAiMessages = formatMessagesForOpenAi(session);
-      const { text } = await callOpenAiMessages({
-        messages: openAiMessages,
-        model: modelToUse,
-        maxTokens: resolveOpenAiMaxTokens(req.body?.openai_max_tokens),
-        temperature: resolveOpenAiTemperature(req.body?.openai_temperature)
-      });
-      reply = text;
-    } else if (isGithubProvider(providerForSession)) {
-      const githubMessages = formatMessagesForOpenAi(session);
-      const { text } = await callGithubModelMessages({
-        messages: githubMessages,
-        model: modelToUse,
-        maxTokens: resolveGithubMaxTokens(
-          req.body?.github_max_tokens ?? req.body?.githubMaxTokens ?? req.body?.max_tokens
-        ),
-        temperature: resolveGithubTemperature(
-          req.body?.github_temperature ?? req.body?.githubTemperature ?? req.body?.temperature
-        ),
-        deployment: req.body?.github_deployment || req.body?.githubDeployment
-      });
-      reply = text;
-    } else {
-      const ollamaBase = pickOllamaBase(targetAccelerator);
-      const ollamaRes = await fetch(`${ollamaBase}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: modelToUse,
-          messages: formatMessagesForOllama(session),
-          stream: false
-        })
-      });
-
-      if (!ollamaRes.ok) {
-        const text = await ollamaRes.text();
-        console.error('Ollama error:', text);
-        return res.status(500).json({ error: 'ollama_error', detail: text });
-      }
-
-      const ollamaData = await ollamaRes.json();
-      reply = (ollamaData.message && ollamaData.message.content) || ollamaData.response || '';
-    }
+    const { reply, resolvedServer: serverUsed, toolRuns } = await executeChatCompletion({
+      session,
+      modelToUse,
+      accelerator: targetAccelerator,
+      body: req.body
+    });
+    const resolvedServer = serverUsed;
 
     addSessionMessage(session, {
       role: 'assistant',
@@ -1232,6 +1771,17 @@ app.post('/voice-chat-audio', upload.single('audio'), async (req, res) => {
       voiceId: typeof req.body?.voice === 'string' ? req.body.voice : null
     });
     const audioUrl = await synthesizeSpeech(reply, targetAccelerator, selectedVoice);
+    const diagnosticsPayload = buildDiagnostics({
+      provider: providerForSession,
+      model: modelToUse,
+      accelerator: targetAccelerator,
+      server:
+        resolvedServer ||
+        resolveProviderServerInfo(providerForSession, {
+          accelerator: targetAccelerator,
+          githubDeployment: req.body?.github_deployment || req.body?.githubDeployment
+        })
+    });
     return res.json({
       transcript,
       language: transcriptLanguage,
@@ -1239,11 +1789,53 @@ app.post('/voice-chat-audio', upload.single('audio'), async (req, res) => {
       audioUrl,
       session: sessionToResponse(session),
       provider: session.provider,
-      voiceId: typeof req.body?.voice === 'string' ? req.body.voice : null
+      voiceId: typeof req.body?.voice === 'string' ? req.body.voice : null,
+      diagnostics: diagnosticsPayload,
+      mcpTools: toolRuns
     });
   } catch (err) {
     console.error('audio flow error:', err);
     return res.status(500).json({ error: 'server error' });
+  }
+});
+
+app.get('/mcp0/providers', async (_req, res) => {
+  if (!MCP0_BASE_URL) {
+    return res.status(503).json({ error: 'mcp0_unconfigured' });
+  }
+  try {
+    const response = await requestWithTimeout(`${MCP0_BASE_URL}/providers`, { timeoutMs: MCP0_TIMEOUT_MS });
+    if (!response.ok) {
+      const detail = await response.text();
+      return res.status(502).json({ error: 'mcp0_providers_error', detail });
+    }
+    const data = await response.json();
+    return res.json(data);
+  } catch (err) {
+    console.error('Failed to list MCP providers:', err);
+    return res.status(500).json({ error: 'mcp0_providers_error', detail: err?.message || 'unknown error' });
+  }
+});
+
+app.post('/mcp0/tools', async (req, res) => {
+  if (!MCP0_BASE_URL) {
+    return res.status(503).json({ error: 'mcp0_unconfigured' });
+  }
+  const provider = typeof req.body?.provider === 'string' ? req.body.provider.trim() : '';
+  const tool = typeof req.body?.tool === 'string' ? req.body.tool.trim() : '';
+  const args = (req.body && req.body.arguments && typeof req.body.arguments === 'object' && req.body.arguments) || {};
+  if (!provider || !tool) {
+    return res.status(400).json({ error: 'provider_and_tool_required' });
+  }
+  if (!MCP_ALLOWED_PROVIDERS.has(provider)) {
+    return res.status(400).json({ error: 'provider_not_allowed' });
+  }
+  try {
+    const result = await callMcpTool({ provider, tool, args });
+    return res.json({ provider, tool, result });
+  } catch (err) {
+    console.error('MCP manual invocation failed:', err);
+    return res.status(502).json({ error: 'mcp_tool_error', detail: err?.message || 'mcp_error' });
   }
 });
 
@@ -1489,25 +2081,64 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+app.get('/mcp/providers', async (req, res) => {
+  if (!MCP0_BASE_URL) {
+    return res.status(503).json({ error: 'mcp0_unconfigured' });
+  }
+
+  const refreshParam = req.query?.refresh === 'true' ? '?refresh=true' : '';
+  const target = `${MCP0_BASE_URL}/providers${refreshParam}`;
+
+  try {
+    const response = await requestWithTimeout(target, {
+      method: 'GET',
+      timeoutMs: MCP0_TIMEOUT_MS
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      return res.status(502).json({ error: 'mcp0_error', detail: detail || `HTTP ${response.status}` });
+    }
+
+    const payload = await response.json().catch(() => null);
+    if (!Array.isArray(payload)) {
+      return res.status(502).json({ error: 'mcp0_invalid_response' });
+    }
+
+    return res.json(payload);
+  } catch (err) {
+    console.error('Failed to load MCP providers:', err);
+    return res.status(502).json({ error: 'mcp0_unreachable', detail: err.message });
+  }
+});
+
 app.get('/health', async (_req, res) => {
-  const serviceChecks = await Promise.all([
+  const coreServiceChecks = [
     checkServiceHealth({ name: 'ollama', baseUrl: OLLAMA_URL, path: '/' }),
     checkServiceHealth({ name: 'ollamaGpu', baseUrl: OLLAMA_GPU_URL, path: '/' }),
     checkServiceHealth({ name: 'stt', baseUrl: STT_URL }),
     checkServiceHealth({ name: 'sttGpu', baseUrl: STT_GPU_URL }),
-    checkServiceHealth({ name: 'openvoice', baseUrl: OPENVOICE_URL, path: '/hc' }),
-    checkServiceHealth({ name: 'openvoiceGpu', baseUrl: OPENVOICE_GPU_URL, path: '/hc' }),
     checkServiceHealth({ name: 'yolo', baseUrl: YOLO_MCP_URL, path: '/' }),
     checkServiceHealth({ name: 'bslip', baseUrl: BSLIP_MCP_URL, path: '/health' }),
     checkServiceHealth({ name: 'mcpImagen', baseUrl: IMAGE_MCP_URL, path: '/' }),
     checkServiceHealth({ name: 'mcpImagenGpu', baseUrl: IMAGE_MCP_GPU_URL, path: '/' }),
     checkServiceHealth({ name: 'idp', baseUrl: IDP_MCP_URL, path: '/health' }),
     checkServiceHealth({ name: 'idpGpu', baseUrl: IDP_MCP_GPU_URL, path: '/health' }),
+    checkServiceHealth({ name: 'memento', baseUrl: MEMENTO_MCP_URL, path: '/health' }),
     checkServiceHealth({ name: 'mcp0', baseUrl: MCP0_URL, path: '/health' }),
     checkServiceHealth({ name: 'githubMcp', baseUrl: GITHUB_MCP_URL, path: GITHUB_MCP_HEALTH_PATH }),
     checkAnthropicHealth(),
     checkOpenAiHealth()
-  ]);
+  ];
+
+  if (VOICE_FEATURE_ENABLED) {
+    coreServiceChecks.splice(4, 0,
+      checkServiceHealth({ name: 'openvoice', baseUrl: OPENVOICE_URL, path: '/hc' }),
+      checkServiceHealth({ name: 'openvoiceGpu', baseUrl: OPENVOICE_GPU_URL, path: '/hc' })
+    );
+  }
+
+  const serviceChecks = await Promise.all(coreServiceChecks);
 
   const hasError = serviceChecks.some((svc) => svc.status === 'error');
 
@@ -1519,8 +2150,8 @@ app.get('/health', async (_req, res) => {
     defaultModel: MODEL,
     sttUrl: STT_URL,
     sttGpuUrl: STT_GPU_URL || null,
-    openvoiceUrl: OPENVOICE_URL || null,
-    openvoiceGpuUrl: OPENVOICE_GPU_URL || null,
+    openvoiceUrl: VOICE_FEATURE_ENABLED ? OPENVOICE_URL || null : null,
+    openvoiceGpuUrl: VOICE_FEATURE_ENABLED ? OPENVOICE_GPU_URL || null : null,
     yoloUrl: YOLO_MCP_URL || null,
     mcpImagenUrl: IMAGE_MCP_URL || null,
     mcpImagenGpuUrl: IMAGE_MCP_GPU_URL || null,
@@ -1528,6 +2159,7 @@ app.get('/health', async (_req, res) => {
     idpGpuUrl: IDP_MCP_GPU_URL || null,
     mcp0Url: MCP0_URL || null,
     githubMcpUrl: GITHUB_MCP_URL || null,
+    voiceFeatureEnabled: VOICE_FEATURE_ENABLED,
     services: serviceChecks,
     timestamp: new Date().toISOString()
   });
@@ -1557,6 +2189,9 @@ const fetchVoicesFromService = async (baseUrl, engine) => {
 };
 
 app.get('/voices', async (req, res) => {
+  if (!VOICE_FEATURE_ENABLED) {
+    return res.status(503).json({ error: 'voice_feature_disabled' });
+  }
   try {
     const aggregated = [];
     const defaultCandidates = [];

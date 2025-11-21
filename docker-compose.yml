@@ -1,30 +1,70 @@
+x-build-cache: &build_cache
+  cache_from:
+    - type=local,src=${DOCKER_CACHE_DIR:-.docker-cache}
+  cache_to:
+    - type=local,dest=${DOCKER_CACHE_DIR:-.docker-cache},mode=max
+
 services:
-  # openvoice-tts:
-  #   build: C:/_dev/_models/openvoice/openvoice
-  #   container_name: voice-chat-openvoice
-  #   profiles: ["cpu"]
-  #   environment:
-  #     - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
-  #     - OPENVOICE_CHECKPOINT_DIR=/app/inference/checkpoints
-  #   volumes:
-  #     - C:/_dev/_models/openvoice_v2:/app/inference/openvoice_v2
-  #     - C:/_dev/_models/openvoice/data:/app/inference/.data
-  #     - C:/_dev/_models/openvoice/checkpoints:/app/inference/checkpoints
-  #     - C:/_dev/_models/openvoice/references:/app/inference/references
-  #     - C:/_dev/_models/openvoice/conf/openvoice:/app/conf/openvoice
-  #     #- ./server/conf/openvoice:/app/conf/openvoice
-  #   ports:
-  #     - "8100:80"
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "curl -sf http://localhost/hc || exit 1"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 5
-  #   restart: unless-stopped
+  openvoice-tts:
+    build:
+      context: C:/_dev/_models/openvoice/openvoice
+      <<: *build_cache
+    container_name: voice-chat-openvoice
+    profiles: ["openvoice"]
+    environment:
+      - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
+      - OPENVOICE_CHECKPOINT_DIR=/app/inference/checkpoints
+    volumes:
+      - C:/_dev/_models/openvoice_v2:/app/inference/openvoice_v2
+      - C:/_dev/_models/openvoice/data:/app/inference/.data
+      - C:/_dev/_models/openvoice/checkpoints:/app/inference/checkpoints
+      - C:/_dev/_models/openvoice/references:/app/inference/references
+      - C:/_dev/_models/openvoice/conf/openvoice:/app/conf/openvoice
+    ports:
+      - "8100:80"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost/hc || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  mcp-memento:
+    build:
+      context: ./mcp_memento
+      <<: *build_cache
+    container_name: mcp-memento
+    profiles: ["cpu", "gpu"]
+    environment:
+      - PORT=8005
+      - MEMORY_DB_DRIVER=${MEMENTO_DB_DRIVER:-sqlite}
+      - MEMORY_DB_PATH=${MEMENTO_DB_PATH:-/data/memento.db}
+      - MEMORY_DB_DSN=${MEMENTO_DB_DSN:-}
+      - DATABASE_URL=${MEMENTO_DB_DSN:-}
+      - SQLITE_VEC_PATH=${MEMENTO_SQLITE_VEC_PATH:-}
+      - PGHOST=${MEMENTO_PGHOST:-}
+      - PGPORT=${MEMENTO_PGPORT:-}
+      - PGUSER=${MEMENTO_PGUSER:-}
+      - PGPASSWORD=${MEMENTO_PGPASSWORD:-}
+      - PGDATABASE=${MEMENTO_PGDATABASE:-}
+      - PGSSLMODE=${MEMENTO_PGSSLMODE:-}
+    volumes:
+      - ${MEMENTO_DATA_ROOT:-C:/_dev/_models/memento}:/data
+    ports:
+      - "8005:8005"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8005/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
 
   mcp_bslip:
-    build: ./mcp-bslip
+    build:
+      context: ./mcp-bslip
+      <<: *build_cache
     container_name: mcp-bslip
+    profiles: ["bslip"]
     environment:
       - PORT=8002
     ports:
@@ -37,7 +77,9 @@ services:
     restart: unless-stopped
 
   mcp_idp:
-    build: ./mcp_idp
+    build:
+      context: ./mcp_idp
+      <<: *build_cache
     container_name: mcp-idp
     profiles: ["cpu"]
     environment:
@@ -60,6 +102,7 @@ services:
   mcp_idp_gpu:
     build:
       context: ./mcp_idp
+      <<: *build_cache
       args:
         BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
         USE_GPU: "true"
@@ -88,9 +131,11 @@ services:
       retries: 5
     restart: unless-stopped
 
-  mcp_0:
-    build: ./mcp_0
-    container_name: mcp-0
+  mcp0:
+    build:
+      context: ./mcp0
+      <<: *build_cache
+    container_name: mcp0
     profiles: ["cpu", "gpu"]
     init: true
     environment:
@@ -102,7 +147,11 @@ services:
       - GITHUB_MCP_TOOLS=${GITHUB_MCP_TOOLS:-list_models+run_space}
       - GITHUB_MCP_TOKEN=${GITHUB_MCP_TOKEN:-}
       - GITHUB_PERSONAL_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
-      - MCP0_PROVIDERS=yolo:http://mcp-yolo:8000|health=/|capabilities=|tools=detect_objects+detect_http,bslip:http://mcp-bslip:8002|health=/health|capabilities=|tools=verify_slip,image:http://mcp-imagen:8001|health=/|capabilities=|tools=generate_image+generate_stream,image_gpu:http://mcp-imagen-gpu:8001|health=/|capabilities=|tools=generate_image+generate_stream,idp:http://mcp-idp:8004|health=/health|capabilities=|tools=identify_people+list_identity_references+refresh_identity_references,idp_gpu:http://mcp-idp-gpu:8004|health=/health|capabilities=|tools=identify_people+list_identity_references+refresh_identity_references,github:${GITHUB_MCP_URL:-http://mcp-github:8080}|health=${GITHUB_MCP_HEALTH_PATH:-/health}|health_method=GET|capabilities=/.well-known/mcp.json|tools=${GITHUB_MCP_TOOLS:-list_models+run_space}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
+      - GITHUB_WEBHOOK_TOOL=${GITHUB_WEBHOOK_TOOL:-run_space}
+      - GITHUB_WEBHOOK_EVENTS=${GITHUB_WEBHOOK_EVENTS:-}
+      - GITHUB_WEBHOOK_TOOL_MAP=${GITHUB_WEBHOOK_TOOL_MAP:-}
+      - MCP0_PROVIDERS=githubModel:${GITHUB_MCP_URL:-http://mcp-github:8080}|health=${GITHUB_MCP_HEALTH_PATH:-/health}|health_method=GET|capabilities=/.well-known/mcp.json|tools=${GITHUB_MCP_TOOLS:-list_models+run_space},memento:http://mcp-memento:8005|health=/health|capabilities=/.well-known/mcp.json|tools=create_entities+create_relations+add_observations+read_graph+search_nodes
     ports:
       - "8010:8010"
     healthcheck:
@@ -113,14 +162,20 @@ services:
     restart: unless-stopped
 
   mcp-github:
-    build: ./mcp_github_bridge
+    build:
+      context: ./mcp_github_bridge
+      <<: *build_cache
     container_name: mcp-github
     profiles: ["cpu", "gpu"]
     environment:
       - GITHUB_PERSONAL_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
-      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_ACCESS_TOKEN:-}
+      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
       - GITHUB_TOOLSETS=${GITHUB_TOOLSETS:-default}
       - LOG_LEVEL=${GITHUB_MCP_BRIDGE_LOG_LEVEL:-INFO}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
+      - GITHUB_WEBHOOK_TOOL=${GITHUB_WEBHOOK_TOOL:-run_space}
+      - GITHUB_WEBHOOK_EVENTS=${GITHUB_WEBHOOK_EVENTS:-}
+      - GITHUB_WEBHOOK_TOOL_MAP=${GITHUB_WEBHOOK_TOOL_MAP:-}
     ports:
       - "8200:8080"
     healthcheck:
@@ -128,9 +183,11 @@ services:
     restart: unless-stopped
 
   openvoice-tts-gpu:
-    build: C:/_dev/_models/openvoice/openvoice
+    build:
+      context: C:/_dev/_models/openvoice/openvoice
+      <<: *build_cache
     container_name: voice-chat-openvoice-gpu
-    profiles: ["gpu"]
+    profiles: ["openvoice-gpu"]
     environment:
       - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
       - NVIDIA_VISIBLE_DEVICES=all
@@ -185,27 +242,31 @@ services:
     runtime: nvidia
     restart: unless-stopped
 
-  stt:
-    build: ./stt
-    container_name: stt-whisper
-    profiles: ["cpu"]
-    environment:
-      - WHISPER_MODEL=tiny
-      - WHISPER_DEVICE=cpu
-      - WHISPER_DOWNLOAD_DIR=/app/models
-    volumes:
-      - C:/_dev/_models/huggingface/stt:/app/models
-    ports:
-      - "5001:5001"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    restart: unless-stopped
+  # stt:
+  #   build:
+  #     context: ./stt
+  #     <<: *build_cache
+  #   container_name: stt-whisper
+  #   profiles: ["cpu"]
+  #   environment:
+  #     - WHISPER_MODEL=tiny
+  #     - WHISPER_DEVICE=cpu
+  #     - WHISPER_DOWNLOAD_DIR=/app/models
+  #   volumes:
+  #     - C:/_dev/_models/huggingface/stt:/app/models
+  #   ports:
+  #     - "5001:5001"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #   restart: unless-stopped
 
   stt-gpu:
-    build: ./stt
+    build:
+      context: ./stt
+      <<: *build_cache
     container_name: stt-whisper-gpu
     profiles: ["gpu"]
     init: true
@@ -236,29 +297,46 @@ services:
     init: true
     environment:
       - NODE_ENV=production
-      - OLLAMA_URL=http://ollama:11434
-      - OLLAMA_GPU_URL=http://ollama-gpu:11434
+      - OLLAMA_URL=${OLLAMA_URL:-}
+      - OLLAMA_GPU_URL=${OLLAMA_GPU_URL:-}
       - MODEL=${OLLAMA_MODEL:-llama3.2:3b}
       - PORT=3001
-      - STT_URL=http://stt:5001
-      - STT_GPU_URL=http://stt-gpu:5001
-      - OPENVOICE_GPU_URL=http://openvoice-tts-gpu:80
-      - YOLO_MCP_URL=http://mcp-yolo:8000
-      - BSLIP_MCP_URL=http://mcp-bslip:8002
-      - IMAGE_MCP_URL=http://mcp-imagen:8001
-      - IMAGE_MCP_GPU_URL=http://mcp-imagen-gpu:8001
-      - IDP_MCP_URL=http://mcp-idp:8004
-      - IDP_MCP_GPU_URL=http://mcp-idp-gpu:8004
-      - MCP0_URL=http://mcp-0:8010
+      - STT_URL=${STT_URL:-}
+      - STT_GPU_URL=${STT_GPU_URL:-}
+      - OPENVOICE_URL=${OPENVOICE_URL:-}
+      - OPENVOICE_GPU_URL=${OPENVOICE_GPU_URL:-}
+      - YOLO_MCP_URL=${YOLO_MCP_URL:-}
+      - BSLIP_MCP_URL=${BSLIP_MCP_URL:-}
+      - IMAGE_MCP_URL=${IMAGE_MCP_URL:-}
+      - IMAGE_MCP_GPU_URL=${IMAGE_MCP_GPU_URL:-}
+      - IDP_MCP_URL=${IDP_MCP_URL:-}
+      - IDP_MCP_GPU_URL=${IDP_MCP_GPU_URL:-}
+      - MEMENTO_MCP_URL=${MEMENTO_MCP_URL:-http://mcp-memento:8005}
+      - MCP0_URL=http://mcp0:8010
       - GITHUB_MCP_URL=${GITHUB_MCP_URL:-http://mcp-github:8080}
       - GITHUB_MCP_HEALTH_PATH=${GITHUB_MCP_HEALTH_PATH:-/health}
       - GITHUB_MCP_TOKEN=${GITHUB_MCP_TOKEN:-}
       - GITHUB_PERSONAL_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
+      - GITHUB_MODEL_TOKEN=${GITHUB_MODEL_TOKEN:-}
+      - GITHUB_MODEL=${GITHUB_MODEL:-}
+      - GITHUB_MODEL_DEPLOYMENT=${GITHUB_MODEL_DEPLOYMENT:-}
+      - GITHUB_MODEL_CHAT_BASE_URL=${GITHUB_MODEL_CHAT_BASE_URL:-}
+      - GITHUB_MODEL_CHAT_URL=${GITHUB_MODEL_CHAT_URL:-}
+      - GITHUB_MODEL_TEMPERATURE=${GITHUB_MODEL_TEMPERATURE:-}
+      - GITHUB_MODEL_MAX_TOKENS=${GITHUB_MODEL_MAX_TOKENS:-}
+      - GITHUB_API_VERSION=${GITHUB_API_VERSION:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - ANTHROPIC_VERSION=${ANTHROPIC_VERSION:-}
+      - ANTHROPIC_MAX_TOKENS=${ANTHROPIC_MAX_TOKENS:-}
+      - ANTHROPIC_TEMPERATURE=${ANTHROPIC_TEMPERATURE:-}
+      - ENABLE_VOICE_FEATURE=false
     ports:
       - "3002:3001"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3001/health || exit 1"]
-      interval: 30s
+      interval: 60s
       timeout: 10s
       retries: 5
     restart: unless-stopped
@@ -277,10 +355,12 @@ services:
     restart: unless-stopped
 
   mcp_yolo:
-    build: ./mcp_yolo
+    build:
+      context: ./mcp_yolo
+      <<: *build_cache
     container_name: mcp-yolo
     environment:
-      - YOLO_MODEL=yolov8n.pt
+      - YOLO_MODEL=/app/models/yolov8n.pt
     volumes:
       - C:/_dev/_models/yolo:/app/models
     ports:
@@ -293,14 +373,16 @@ services:
     restart: unless-stopped
 
   mcp-imagen:
-    build: ./mcp-imagen
+    build:
+      context: ./mcp_imagen
+      <<: *build_cache
     container_name: mcp-imagen
     profiles: ["cpu"]
     environment:
       - IMAGE_MODEL_ID=${IMAGE_MODEL_ID:-runwayml/stable-diffusion-v1-5}
       - TORCH_DEVICE=${IMAGE_TORCH_DEVICE:-cpu}
-      - IMAGE_STEPS=${IMAGE_STEPS:-25}
-      - IMAGE_MAX_STEPS=${IMAGE_MAX_STEPS:-60}
+      - IMAGE_STEPS=${IMAGE_STEPS:-14}
+      - IMAGE_MAX_STEPS=${IMAGE_MAX_STEPS:-40}
       - IMAGE_WIDTH=${IMAGE_WIDTH:-512}
       - IMAGE_HEIGHT=${IMAGE_HEIGHT:-512}
       - IMAGE_MODEL_CACHE=/app/models
@@ -317,7 +399,8 @@ services:
 
   mcp-imagen-gpu:
     build:
-      context: ./mcp-imagen
+      context: ./mcp_imagen
+      <<: *build_cache
       args:
         BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
         USE_GPU: "true"

@@ -68,4 +68,4 @@ USER appuser
 VOLUME ["/app/models"]
 EXPOSE 8001
 
-CMD ["python", "main.py"]
+CMD ["/opt/venv/bin/python", "main.py"]

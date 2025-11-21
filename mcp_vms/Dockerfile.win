@@ -1,0 +1,24 @@
+# escape=`
+FROM mcr.microsoft.com/windows/python:3.12-windowsservercore-ltsc2022
+
+SHELL ["powershell", "-NoLogo", "-Command"]
+
+ENV PYTHONUNBUFFERED=1 `
+    PIP_NO_CACHE_DIR=1 `
+    PORT=8006
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy upstream sources plus config overrides and native vendor assets
+COPY upstream/ ./src/
+COPY mcp_vms_config.py ./src/mcp_vms_config.py
+COPY vendor/ ./src/
+
+WORKDIR /app/src
+
+EXPOSE 8006
+
+ENTRYPOINT ["python", "mcp_vms.py"]

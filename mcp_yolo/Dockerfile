@@ -50,6 +50,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Runtime libs for OpenCV/Ultralytics
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        curl \
         libgl1 \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists*
@@ -64,4 +65,4 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["python", "main.py"]
+CMD ["/opt/venv/bin/python", "main.py"]

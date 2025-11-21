@@ -13,6 +13,19 @@ coverage/
 # Temporary folders
 tmp/
 temp/
+tmp_*.json
+tmp_*.yaml
+tmp_*.yml
+tmp_*.txt
+tmp_*.log
+
+# Test artifacts
+playwright-report/
+client/playwright-report/
+client/test-results/
+test-results/
+**/test-results/
+*.trace
 
 # Runtime uploads & generated audio
 uploads/
@@ -24,6 +37,24 @@ __pycache__/
 *.pyo
 *.pyd
 *.egg-info/
+
+# Python tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pytype/
+.nox/
+.tox/
+.hypothesis/
+.benchmarks/
+htmlcov/
+.coverage
+.coverage.*
+pip-wheel-metadata/
+pip-wheel/
+__pypackages__/
+.ipynb_checkpoints/
+
 
 # Node/JavaScript dependencies and logs
 node_modules/
@@ -40,6 +71,7 @@ pnpm-lock.yaml
 
 # Docker / Compose state
 .docker/
+.docker-cache/
 docker-data/
 *.pid
 

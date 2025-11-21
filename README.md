@@ -109,6 +109,29 @@ BSLIP_MCP_URL=http://mcp-bslip:8002
 
 Until you wire the real API, the mock container lets you iterate on the UI/UX and test wiring without external dependencies.
 
+### Memento memory MCP (SQLite/pgvector knowledge graph)
+
+For persistent conversation memory we now ship [`./mcp_memento`](./mcp_memento), a FastAPI shim that shells out to the official [`@iachilles/memento`](https://github.com/iAchilles/memento) MCP server. This container exposes the full memory toolbelt (create entities, add observations, semantic search, etc.) over HTTP on port `8005` and registers itself with `mcp0`.
+
+Key environment knobs (all in `.env` / `.env.secure`):
+
+```
+MEMENTO_MCP_URL=http://mcp-memento:8005
+MEMENTO_DATA_ROOT=C:/_dev/_models/memento   # host folder mounted to /data for the SQLite DB
+MEMENTO_DB_DRIVER=sqlite                     # or postgres
+MEMENTO_DB_PATH=/data/memento.db             # path inside the container when using sqlite
+MEMENTO_DB_DSN=                              # optional postgres DSN (also mirrored to DATABASE_URL)
+MEMENTO_SQLITE_VEC_PATH=                     # set if sqlite-vec auto-detection fails
+MEMENTO_PGHOST=...
+MEMENTO_PGPORT=...
+MEMENTO_PGUSER=...
+MEMENTO_PGPASSWORD=...
+MEMENTO_PGDATABASE=...
+MEMENTO_PGSSLMODE=...
+```
+
+The bridge monitors `/health`, serves a `/.well-known/mcp.json` manifest, and can be hit directly at `http://localhost:8005/invoke` for manual testing. Once the container is up, the Node server will surface `memento` in `/health`, and `mcp0` automatically advertises it to any MCP clients (Claude Desktop, etc.).
+
 ### Frontend deployment workflow
 
 When shipping UI updates that must be visible through Docker/ngrok:
@@ -125,6 +148,47 @@ When shipping UI updates that must be visible through Docker/ngrok:
    ```
 
 Following this loop avoids the “old UI” problem when exposing the stack via ngrok or any long-lived container.
+
+## Automation helpers
+
+#### GitHub → MCP webhook automation
+
+The `mcp-github` bridge now exposes a `/webhook` endpoint so GitHub can fan out events to MCP tools (default: `run_space`). To wire it up:
+
+1. **Secrets** – add `GITHUB_PERSONAL_TOKEN` + `GITHUB_WEBHOOK_SECRET` to `.env.secure`. Optionally set `GITHUB_WEBHOOK_TOOL` (global default), `GITHUB_WEBHOOK_EVENTS` (comma list allow-list), and `GITHUB_WEBHOOK_TOOL_MAP` (JSON object mapping event names to tool names) in `.env`/`.env.secure`.
+2. **Compose** – the bridge already inherits those vars; start it with `cmd /c "cd /d c:\_dev\windsurf_ai\voice_chat && npx dotenv-cli -e .env -- docker compose up -d mcp-github"` (and remember to load `.env.secure`).
+3. **Ingress** – expose `mcp-github` port 8080 to GitHub (ngrok, reverse proxy, GitHub Apps, etc.) and point the webhook URL to `https://<your-host>/webhook`.
+4. **GitHub settings** – in the repo/org webhook config choose `application/json`, the same secret, and select the events you allowed in `GITHUB_WEBHOOK_EVENTS` (leave blank to accept all).
+5. **Testing** – use the GitHub "Recent Deliveries" feature or a helper script (see `scripts/` for MCP helpers) to replay payloads locally.
+
+When a delivery arrives the FastAPI app validates the signature, enqueues the payload, and invokes the configured MCP tool via `/invoke`. Logs in `mcp-github` will show `Processed webhook <delivery>` once successful.
+
+### GitHub Actions CI
+
+- `.github/workflows/ci.yml` now runs on every push and pull request.
+- Jobs executed:
+  1. **client-quality** – installs client deps, runs `npm run build`, and calls `npm run build:deploy` to ensure `server/public` stays in sync. The produced `client/dist` bundle is stored as an artifact for reviewers.
+  2. **server-smoke** – installs API server deps and runs `node --check index.js` as a fast syntax/require guard.
+  3. **compose-validate** – runs `docker compose -f docker-compose.yml config` so Compose changes fail fast if the YAML or env wiring is invalid.
+
+These jobs catch broken UI builds, missing sync steps, and compose typos before merges.
+
+### Local pre-push checks (Windows)
+
+Run `scripts/prepush-checks.cmd` from the repo root whenever you prepare to push:
+
+```
+cmd /c scripts\prepush-checks.cmd
+```
+
+What it does:
+
+1. Verifies both `.env` and `.env.secure` exist (per our deployment rule: always keep `.env.secure` alongside the repo).
+2. Runs `npm ci` (or `npm install` if no lockfile) inside `client/`, then `npm run build:deploy` so the latest UI assets populate `server/public`.
+3. Runs `npm ci` (or `npm install`) inside `server/`, followed by `node --check index.js` for a quick syntax sanity check.
+4. Executes `npx dotenv -e .env -e .env.secure -- docker compose -f docker-compose.yml config` to ensure Compose stays valid with both env files loaded.
+
+If any step fails, the script aborts with a non-zero exit code so you can fix issues before they hit CI.
 
 ### Switching LLM providers from the UI
 

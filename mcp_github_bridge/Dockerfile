@@ -2,6 +2,10 @@ FROM ghcr.io/github/github-mcp-server:latest AS github_mcp
 
 FROM python:3.11-slim
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1

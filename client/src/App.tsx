@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+  import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './style.css'
 import type { DetectionResult, DetectionTestPayload } from './types/yolo'
 
@@ -66,6 +66,7 @@ const resolveDefaultApiBase = () => {
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || resolveDefaultApiBase()
 const API_URL = `${API_BASE}/voice-chat`
+const API_STREAM_URL = `${API_BASE}/voice-chat-stream`
 const API_AUDIO_URL = `${API_BASE}/voice-chat-audio`
 const HEALTH_URL = `${API_BASE}/health`
 const DETECT_URL = `${API_BASE}/detect-image`
@@ -75,6 +76,11 @@ const GENERATE_IMAGE_STREAM_URL = `${API_BASE}/generate-image-stream`
 const OCR_URL = `${API_BASE}/ocr-image`
 const VOICES_URL = `${API_BASE}/voices`
 const PREVIEW_VOICE_URL = `${API_BASE}/preview-voice`
+
+const MCP0_PROVIDERS_API = `${API_BASE}/mcp0/providers`
+const MCP0_TOOLS_API = `${API_BASE}/mcp0/tools`
+const MCP_PROVIDERS_URL = `${API_BASE}/mcp/providers`
+const GITHUB_MODEL_HEALTH_URL = `${API_BASE}/github-model/health`
 
 const SpeechRecognitionImpl: typeof window.SpeechRecognition | undefined =
   (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
@@ -94,6 +100,25 @@ interface ChatAttachment {
   size?: number
 }
 
+interface McpToolRun {
+  provider?: string
+  tool?: string
+  args?: Record<string, unknown>
+  result?: unknown
+  error?: string | null
+  raw?: string
+}
+
+interface McpProviderInfo {
+  name: string
+  base_url?: string
+  health_path?: string
+  capabilities_path?: string | null
+  default_tools?: string[]
+  health?: Record<string, unknown> | null
+  capabilities?: Record<string, unknown> | null
+}
+
 interface ChatMessage {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -108,6 +133,8 @@ interface ChatMessage {
   accelerator?: 'cpu' | 'gpu'
   attachments?: ChatAttachment[]
   voiceId?: string | null
+  diagnostics?: DiagnosticsInfo | null
+  mcpToolRuns?: McpToolRun[]
 }
 
 type InlineSpeakerStatus = 'idle' | 'playing' | 'paused'
@@ -117,15 +144,165 @@ interface InlineSpeakerState {
   status: InlineSpeakerStatus
 }
 
+type InlinePlaybackMode = 'speech' | 'audio'
+
 interface SpeakLifecycle {
   onStart?: () => void
   onEnd?: () => void
   onError?: () => void
 }
 
-type InlinePlaybackMode = 'audio' | 'speech'
+interface DiagnosticsInfo {
+  provider?: string | null
+  model?: string | null
+  accelerator?: 'cpu' | 'gpu' | null
+  server?: string | null
+  mcp0?: string | null
+  timestamp?: string | null
+}
 
-type LlmProvider = 'ollama' | 'anthropic' | 'openai'
+interface StreamDeltaEvent {
+  type: 'delta'
+  delta: string
+  full: string
+}
+
+interface StreamCompleteEvent {
+  type: 'complete'
+  reply: string
+  audioUrl?: string | null
+  session?: SessionResponse
+  provider?: string | null
+  voiceId?: string | null
+  diagnostics?: DiagnosticsInfo | null
+  mcpTools?: McpToolRun[]
+}
+
+interface StreamErrorEvent {
+  type: 'error'
+  error: string
+}
+
+type StreamEventPayload = StreamDeltaEvent | StreamCompleteEvent | StreamErrorEvent
+
+const PROVIDER_LABELS: Record<string, string> = {
+  anthropic: 'Anthropic',
+  openai: 'OpenAI',
+  github: 'GitHub Models',
+  ollama: 'Ollama'
+}
+
+const STREAMING_PROVIDERS = new Set<string>(['ollama'])
+
+const providerSupportsStreaming = (provider?: string | null) => {
+  if (!provider) return false
+  return STREAMING_PROVIDERS.has(provider.toLowerCase())
+}
+
+const parseSsePayload = (chunk: string): StreamEventPayload | null => {
+  if (!chunk) return null
+  const dataLines = chunk
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trim())
+
+  if (!dataLines.length) {
+    return null
+  }
+
+  const jsonText = dataLines.join('\n')
+  if (!jsonText) return null
+
+  try {
+    return JSON.parse(jsonText) as StreamEventPayload
+  } catch (err) {
+    console.warn('Failed to parse SSE payload', err)
+    return null
+  }
+}
+
+const readSseStream = async (
+  stream: ReadableStream<Uint8Array>,
+  onPayload: (payload: StreamEventPayload) => void
+) => {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+
+  const processBuffer = (isFinal = false) => {
+    let delimiterIndex = buffer.indexOf('\n\n')
+    while (delimiterIndex >= 0) {
+      const chunk = buffer.slice(0, delimiterIndex)
+      buffer = buffer.slice(delimiterIndex + 2)
+      const payload = parseSsePayload(chunk)
+      if (payload) {
+        onPayload(payload)
+      }
+      delimiterIndex = buffer.indexOf('\n\n')
+    }
+
+    if (isFinal && buffer.trim()) {
+      const payload = parseSsePayload(buffer)
+      buffer = ''
+      if (payload) {
+        onPayload(payload)
+      }
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) {
+      buffer += decoder.decode()
+      processBuffer(true)
+      break
+    }
+    buffer += decoder.decode(value, { stream: true })
+    processBuffer()
+  }
+}
+
+const formatProviderLabel = (raw?: string | null) => {
+  if (!raw) return null
+  const normalized = raw.toLowerCase()
+  return PROVIDER_LABELS[normalized] || raw.replace(/^[a-z]/, (match) => match.toUpperCase())
+}
+
+const formatServerLabel = (raw?: string | null) => {
+  if (!raw) return null
+  try {
+    const parsed = new URL(raw)
+    return parsed.host || raw
+  } catch {
+    return raw.replace(/^https?:\/\//i, '')
+  }
+}
+
+type LlmProvider = 'ollama' | 'anthropic' | 'openai' | 'github'
+
+interface McpToolRun {
+  provider?: string
+  tool?: string
+  args?: Record<string, unknown>
+  result?: unknown
+  error?: string | null
+  raw?: string
+}
+
+interface McpProviderInfo {
+  name: string
+  base_url?: string
+  health_path?: string
+  capabilities_path?: string | null
+  default_tools?: string[]
+  health?: Record<string, unknown> | null
+  capabilities?: Record<string, unknown> | null
+}
+
+type QuickMenuAction = 'popup' | 'status' | 'reset'
+
+type StatusTone = 'ok' | 'error' | 'unknown' | 'loading'
 
 interface PlayAudioOptions {
   onStart?: () => void
@@ -133,6 +310,23 @@ interface PlayAudioOptions {
 }
 
 const AUTO_SPEECH_REPLIES_ENABLED = false
+const SPEECH_LANGUAGE_HELPER = 'Used for mic input & Whisper hints.'
+const LLM_PROVIDER_HELPER = 'Switch between available LLM backends.'
+const WHISPER_HELPER = 'Controls transcription model and latency.'
+
+interface ChipInfoIconProps {
+  label: string
+  message?: string | null
+}
+
+const ChipInfoIcon = ({ label, message }: ChipInfoIconProps) => {
+  if (!message) return null
+  return (
+    <button type="button" className="chip-help" aria-label={`${label} info`} data-tooltip={message}>
+      <span aria-hidden>?</span>
+    </button>
+  )
+}
 
 const detectionTargetOptions = [
   { label: 'People', value: 'person' },
@@ -260,9 +454,16 @@ const serviceMeta: Record<string, { label: string; group: StatusGroupKey; type: 
   openvoice: { label: 'OpenVoice (CPU)', group: 'voice', type: 'CPU' },
   openvoiceGpu: { label: 'OpenVoice (GPU)', group: 'voice', type: 'GPU' },
   yolo: { label: 'YOLO MCP', group: 'vision', type: 'Service' },
-  image: { label: 'Image MCP (CPU)', group: 'vision', type: 'CPU' },
-  imageGpu: { label: 'Image MCP (GPU)', group: 'vision', type: 'GPU' },
-  githubMcp: { label: 'GitHub MCP', group: 'other', type: 'Service' }
+  bslip: { label: 'BSLIP MCP', group: 'vision', type: 'Service' },
+  mcpImagen: { label: 'Image MCP (CPU)', group: 'vision', type: 'CPU' },
+  mcpImagenGpu: { label: 'Image MCP (GPU)', group: 'vision', type: 'GPU' },
+  idp: { label: 'IDP MCP (CPU)', group: 'vision', type: 'CPU' },
+  idpGpu: { label: 'IDP MCP (GPU)', group: 'vision', type: 'GPU' },
+  anthropic: { label: 'Anthropic API', group: 'language', type: 'Service' },
+  openai: { label: 'OpenAI API', group: 'language', type: 'Service' },
+  githubModel: { label: 'GitHub Models', group: 'language', type: 'Service' },
+  githubMcp: { label: 'GitHub MCP', group: 'other', type: 'Service' },
+  mcp0: { label: 'MCP Hub', group: 'other', type: 'Service' }
 }
 
 const formatStatusDetail = (detail: unknown): string => {
@@ -404,6 +605,11 @@ const formatImageDuration = (value?: number | null) => {
   }
   const seconds = value / 1000
   return `${seconds.toFixed(seconds >= 10 ? 0 : 1)} s`
+}
+
+const truncateText = (value: string, limit = 48) => {
+  if (!value) return ''
+  return value.length > limit ? `${value.slice(0, Math.max(0, limit - 1))}…` : value
 }
 
 const bboxAreaPercent = (
@@ -659,10 +865,11 @@ interface UploadedAttachment {
 
 const builtInLlmModels = ['llama3.2-vision:11b', 'llama3.2:1b', 'llama3.2:3b', 'llama3.1:8b', 'phi3:mini'] as const
 
-const LLM_PROVIDER_OPTIONS: Array<{ value: LlmProvider; label: string }> = [
+const BASE_LLM_PROVIDER_OPTIONS: Array<{ value: LlmProvider; label: string }> = [
   { value: 'ollama', label: 'Ollama (local)' },
   { value: 'anthropic', label: 'Anthropic Claude' },
-  { value: 'openai', label: 'OpenAI GPT' }
+  { value: 'openai', label: 'OpenAI GPT' },
+  { value: 'github', label: 'GitHub Models' }
 ]
 
 const SESSION_STORAGE_KEY = 'voice-chat-session-id'
@@ -717,10 +924,10 @@ const STORAGE_KEYS = {
   micMode: 'chaba.micMode',
   activePanel: 'chaba.activePanel',
   detectConfidence: 'chaba.detectConfidence',
+  detectConfidenceAlt: 'chaba.detect.confidenceAlt',
   detectionTargets: 'chaba.detect.targets',
-  detectConfidenceAlt: 'chaba.detect.confidence.alt',
   showDetectionBoxes: 'chaba.detect.boxes',
-  showDetectionBoxesAlt: 'chaba.detect.boxes.alt',
+  showDetectionBoxesAlt: 'chaba.detect.boxesAlt',
   bankDetectConfidence: 'chaba.bank.confidence',
   bankShowDetectionBoxes: 'chaba.bank.boxes',
   imagePrompt: 'chaba.image.prompt',
@@ -739,6 +946,57 @@ const IMAGE_DIMENSION_OPTIONS = [384, 512, 640, 768, 896, 1024] as const
 const IMAGE_HISTORY_LIMIT = 6
 const IMAGE_MIN_GUIDANCE = 1
 const IMAGE_MAX_GUIDANCE = 14
+
+interface ImagePromptPreset {
+  label: string
+  prompt: string
+  negative?: string
+  width?: number
+  height?: number
+  guidance?: number
+  steps?: number
+  accelerator?: 'cpu' | 'gpu'
+}
+
+const IMAGE_PROMPT_PRESETS: ImagePromptPreset[] = [
+  {
+    label: 'Neon alley cityscape',
+    prompt:
+      'Neon-soaked alley in Bangkok, cinematic rain reflections, Leica Summilux bokeh, Fujifilm colors, cyberpunk street photography',
+    negative: 'blurry, low detail, extra limbs',
+    width: 768,
+    height: 512,
+    accelerator: 'gpu'
+  },
+  {
+    label: 'Studio portrait',
+    prompt:
+      'Soft studio portrait of a confident founder, diffused rim lighting, 85mm lens, medium format, shallow depth of field',
+    negative: 'harsh shadows, artifacts, text',
+    width: 640,
+    height: 768,
+    guidance: 8.5,
+    accelerator: 'cpu'
+  },
+  {
+    label: 'Product hero',
+    prompt:
+      'Minimal product hero shot of wireless earbuds on concrete pedestal, volumetric light beams, high contrast, 3D render realism',
+    negative: 'logos, people, hands',
+    width: 896,
+    height: 512,
+    steps: 30
+  },
+  {
+    label: 'Concept art',
+    prompt:
+      'Wide matte painting of floating temples above Chiang Mai mountains, sunrise mist, painterly brush strokes, concept art',
+    negative: 'low resolution, noisy',
+    width: 1024,
+    height: 512,
+    steps: 28
+  }
+]
 const IMAGE_MIN_STEPS = 5
 const IMAGE_MAX_STEPS = 60
 const IMAGE_ACCELERATOR_OPTIONS: Array<{ value: 'cpu' | 'gpu'; label: string }> = [
@@ -937,12 +1195,22 @@ export function App() {
   const [healthInfo, setHealthInfo] = useState<any>(null)
   const [statusExpanded, setStatusExpanded] = useState(false)
   const [appMenuOpen, setAppMenuOpen] = useState(false)
+  const [mcpPanelOpen, setMcpPanelOpen] = useState(false)
+  const [mcpPanelMessageId, setMcpPanelMessageId] = useState<string | null>(null)
+  const [mcpManualProvider, setMcpManualProvider] = useState('')
+  const [mcpManualTool, setMcpManualTool] = useState('')
+  const [mcpManualArgs, setMcpManualArgs] = useState('{}')
+  const [mcpManualResult, setMcpManualResult] = useState<unknown>(null)
+  const [mcpManualError, setMcpManualError] = useState<string | null>(null)
+  const [mcpManualLoading, setMcpManualLoading] = useState(false)
   const [popupVisible, setPopupVisible] = useState(false)
   const [llmProvider, setLlmProvider] = useState<LlmProvider>(() => readFromStorage(STORAGE_KEYS.llmProvider, 'ollama'))
   const [llmModel, setLlmModel] = useState<string>(() => readFromStorage(STORAGE_KEYS.llmModel, defaultModels.llm))
   const [whisperModel, setWhisperModel] = useState(() =>
     readFromStorage(STORAGE_KEYS.whisperModel, defaultModels.whisper)
   )
+  const [mcpProviderNames, setMcpProviderNames] = useState<string[]>([])
+  const [mcpProviders, setMcpProviders] = useState<McpProviderInfo[]>([])
   const [acceleratorMode, setAcceleratorMode] = useState<'cpu' | 'gpu'>(() => {
     if (typeof window === 'undefined') return 'gpu'
     try {
@@ -961,35 +1229,36 @@ export function App() {
   const [detectConfidence, setDetectConfidence] = useState(() =>
     readFromStorage(STORAGE_KEYS.detectConfidence, 0.25)
   )
+  const [detectConfidenceAlt, setDetectConfidenceAlt] = useState(() =>
+    readFromStorage(STORAGE_KEYS.detectConfidenceAlt, 0.25)
+  )
   const [detecting, setDetecting] = useState(false)
+  const [detectingAlt, setDetectingAlt] = useState(false)
   const [lastDetectionFile, setLastDetectionFile] = useState<File | null>(null)
+  const [lastDetectionFileAlt, setLastDetectionFileAlt] = useState<File | null>(null)
   const [detectionImage, setDetectionImage] = useState<string | null>(null)
+  const [detectionImageAlt, setDetectionImageAlt] = useState<string | null>(null)
   const [detectionPreviewUrl, setDetectionPreviewUrl] = useState<string | null>(null)
+  const [detectionPreviewUrlAlt, setDetectionPreviewUrlAlt] = useState<string | null>(null)
   const [detectionExpanded, setDetectionExpanded] = useState(false)
+  const [detectionExpandedAlt, setDetectionExpandedAlt] = useState(false)
   const [showDetectionBoxes, setShowDetectionBoxes] = useState(() =>
     readFromStorage(STORAGE_KEYS.showDetectionBoxes, true)
   )
-  const [detectionResults, setDetectionResults] = useState<DetectionResult[]>([])
-  const [detectionImageSize, setDetectionImageSize] = useState<{ width: number; height: number } | null>(null)
-  const [detectionError, setDetectionError] = useState<string | null>(null)
-  const [secondaryDetectionTargets, setSecondaryDetectionTargets] = useState<string[]>(() =>
-    readFromStorage(STORAGE_KEYS.detectionTargets, ['face'])
-  )
-  const [detectConfidenceAlt, setDetectConfidenceAlt] = useState(() =>
-    readFromStorage(STORAGE_KEYS.detectConfidenceAlt, 0.3)
-  )
-  const [detectingAlt, setDetectingAlt] = useState(false)
-  const [lastDetectionFileAlt, setLastDetectionFileAlt] = useState<File | null>(null)
-  const [detectionImageAlt, setDetectionImageAlt] = useState<string | null>(null)
-  const [detectionPreviewUrlAlt, setDetectionPreviewUrlAlt] = useState<string | null>(null)
-  const [detectionExpandedAlt, setDetectionExpandedAlt] = useState(false)
   const [showDetectionBoxesAlt, setShowDetectionBoxesAlt] = useState(() =>
     readFromStorage(STORAGE_KEYS.showDetectionBoxesAlt, true)
   )
+  const [detectionResults, setDetectionResults] = useState<DetectionResult[]>([])
   const [detectionResultsAlt, setDetectionResultsAlt] = useState<DetectionResult[]>([])
-  const [hoveredDetectionAlt, setHoveredDetectionAlt] = useState<number | null>(null)
+  const [detectionImageSize, setDetectionImageSize] = useState<{ width: number; height: number } | null>(null)
   const [detectionImageSizeAlt, setDetectionImageSizeAlt] = useState<{ width: number; height: number } | null>(null)
+  const [detectionError, setDetectionError] = useState<string | null>(null)
   const [detectionErrorAlt, setDetectionErrorAlt] = useState<string | null>(null)
+  const [secondaryDetectionTargets, setSecondaryDetectionTargets] = useState<string[]>(() =>
+    readFromStorage(STORAGE_KEYS.detectionTargets, ['face'])
+  )
+  const [hoveredDetection, setHoveredDetection] = useState<number | null>(null)
+  const [hoveredDetectionAlt, setHoveredDetectionAlt] = useState<number | null>(null)
   const [bankDetectConfidence, setBankDetectConfidence] = useState(() =>
     readFromStorage(STORAGE_KEYS.bankDetectConfidence, 0.35)
   )
@@ -1065,6 +1334,13 @@ export function App() {
   const [voicesLoading, setVoicesLoading] = useState(false)
   const [voicePreviewLoading, setVoicePreviewLoading] = useState(false)
   const [voicePreviewError, setVoicePreviewError] = useState<string | null>(null)
+  const [providersInitialized, setProvidersInitialized] = useState(false)
+  const [githubModelStatus, setGithubModelStatus] = useState<{ status: string; detail?: string | null } | null>(null)
+  const [githubModelChecking, setGithubModelChecking] = useState(false)
+  const [githubModelError, setGithubModelError] = useState<string | null>(null)
+  const speechLanguageHelper = SPEECH_LANGUAGE_HELPER
+  const llmProviderHelper = LLM_PROVIDER_HELPER
+  const whisperHelper = WHISPER_HELPER
 
   const VOICE_SERVICE_HINT =
     'Voice service unavailable. Ensure the OpenVoice containers are running (openvoice-tts / openvoice-tts-gpu) and reload.'
@@ -1189,12 +1465,12 @@ export function App() {
   }, [bankDetectionPreviewUrl])
 
   useEffect(() => {
-    setHoveredDetectionAlt(null)
-  }, [detectionResultsAlt])
+    setHoveredDetection(null)
+  }, [detectionResults, secondaryDetectionTargets])
 
   useEffect(() => {
     setHoveredDetectionAlt(null)
-  }, [secondaryDetectionTargets])
+  }, [detectionResultsAlt, secondaryDetectionTargets])
 
   useEffect(() => {
     if (!appMenuOpen) return
@@ -1524,23 +1800,52 @@ export function App() {
     }
   }, [selectedVoice, acceleratorMode])
 
-  const addMessage = (msg: Omit<ChatMessage, 'id' | 'time'> & { voiceId?: string | null }) => {
+  const addMessage = (
+    msg: Omit<ChatMessage, 'id' | 'time'> & { voiceId?: string | null; id?: string; time?: string }
+  ) => {
     const resolvedVoiceId =
       msg.role === 'assistant'
         ? msg.voiceId || selectedVoice || selectedVoiceInfo?.id || null
         : msg.voiceId || null
+    const generatedId = msg.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const generatedTime = msg.time || new Date().toLocaleTimeString()
     setMessages((prev) => [
       ...prev,
       {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        time: new Date().toLocaleTimeString(),
+        id: generatedId,
+        time: generatedTime,
         ...msg,
         voiceId: resolvedVoiceId || undefined
       }
     ])
+    return generatedId
   }
 
-  const fetchHealth = async () => {
+  const updateMessage = useCallback(
+    (
+      messageId: string,
+      updater: Partial<ChatMessage> | ((current: ChatMessage) => Partial<ChatMessage>)
+    ) => {
+      setMessages((prev) =>
+        prev.map((msg) => {
+          if (msg.id !== messageId) return msg
+          const next = typeof updater === 'function' ? updater(msg) : updater
+          return { ...msg, ...next }
+        })
+      )
+    },
+    []
+  )
+
+  const llmProviderOptions = useMemo(() => {
+    const baseOptions = [...BASE_LLM_PROVIDER_OPTIONS]
+    if (!mcpProviderNames.includes('githubModel')) {
+      return baseOptions.filter((option) => option.value !== 'github')
+    }
+    return baseOptions
+  }, [mcpProviderNames])
+
+  const fetchHealth = useCallback(async () => {
     try {
       const res = await fetch(HEALTH_URL)
       if (!res.ok) throw new Error('health not ok')
@@ -1554,7 +1859,140 @@ export function App() {
       console.error('health error', e)
       setHealth('error')
     }
-  }
+  }, [])
+
+  const fetchMcpProviders = useCallback(async () => {
+    const fetchJson = async (url: string) => {
+      const target = url.includes('?') ? url : `${url}?refresh=true`
+      const res = await fetch(target)
+      if (!res.ok) {
+        const detail = await res.text()
+        throw new Error(detail || `Fetch failed ${res.status}`)
+      }
+      return res.json()
+    }
+
+    const processData = (data: unknown) => {
+      if (Array.isArray(data)) {
+        setMcpProviders(data as McpProviderInfo[])
+        const names = data
+          .map((entry) => (entry && typeof (entry as McpProviderInfo).name === 'string' ? (entry as McpProviderInfo).name.trim() : ''))
+          .filter((name): name is string => !!name)
+        setMcpProviderNames(names)
+      }
+    }
+
+    try {
+      const primary = await fetchJson(MCP0_PROVIDERS_API)
+      processData(primary)
+    } catch (primaryErr) {
+      console.warn('Primary MCP provider fetch failed', primaryErr)
+      try {
+        const fallback = await fetchJson(MCP_PROVIDERS_URL)
+        processData(fallback)
+      } catch (err) {
+        console.error('Failed to load MCP providers', err)
+        setMcpProviders([])
+        setMcpProviderNames([])
+      }
+    } finally {
+      setProvidersInitialized(true)
+    }
+  }, [])
+
+  const availableManualTools = useMemo(() => {
+    const provider = mcpProviders.find((p) => p.name === mcpManualProvider)
+    return provider?.default_tools || []
+  }, [mcpManualProvider, mcpProviders])
+
+  const activeMcpMessage = useMemo(() => {
+    if (!mcpPanelMessageId) return null
+    return messages.find((m) => m.id === mcpPanelMessageId) || null
+  }, [mcpPanelMessageId, messages])
+
+  const handleOpenMcpPanel = useCallback(
+    (message: ChatMessage) => {
+      if (!mcpProviderNames.length) return
+      setMcpPanelMessageId(message.id)
+      setMcpPanelOpen(true)
+      setMcpManualResult(null)
+      setMcpManualError(null)
+      setMcpManualArgs('{}')
+
+      let nextProvider = mcpManualProvider
+      if (!nextProvider && mcpProviderNames.length) {
+        nextProvider = mcpProviderNames[0]
+        setMcpManualProvider(nextProvider)
+      }
+      const providerEntry = mcpProviders.find((p) => p.name === nextProvider)
+      const providerTools = providerEntry?.default_tools || []
+      if (!mcpManualTool && providerTools.length) {
+        setMcpManualTool(providerTools[0])
+      }
+    },
+    [mcpManualProvider, mcpManualTool, mcpProviderNames, mcpProviders]
+  )
+
+  const closeMcpPanel = useCallback(() => {
+    setMcpPanelOpen(false)
+    setMcpPanelMessageId(null)
+    setMcpManualResult(null)
+    setMcpManualError(null)
+    setMcpManualLoading(false)
+  }, [])
+
+  useEffect(() => {
+    if (!mcpPanelOpen) return
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeMcpPanel()
+      }
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [mcpPanelOpen, closeMcpPanel])
+
+  const handleRunManualTool = useCallback(async () => {
+    if (!mcpManualProvider || !mcpManualTool) {
+      setMcpManualError('Select provider and tool')
+      return
+    }
+    let parsedArgs: Record<string, unknown> = {}
+    if (mcpManualArgs.trim()) {
+      try {
+        parsedArgs = JSON.parse(mcpManualArgs)
+      } catch (err: any) {
+        setMcpManualError(`Invalid JSON: ${err?.message || 'Parse error'}`)
+        return
+      }
+    }
+    setMcpManualError(null)
+    setMcpManualLoading(true)
+    try {
+      const res = await fetch(MCP0_TOOLS_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: mcpManualProvider, tool: mcpManualTool, arguments: parsedArgs })
+      })
+      if (!res.ok) {
+        const detail = await res.text()
+        throw new Error(detail || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      setMcpManualResult(data?.result ?? data)
+    } catch (err: any) {
+      setMcpManualError(err?.message || 'Tool invocation failed')
+      setMcpManualResult(null)
+    } finally {
+      setMcpManualLoading(false)
+    }
+  }, [mcpManualArgs, mcpManualProvider, mcpManualTool])
+
+  const handleRefreshProviders = useCallback(() => {
+    setHealth('unknown')
+    fetchHealth()
+    fetchMcpProviders()
+  }, [fetchHealth, fetchMcpProviders])
 
   const healthServices = useMemo<HealthServiceEntry[]>(() => {
     if (!Array.isArray(healthInfo?.services)) {
@@ -1566,44 +2004,7 @@ export function App() {
     )
   }, [healthInfo])
 
-  const providerStatuses = useMemo<Record<LlmProvider, { available: boolean; label: string }>>(() => {
-    const formatStatusLabel = (status?: string) => {
-      if (!status || status === 'unknown') return 'Unknown'
-      if (status === 'ok') return 'Available'
-      return status
-        .split('_')
-        .map((chunk) => chunk.charAt(0).toUpperCase() + chunk.slice(1))
-        .join(' ')
-    }
-
-    if (!healthServices.length) {
-      return {
-        ollama: { available: true, label: 'Available' },
-        anthropic: { available: true, label: 'Unknown' },
-        openai: { available: true, label: 'Unknown' }
-      }
-    }
-
-    const byName = new Map<string, HealthServiceEntry>(healthServices.map((svc) => [svc.name, svc]))
-    const statusFor = (name: string) => byName.get(name)?.status || 'unknown'
-    const isOk = (status?: string) => status === 'ok'
-
-    const ollamaCpuStatus = statusFor('ollama')
-    const ollamaGpuStatus = statusFor('ollamaGpu')
-    const ollamaAvailable = [ollamaCpuStatus, ollamaGpuStatus].some(isOk)
-    const ollamaLabel = ollamaAvailable
-      ? 'Available'
-      : formatStatusLabel(ollamaCpuStatus !== 'unknown' ? ollamaCpuStatus : ollamaGpuStatus)
-
-    const anthropicStatus = statusFor('anthropic')
-    const openaiStatus = statusFor('openai')
-
-    return {
-      ollama: { available: ollamaAvailable || !healthServices.length, label: ollamaLabel || 'Unknown' },
-      anthropic: { available: isOk(anthropicStatus), label: formatStatusLabel(anthropicStatus) },
-      openai: { available: isOk(openaiStatus), label: formatStatusLabel(openaiStatus) }
-    }
-  }, [healthServices])
+  const voiceFeatureEnabled = Boolean(healthInfo?.voiceFeatureEnabled)
 
   const openvoiceCpuHealthy = useMemo(
     () => healthServices.some((svc) => svc.name === 'openvoice' && svc.status === 'ok'),
@@ -1614,29 +2015,56 @@ export function App() {
     [healthServices]
   )
   const visibleVoiceOptions = useMemo(() => {
-    if (!voiceOptions.length) return voiceOptions
-    if (!openvoiceCpuHealthy && !openvoiceGpuHealthy && healthServices.length) {
+    if (!voiceFeatureEnabled) {
       return []
     }
+    if (!openvoiceCpuHealthy && !openvoiceGpuHealthy) {
+      return []
+    }
+    if (!voiceOptions.length) return voiceOptions
     if (openvoiceGpuHealthy) {
       return voiceOptions
     }
     return voiceOptions.filter((voice) => (voice.tier || 'standard').toLowerCase() !== 'premium')
-  }, [voiceOptions, openvoiceCpuHealthy, openvoiceGpuHealthy, healthServices.length])
+  }, [voiceOptions, openvoiceCpuHealthy, openvoiceGpuHealthy, voiceFeatureEnabled])
 
-  useEffect(() => {
-    const current = providerStatuses[llmProvider]
-    if (current && !current.available) {
-      const fallback = LLM_PROVIDER_OPTIONS.find((option) => providerStatuses[option.value]?.available)
-      if (fallback && fallback.value !== llmProvider) {
-        setLlmProvider(fallback.value)
-      }
-    }
-  }, [llmProvider, providerStatuses])
+  const voiceStatusTone: StatusTone = voicesLoading
+    ? 'loading'
+    : !voiceFeatureEnabled
+      ? 'unknown'
+      : visibleVoiceOptions.length
+        ? 'ok'
+        : voiceFetchError
+          ? 'error'
+          : 'unknown'
+
+  const voiceStatusLabel =
+    voicesLoading
+      ? 'Loading voices…'
+      : !voiceFeatureEnabled
+        ? 'Voice disabled'
+        : visibleVoiceOptions.length
+          ? `${visibleVoiceOptions.length} voice${visibleVoiceOptions.length > 1 ? 's' : ''} ready`
+          : 'No voices available'
+
+  const voiceStatusHelper =
+    !voiceFeatureEnabled
+      ? 'Start the OpenVoice containers to unlock voice playback.'
+      : !visibleVoiceOptions.length && !voicesLoading
+        ? 'Refresh provider status once OpenVoice services are online.'
+        : null
 
   useEffect(() => {
     fetchHealth()
-  }, [])
+    fetchMcpProviders()
+  }, [fetchHealth, fetchMcpProviders])
+
+  useEffect(() => {
+    if (!providersInitialized) return
+    if (!llmProviderOptions.some((option) => option.value === llmProvider)) {
+      return
+    }
+  }, [llmProviderOptions, llmProvider, providersInitialized])
 
   useEffect(() => {
     writeToStorage(STORAGE_KEYS.llmProvider, llmProvider)
@@ -1720,7 +2148,7 @@ export function App() {
     writeToStorage(STORAGE_KEYS.detectConfidenceAlt, detectConfidenceAlt)
   }, [detectConfidenceAlt])
 
-  useEffect(() => {
+    useEffect(() => {
     writeToStorage(STORAGE_KEYS.bankDetectConfidence, bankDetectConfidence)
   }, [bankDetectConfidence])
 
@@ -1777,7 +2205,16 @@ export function App() {
   }, [imageSeed])
 
   useEffect(() => {
+    if (!voiceFeatureEnabled) {
+      setVoiceOptions([])
+      setDefaultVoiceId(null)
+      setVoiceFetchError(null)
+      setVoicesLoading(false)
+      return
+    }
+
     let cancelled = false
+
     const loadVoices = async () => {
       setVoicesLoading(true)
       try {
@@ -1831,6 +2268,25 @@ export function App() {
 
     return () => {
       cancelled = true
+    }
+  }, [voiceFeatureEnabled])
+
+  const checkGithubModel = useCallback(async () => {
+    setGithubModelChecking(true)
+    setGithubModelError(null)
+    try {
+      const res = await fetch(GITHUB_MODEL_HEALTH_URL)
+      if (!res.ok) {
+        const detail = await res.text()
+        throw new Error(detail || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      setGithubModelStatus({ status: data?.status || 'unknown', detail: data?.detail })
+    } catch (err: any) {
+      setGithubModelError(err?.message || 'Failed to check GitHub model')
+      setGithubModelStatus(null)
+    } finally {
+      setGithubModelChecking(false)
     }
   }, [])
 
@@ -1927,8 +2383,9 @@ export function App() {
           lines.push(`  Info: ${parts.join(', ')}`)
         }
       }
+      // Avoid sending base64 payloads back to the server—it's already stored locally.
       if (att.base64) {
-        lines.push(`  DataURI: ${att.base64}`)
+        lines.push('  DataURI: [stripped]')
       }
       if (att.prompt?.trim()) {
         lines.push(`  Prompt: ${att.prompt.trim()}`)
@@ -1989,56 +2446,191 @@ export function App() {
     setReplying(true)
 
     try {
-      const makeRequest = async (acc: 'cpu' | 'gpu') => {
-        const res = await fetch(API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: contentForServer,
-            model: llmModel,
-            accelerator: acc,
-            sessionId,
-            history: historyPayload,
-            provider: llmProvider,
-            voice:
-              selectedVoice && visibleVoiceOptions.some((voice) => voice.id === selectedVoice)
-                ? selectedVoice
-                : undefined
-          })
-        })
-        if (!res.ok) {
-          const detail = await res.text()
-          throw new Error(detail || 'request_failed')
-        }
-        return res.json()
+      const voiceForServer =
+        selectedVoice && visibleVoiceOptions.some((voice) => voice.id === selectedVoice)
+          ? selectedVoice
+          : undefined
+      const requestBodyBase = {
+        message: contentForServer,
+        model: llmModel,
+        sessionId,
+        history: historyPayload,
+        provider: llmProvider,
+        voice: voiceForServer
       }
 
-      const {
-        result: data,
-        acceleratorUsed,
-        fellBack
-      } = await runWithAcceleratorFallback(makeRequest, targetAccelerator)
-      if (fellBack) {
+      if (providerSupportsStreaming(llmProvider)) {
+        const assistantMessageId = `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
         addMessage({
-          role: 'system',
-          text: 'GPU services unavailable, rerouted to CPU.',
-          model: llmModel
+          id: assistantMessageId,
+          role: 'assistant',
+          text: '',
+          model: llmModel,
+          accelerator: targetAccelerator,
+          mcpToolRuns: undefined,
+          diagnostics: null
         })
-      }
-      if (data.error) {
-        addMessage({ role: 'system', text: `Error: ${data.error}`, model: llmModel })
-        return
-      }
-      const returnedSessionId = data.session?.sessionId || data.sessionId || null
-      if (returnedSessionId) {
-        setSessionId(returnedSessionId)
-      }
-      const reply = data.reply || ''
-      addMessage({ role: 'assistant', text: reply, model: llmModel, accelerator: acceleratorUsed })
-      if (AUTO_SPEECH_REPLIES_ENABLED && reply) {
-        const played = playResponseAudio(data.audioUrl)
-        if (!played) {
-          speak(reply)
+
+        const streamRequest = async (acc: 'cpu' | 'gpu') => {
+          const res = await fetch(API_STREAM_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...requestBodyBase, accelerator: acc })
+          })
+          if (!res.ok || !res.body) {
+            const detail = await res.text().catch(() => '')
+            throw new Error(detail || 'stream_request_failed')
+          }
+
+          return await new Promise<{
+            reply: string
+            audioUrl?: string | null
+            session?: SessionResponse | null
+            diagnostics?: DiagnosticsInfo | null
+            mcpTools?: McpToolRun[]
+          }>((resolve, reject) => {
+            let settled = false
+            let latestText = ''
+
+            const settle = (type: 'resolve' | 'reject', value: unknown) => {
+              if (settled) return
+              settled = true
+              if (type === 'resolve') {
+                resolve(value as {
+                  reply: string
+                  audioUrl?: string | null
+                  session?: SessionResponse | null
+                  diagnostics?: DiagnosticsInfo | null
+                  mcpTools?: McpToolRun[]
+                })
+              } else {
+                reject(value)
+              }
+            }
+
+            readSseStream(res.body!, (event) => {
+              if (event.type === 'delta') {
+                const full = event.full || ''
+                latestText = full || `${latestText}${event.delta || ''}`
+                updateMessage(assistantMessageId, {
+                  text: latestText,
+                  accelerator: acc
+                })
+              } else if (event.type === 'complete') {
+                const finalText = event.reply || latestText
+                latestText = finalText
+                if (event.session?.sessionId) {
+                  setSessionId(event.session.sessionId)
+                }
+                updateMessage(assistantMessageId, (current) => ({
+                  text: finalText,
+                  accelerator: acc,
+                  diagnostics: event.diagnostics || current.diagnostics || null,
+                  mcpToolRuns: event.mcpTools?.length ? event.mcpTools : current.mcpToolRuns
+                }))
+                settle('resolve', {
+                  reply: finalText,
+                  audioUrl: event.audioUrl,
+                  session: event.session,
+                  diagnostics: event.diagnostics || null,
+                  mcpTools: event.mcpTools
+                })
+              } else if (event.type === 'error') {
+                settle('reject', new Error(event.error || 'stream_error'))
+              }
+            })
+              .then(() => {
+                if (!settled) {
+                  settle('reject', new Error('stream_closed'))
+                }
+              })
+              .catch((err) => {
+                settle('reject', err)
+              })
+          })
+        }
+
+        const {
+          result: streamResult,
+          acceleratorUsed,
+          fellBack
+        } = await runWithAcceleratorFallback(streamRequest, targetAccelerator)
+
+        if (fellBack) {
+          addMessage({
+            role: 'system',
+            text: 'GPU services unavailable, rerouted to CPU.',
+            model: llmModel
+          })
+        }
+
+        if (streamResult?.reply) {
+          updateMessage(assistantMessageId, {
+            text: streamResult.reply,
+            accelerator: acceleratorUsed,
+            mcpToolRuns: streamResult.mcpTools,
+            diagnostics: streamResult.diagnostics || null
+          })
+        }
+
+        const returnedSessionId = streamResult?.session?.sessionId || null
+        if (returnedSessionId) {
+          setSessionId(returnedSessionId)
+        }
+
+        if (AUTO_SPEECH_REPLIES_ENABLED && streamResult?.reply) {
+          const played = playResponseAudio(streamResult.audioUrl || undefined)
+          if (!played) {
+            speak(streamResult.reply)
+          }
+        }
+      } else {
+        const makeRequest = async (acc: 'cpu' | 'gpu') => {
+          const res = await fetch(API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...requestBodyBase, accelerator: acc })
+          })
+          if (!res.ok) {
+            const detail = await res.text()
+            throw new Error(detail || 'request_failed')
+          }
+          return res.json()
+        }
+
+        const {
+          result: data,
+          acceleratorUsed,
+          fellBack
+        } = await runWithAcceleratorFallback(makeRequest, targetAccelerator)
+        if (fellBack) {
+          addMessage({
+            role: 'system',
+            text: 'GPU services unavailable, rerouted to CPU.',
+            model: llmModel
+          })
+        }
+        if (data.error) {
+          addMessage({ role: 'system', text: `Error: ${data.error}`, model: llmModel })
+          return
+        }
+        const returnedSessionId = data.session?.sessionId || data.sessionId || null
+        if (returnedSessionId) {
+          setSessionId(returnedSessionId)
+        }
+        const reply = data.reply || ''
+        addMessage({
+          role: 'assistant',
+          text: reply,
+          model: llmModel,
+          accelerator: acceleratorUsed,
+          mcpToolRuns: Array.isArray(data?.mcpTools) ? data.mcpTools : undefined
+        })
+        if (AUTO_SPEECH_REPLIES_ENABLED && reply) {
+          const played = playResponseAudio(data.audioUrl || undefined)
+          if (!played) {
+            speak(reply)
+          }
         }
       }
     } catch (e: any) {
@@ -2224,7 +2816,8 @@ export function App() {
           model: llmModel,
           sttModel: usedWhisperModel,
           sttLanguage: detectedLanguage,
-          accelerator: acceleratorUsed
+          accelerator: acceleratorUsed,
+          mcpToolRuns: Array.isArray(data?.mcpTools) ? data.mcpTools : undefined
         })
         if (AUTO_SPEECH_REPLIES_ENABLED) {
           const played = playResponseAudio(data.audioUrl)
@@ -2555,6 +3148,54 @@ export function App() {
     )
   }
 
+  const renderDetectionBoxesAlt = (detections: DetectionResult[] = detectionResultsAlt) => {
+    if (!showDetectionBoxesAlt || !detectionImageAlt || !detectionImageSizeAlt || detections.length === 0) {
+      return null
+    }
+
+    const width = detectionImageSizeAlt.width || 1
+    const height = detectionImageSizeAlt.height || 1
+
+    return (
+      <div className="vision-overlay">
+        {detections.map((det, idx) => {
+          if (!Array.isArray(det.bbox) || det.bbox.length !== 4) return null
+          const [rawX1, rawY1, rawX2, rawY2] = det.bbox
+
+          const x1 = Math.max(0, Math.min(rawX1, width))
+          const y1 = Math.max(0, Math.min(rawY1, height))
+          const x2 = Math.max(x1, Math.min(rawX2, width))
+          const y2 = Math.max(y1, Math.min(rawY2, height))
+
+          const boxWidth = Math.max(1, x2 - x1)
+          const boxHeight = Math.max(1, y2 - y1)
+
+          const leftPct = (x1 / width) * 100
+          const topPct = (y1 / height) * 100
+          const widthPct = (boxWidth / width) * 100
+          const heightPct = (boxHeight / height) * 100
+
+          const label = det.class_name || (typeof det.class_id === 'number' ? `Class ${det.class_id}` : `Detection ${idx + 1}`)
+          const confidence = typeof det.confidence === 'number' ? `${(det.confidence * 100).toFixed(0)}%` : null
+          const isHovered = hoveredDetectionAlt === idx
+
+          return (
+            <div
+              key={`${label}-${idx}`}
+              className={`vision-box ${isHovered ? 'highlighted' : ''}`.trim()}
+              style={{ left: `${leftPct}%`, top: `${topPct}%`, width: `${widthPct}%`, height: `${heightPct}%` }}
+            >
+              <span className="vision-box-label">
+                {label}
+                {confidence ? <span className="vision-box-conf">{confidence}</span> : null}
+              </span>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
   const updatePendingAttachmentPrompt = (id: string, prompt: string) => {
     setPendingAttachments((prev) =>
       prev.map((att) => (att.id === id ? { ...att, prompt } : att))
@@ -2704,11 +3345,70 @@ export function App() {
       setDetectionError(null)
       setDetectionExpanded(false)
       setShowDetectionBoxes(true)
+      setHoveredDetection(null)
       setDetectionPreviewUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev)
         return URL.createObjectURL(file)
       })
       void handleDetectFile(file)
+    }
+    e.target.value = ''
+  }
+
+  const handleDetectFileAlt = async (rawFile: File) => {
+    const file = ensureFileHasName(rawFile)
+    setLastDetectionFileAlt(file)
+    const formData = new FormData()
+    formData.append('image', file, file.name)
+    formData.append('confidence', detectConfidenceAlt.toString())
+
+    setDetectingAlt(true)
+    setDetectionErrorAlt(null)
+
+    try {
+      const res = await fetch(DETECT_URL, {
+        method: 'POST',
+        body: formData
+      })
+
+      if (!res.ok) {
+        const detail = await res.text()
+        throw new Error(detail || 'Detection failed')
+      }
+
+      const data = await res.json()
+      const imageData = typeof data?.image === 'string' && data.image ? data.image : null
+      const detections = Array.isArray(data?.detections) ? (data.detections as DetectionResult[]) : []
+
+      setDetectionImageAlt(imageData)
+      setDetectionResultsAlt(detections)
+    } catch (err: any) {
+      console.error('Linked detection failed', err)
+      setDetectionErrorAlt(err?.message || 'Detection failed')
+      setDetectionImageAlt(null)
+      setDetectionResultsAlt([])
+    } finally {
+      setDetectingAlt(false)
+      if (detectFileInputRefAlt.current) {
+        detectFileInputRefAlt.current.value = ''
+      }
+    }
+  }
+
+  const handleDetectFileChangeAlt = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) {
+      setDetectionImageAlt(null)
+      setDetectionResultsAlt([])
+      setDetectionErrorAlt(null)
+      setDetectionExpandedAlt(false)
+      setShowDetectionBoxesAlt(true)
+      setHoveredDetectionAlt(null)
+      setDetectionPreviewUrlAlt((prev) => {
+        if (prev) URL.revokeObjectURL(prev)
+        return URL.createObjectURL(file)
+      })
+      void handleDetectFileAlt(file)
     }
     e.target.value = ''
   }
@@ -2846,62 +3546,10 @@ export function App() {
     e.target.value = ''
   }
 
-  const handleDetectFileAlt = async (rawFile: File) => {
-    const file = ensureFileHasName(rawFile)
-    setLastDetectionFileAlt(file)
-    const formData = new FormData()
-    formData.append('image', file, file.name)
-    formData.append('confidence', detectConfidenceAlt.toString())
-
-    setDetectingAlt(true)
-    setDetectionErrorAlt(null)
-
-    try {
-      const res = await fetch(DETECT_URL, {
-        method: 'POST',
-        body: formData
-      })
-
-      if (!res.ok) {
-        const detail = await res.text()
-        throw new Error(detail || 'Detection failed')
-      }
-
-      const data = await res.json()
-      const imageData = typeof data?.image === 'string' && data.image ? data.image : null
-      const detections = Array.isArray(data?.detections) ? (data.detections as DetectionResult[]) : []
-
-      setDetectionImageAlt(imageData)
-      setDetectionResultsAlt(detections)
-    } catch (err: any) {
-      console.error('Detection failed', err)
-      setDetectionErrorAlt(err?.message || 'Detection failed')
-      setDetectionImageAlt(null)
-      setDetectionResultsAlt([])
-    } finally {
-      setDetectingAlt(false)
-      if (detectFileInputRefAlt.current) {
-        detectFileInputRefAlt.current.value = ''
-      }
+  const handleRedetect = () => {
+    if (lastDetectionFile) {
+      void handleDetectFile(lastDetectionFile)
     }
-  }
-
-  const handleDetectFileChangeAlt = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (file) {
-      setDetectionImageAlt(null)
-      setDetectionResultsAlt([])
-      setDetectionErrorAlt(null)
-      setDetectionExpandedAlt(false)
-      setShowDetectionBoxesAlt(true)
-      setHoveredDetectionAlt(null)
-      setDetectionPreviewUrlAlt((prev) => {
-        if (prev) URL.revokeObjectURL(prev)
-        return URL.createObjectURL(file)
-      })
-      void handleDetectFileAlt(file)
-    }
-    e.target.value = ''
   }
 
   const handlePasteFromClipboard = async () => {
@@ -3268,6 +3916,68 @@ export function App() {
     return imageResults.length ? 'Ready' : 'Drafting'
   }, [imageBusy, imagePreview, imageResults.length])
 
+  const imageInsights = useMemo(() => {
+    if (!imageResults.length) {
+      return {
+        total: 0,
+        avgDurationLabel: null as string | null,
+        lastSize: null as string | null,
+        lastAccel: null as string | null,
+        lastPrompt: null as string | null
+      }
+    }
+
+    const durations = imageResults
+      .map((result) => (typeof result.duration_ms === 'number' ? result.duration_ms : null))
+      .filter((value): value is number => typeof value === 'number' && value > 0)
+
+    const avgDuration = durations.length
+      ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length)
+      : null
+
+    const lastResult = imageResults[0]
+
+    return {
+      total: imageResults.length,
+      avgDurationLabel: avgDuration ? formatImageDuration(avgDuration) : null,
+      lastSize:
+        typeof lastResult?.width === 'number' && typeof lastResult?.height === 'number'
+          ? `${lastResult.width}×${lastResult.height}`
+          : null,
+      lastAccel: lastResult?.accelerator ? lastResult.accelerator.toUpperCase() : null,
+      lastPrompt: lastResult?.prompt ? truncateText(lastResult.prompt, 56) : null
+    }
+  }, [imageResults])
+
+  const applyImagePreset = useCallback(
+    (preset: ImagePromptPreset) => {
+      cancelImageStream()
+      setImageBusy(false)
+      setImageError(null)
+      setImagePrompt(preset.prompt || '')
+      setImageNegativePrompt(preset.negative || '')
+      if (typeof preset.width === 'number') {
+        setImageWidth(preset.width)
+      }
+      if (typeof preset.height === 'number') {
+        setImageHeight(preset.height)
+      }
+      if (typeof preset.guidance === 'number') {
+        setImageGuidance(clampNumeric(preset.guidance, IMAGE_MIN_GUIDANCE, IMAGE_MAX_GUIDANCE))
+      }
+      if (typeof preset.steps === 'number') {
+        setImageSteps(clampNumeric(preset.steps, IMAGE_MIN_STEPS, IMAGE_MAX_STEPS))
+      }
+      if (preset.accelerator) {
+        setImageAccelerator(preset.accelerator)
+      }
+      setImageControlsCollapsed(false)
+    },
+    [cancelImageStream]
+  )
+
+  const hasImageResults = imageResults.length > 0
+
   useEffect(() => {
     writeToStorage(STORAGE_KEYS.imageAccelerator, imageAccelerator)
   }, [imageAccelerator])
@@ -3409,12 +4119,34 @@ export function App() {
     })
   }
 
-  const handleResetConversation = () => {
+  const handleResetConversation = useCallback(() => {
     stopAllAudio()
     setMessages([])
     setSessionId(null)
     setInput('')
-  }
+  }, [stopAllAudio])
+
+  const handleMenuAction = useCallback(
+    (action: QuickMenuAction) => {
+      setAppMenuOpen(false)
+
+      if (action === 'popup') {
+        setPopupVisible(true)
+        return
+      }
+
+      if (action === 'status') {
+        setStatusExpanded(true)
+        statusWrapperRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
+        return
+      }
+
+      if (action === 'reset') {
+        handleResetConversation()
+      }
+    },
+    [handleResetConversation]
+  )
 
   const handleDetectionImageLoad = (event: React.SyntheticEvent<HTMLImageElement>) => {
     if (!detectionImage) return
@@ -3440,65 +4172,13 @@ export function App() {
     }
   }
 
-  const renderDetectionBoxes = () => {
-    if (!showDetectionBoxes || !detectionImage || !detectionImageSize || detectionResults.length === 0) {
+  const renderDetectionBoxes = (detections: DetectionResult[] = detectionResults) => {
+    if (!showDetectionBoxes || !detectionImage || !detectionImageSize || detections.length === 0) {
       return null
     }
 
     const width = detectionImageSize.width || 1
     const height = detectionImageSize.height || 1
-
-    return (
-      <div className="vision-overlay">
-        {detectionResults.map((det, idx) => {
-          if (!Array.isArray(det.bbox) || det.bbox.length !== 4) return null
-          const [rawX1, rawY1, rawX2, rawY2] = det.bbox
-
-          const x1 = Math.max(0, Math.min(rawX1, width))
-          const y1 = Math.max(0, Math.min(rawY1, height))
-          const x2 = Math.max(x1, Math.min(rawX2, width))
-          const y2 = Math.max(y1, Math.min(rawY2, height))
-
-          const boxWidth = Math.max(1, x2 - x1)
-          const boxHeight = Math.max(1, y2 - y1)
-
-          const leftPct = (x1 / width) * 100
-          const topPct = (y1 / height) * 100
-          const widthPct = (boxWidth / width) * 100
-          const heightPct = (boxHeight / height) * 100
-
-          const label = det.class_name || (typeof det.class_id === 'number' ? `Class ${det.class_id}` : `Detection ${idx + 1}`)
-          const confidence = typeof det.confidence === 'number' ? `${(det.confidence * 100).toFixed(0)}%` : null
-
-          return (
-            <div
-              key={`${label}-${idx}`}
-              className="vision-box"
-              style={{ left: `${leftPct}%`, top: `${topPct}%`, width: `${widthPct}%`, height: `${heightPct}%` }}
-            >
-              <span className="vision-box-label">
-                {label}
-                {confidence ? <span className="vision-box-conf">{confidence}</span> : null}
-              </span>
-            </div>
-          )
-        })}
-      </div>
-    )
-  }
-
-  const renderDetectionBoxesAlt = (detections: DetectionResult[]) => {
-    if (
-      !showDetectionBoxesAlt ||
-      !detectionImageAlt ||
-      !detectionImageSizeAlt ||
-      detections.length === 0
-    ) {
-      return null
-    }
-
-    const width = detectionImageSizeAlt.width || 1
-    const height = detectionImageSizeAlt.height || 1
 
     return (
       <div className="vision-overlay">
@@ -3521,7 +4201,7 @@ export function App() {
 
           const label = det.class_name || (typeof det.class_id === 'number' ? `Class ${det.class_id}` : `Detection ${idx + 1}`)
           const confidence = typeof det.confidence === 'number' ? `${(det.confidence * 100).toFixed(0)}%` : null
-          const isActive = hoveredDetectionAlt === idx
+          const isActive = hoveredDetection === idx && secondaryDetectionTargets.length > 0
 
           return (
             <div
@@ -3711,20 +4391,34 @@ export function App() {
                       <div className="bubble-text">
                         {m.text}
                         {m.role === 'assistant' && m.text ? (
-                          (() => {
-                            const { icon, label } = inlineSpeakerMetaFor(m.id)
-                            return (
+                          <div className="assistant-inline-actions">
+                            {(() => {
+                              const { icon, label } = inlineSpeakerMetaFor(m.id)
+                              return (
+                                <button
+                                  type="button"
+                                  className="inline-speaker-button"
+                                  onClick={() => handleSpeakerClick(m)}
+                                  title={label}
+                                  aria-label={label}
+                                >
+                                  {icon}
+                                </button>
+                              )
+                            })()}
+                            {mcpProviderNames.length ? (
                               <button
                                 type="button"
-                                className="inline-speaker-button"
-                                onClick={() => handleSpeakerClick(m)}
-                                title={label}
-                                aria-label={label}
+                                className="mcp-run-button"
+                                onClick={() => handleOpenMcpPanel(m)}
+                                aria-label="Open MCP tools"
+                                title={m.mcpToolRuns?.length ? 'View MCP results' : 'Run MCP tools'}
                               >
-                                {icon}
+                                🧩
+                                {m.mcpToolRuns?.length ? <span className="mcp-badge">{m.mcpToolRuns.length}</span> : null}
                               </button>
-                            )
-                          })()
+                            ) : null}
+                          </div>
                         ) : null}
                         {m.attachments?.length ? (
                           <div className="chat-attachments">
@@ -3821,21 +4515,22 @@ export function App() {
                     </div>
                   </div>
                 )}
-                <button
-                  type="button"
-                  className={`chat-scroll-bottom ${showScrollToBottom ? 'visible' : ''}`.trim()}
-                  onClick={() => scrollChatToBottom(true)}
-                  aria-label="Scroll to latest message"
-                  title="Scroll to latest message"
-                >
-                  ↓
-                </button>
               </div>
+              <button
+                type="button"
+                className={`chat-scroll-bottom ${showScrollToBottom ? 'visible' : ''}`.trim()}
+                onClick={() => scrollChatToBottom(true)}
+                aria-label="Scroll to latest message"
+                title="Scroll to latest message"
+              >
+                ↓
+              </button>
             </section>
 
             <section className="controls-panel">
               <div className="control-chips snap-scroll" role="group" aria-label="Chat settings">
-                <label className="control-chip">
+                <label className={`control-chip${speechLanguageHelper ? ' has-chip-help' : ''}`}>
+                  <ChipInfoIcon label="Speech language" message={speechLanguageHelper} />
                   <span className="chip-header">
                     <span className="chip-icon" aria-hidden>
                       🌐
@@ -3853,43 +4548,46 @@ export function App() {
                       </option>
                     ))}
                   </select>
-                  <span className="chip-helper">Used for mic input & Whisper hints.</span>
-                  {speechLanguage === 'auto' && browserDetectedLanguage && (
+                  {speechLanguage === 'auto' && browserDetectedLanguage ? (
                     <span className="chip-helper" aria-live="polite">
                       Browser detected: {getLanguageLabel(browserDetectedLanguage) || browserDetectedLanguage}
                     </span>
-                  )}
+                  ) : null}
                 </label>
-                <label className="control-chip">
+                <label
+                  className={`control-chip${llmProviderHelper ? ' has-chip-help' : ''}`}
+                  htmlFor="llm-provider-select"
+                  data-testid="llm-provider-chip"
+                >
+                  <ChipInfoIcon label="LLM provider" message={llmProviderHelper} />
                   <span className="chip-header">
                     <span className="chip-icon" aria-hidden>
                       🧠
                     </span>
-                    <span className="chip-label">Provider</span>
+                    <span className="chip-label">LLM Provider</span>
+                    <button
+                      type="button"
+                      className="chip-refresh"
+                      onClick={() => handleRefreshProviders()}
+                      title="Refresh providers"
+                      aria-label="Refresh providers"
+                    >
+                      ↺
+                    </button>
                   </span>
                   <select
+                    id="llm-provider-select"
+                    data-testid="llm-provider-select"
                     value={llmProvider}
                     onChange={(e) => setLlmProvider(e.target.value as LlmProvider)}
                     className="chip-select"
                   >
-                    {LLM_PROVIDER_OPTIONS.map((option) => {
-                      const status = providerStatuses[option.value]
-                      const statusSuffix = status && status.label !== 'Available' ? ` (${status.label})` : ''
-                      const disableOption = healthServices.length > 0 && status && !status.available
-                      return (
-                        <option key={option.value} value={option.value} disabled={disableOption}>
-                          {option.label}
-                          {statusSuffix}
-                        </option>
-                      )
-                    })}
+                    {llmProviderOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
                   </select>
-                  <span className="chip-helper">Switch between Ollama, Anthropic, or OpenAI.</span>
-                  {providerStatuses[llmProvider] && providerStatuses[llmProvider].label !== 'Available' && (
-                    <span className="chip-helper" role="status">
-                      Status: {providerStatuses[llmProvider].label}
-                    </span>
-                  )}
                 </label>
                 <label className="control-chip">
                   <span className="chip-header">
@@ -3910,7 +4608,8 @@ export function App() {
                     ))}
                   </select>
                 </label>
-                <label className="control-chip">
+                <label className={`control-chip${whisperHelper ? ' has-chip-help' : ''}`}>
+                  <ChipInfoIcon label="Whisper" message={whisperHelper} />
                   <span className="chip-header">
                     <span className="chip-icon" aria-hidden>
                       🗣️
@@ -3927,12 +4626,17 @@ export function App() {
                     <option value="small">small</option>
                   </select>
                 </label>
-                <label className="control-chip">
+                <label className={`control-chip${voiceStatusHelper ? ' has-chip-help' : ''}`}>
+                  <ChipInfoIcon label="Voice" message={voiceStatusHelper || undefined} />
                   <span className="chip-header">
                     <span className="chip-icon" aria-hidden>
                       🎙️
                     </span>
                     <span className="chip-label">Voice</span>
+                  </span>
+                  <span className={`chip-status chip-status-${voiceStatusTone}`} role="status">
+                    <span className="chip-status-dot" aria-hidden />
+                    {voiceStatusLabel}
                   </span>
                   <div className="voice-control-row">
                     <select
@@ -4282,6 +4986,87 @@ export function App() {
                   </div>
                 </aside>
               )}
+              <div className="panel-surface image-summary-panel">
+                <div className="image-summary-row">
+                  {hasImageResults ? (
+                    <section className="image-insights" aria-label="Imagen Studio session stats">
+                      <div className="image-insight-card">
+                        <span className="image-insight-label">Renders</span>
+                        <strong className="image-insight-value">{imageInsights.total}</strong>
+                        <span className="image-insight-hint">saved this session</span>
+                      </div>
+                      <div className="image-insight-card">
+                        <span className="image-insight-label">Avg duration</span>
+                        <strong className="image-insight-value">
+                          {imageInsights.avgDurationLabel || '—'}
+                        </strong>
+                        <span className="image-insight-hint">across completed runs</span>
+                      </div>
+                      <div className="image-insight-card">
+                        <span className="image-insight-label">Last output</span>
+                        <strong className="image-insight-value">
+                          {imageInsights.lastSize || '—'}
+                        </strong>
+                        <span className="image-insight-hint">{imageInsights.lastAccel || 'pending'}</span>
+                      </div>
+                      <div className="image-insight-card">
+                        <span className="image-insight-label">Last prompt</span>
+                        <p className="image-insight-description">
+                          {imageInsights.lastPrompt || 'Generate to capture prompt history.'}
+                        </p>
+                      </div>
+                    </section>
+                  ) : (
+                    <section className="image-empty-state" aria-live="polite">
+                      <div>
+                        <h3>Draft your first render</h3>
+                        <p>Use the quick presets to auto-fill prompts, dimensions, and guidance.</p>
+                      </div>
+                      <span className="image-empty-icon" aria-hidden>
+                        ✨
+                      </span>
+                    </section>
+                  )}
+                  <section className="image-preset-panel" aria-label="Imagen prompt presets">
+                    <header>
+                      <div>
+                        <h3>Quick presets</h3>
+                        <p>Tap to populate prompt, negative, and size controls.</p>
+                      </div>
+                    </header>
+                    <div className="image-preset-grid">
+                      {IMAGE_PROMPT_PRESETS.map((preset) => (
+                        <button
+                          type="button"
+                          key={preset.label}
+                          className="image-preset-card"
+                          onClick={() => applyImagePreset(preset)}
+                          disabled={imageBusy}
+                        >
+                          <div className="image-preset-header">
+                            <span>{preset.label}</span>
+                            {preset.accelerator ? (
+                              <span className={`image-chip-accent image-chip-accent-${preset.accelerator}`}>
+                                {preset.accelerator.toUpperCase()}
+                              </span>
+                            ) : null}
+                          </div>
+                          <p>{truncateText(preset.prompt, 88)}</p>
+                          <div className="image-preset-meta">
+                            {preset.width && preset.height ? (
+                              <span>{preset.width}×{preset.height}</span>
+                            ) : null}
+                            {typeof preset.guidance === 'number' ? (
+                              <span>{preset.guidance.toFixed(1)}× guidance</span>
+                            ) : null}
+                            {typeof preset.steps === 'number' ? <span>{preset.steps} steps</span> : null}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                </div>
+              </div>
               <div className="image-lab-grid">
                 <div className="image-results-column">
                   {imagePreview ? (
@@ -5161,6 +5946,96 @@ export function App() {
           </div>
         </div>
       )}
+      {mcpPanelOpen && activeMcpMessage ? (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="MCP tools panel">
+          <div className="modal-card mcp-panel">
+            <header className="modal-header">
+              <div>
+                <div className="modal-title">MCP tools</div>
+                <div className="modal-subtitle">Message at {activeMcpMessage.time}</div>
+              </div>
+              <button type="button" className="icon-button" onClick={closeMcpPanel} aria-label="Close MCP panel">
+                ✕
+              </button>
+            </header>
+            <div className="mcp-panel-content">
+              <section>
+                <h4>Automatic tool calls</h4>
+                {activeMcpMessage.mcpToolRuns?.length ? (
+                  <ul className="mcp-run-list">
+                    {activeMcpMessage.mcpToolRuns.map((run, idx) => (
+                      <li key={`${run.provider}-${run.tool}-${idx}`}>
+                        <div className="mcp-run-head">
+                          <strong>{run.provider || 'unknown'}</strong>
+                          <span>{run.tool || 'tool'}</span>
+                          {run.error ? <span className="mcp-run-error">{run.error}</span> : <span className="mcp-run-success">success</span>}
+                        </div>
+                        {run.args ? (
+                          <pre className="mcp-code">{JSON.stringify(run.args, null, 2)}</pre>
+                        ) : null}
+                        {typeof run.result !== 'undefined' ? (
+                          <pre className="mcp-code">{JSON.stringify(run.result, null, 2)}</pre>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="mcp-empty">No tool calls were embedded in this reply.</p>
+                )}
+              </section>
+              <section>
+                <h4>Manual invocation</h4>
+                {mcpProviderNames.length ? (
+                  <div className="mcp-form">
+                    <label>
+                      Provider
+                      <select value={mcpManualProvider} onChange={(e) => setMcpManualProvider(e.target.value)}>
+                        {mcpProviderNames.map((name) => (
+                          <option value={name} key={name}>
+                            {name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Tool
+                      <select
+                        value={mcpManualTool}
+                        onChange={(e) => setMcpManualTool(e.target.value)}
+                        disabled={!availableManualTools.length}
+                      >
+                        {availableManualTools.map((tool) => (
+                          <option value={tool} key={tool}>
+                            {tool}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Arguments (JSON)
+                      <textarea value={mcpManualArgs} onChange={(e) => setMcpManualArgs(e.target.value)} rows={4} />
+                    </label>
+                    <div className="mcp-form-actions">
+                      <button type="button" onClick={handleRunManualTool} disabled={mcpManualLoading}>
+                        {mcpManualLoading ? 'Running…' : 'Run tool'}
+                      </button>
+                      <button type="button" className="secondary" onClick={() => setMcpManualArgs('{}')}>
+                        Reset args
+                      </button>
+                    </div>
+                    {mcpManualError ? <div className="mcp-error">{mcpManualError}</div> : null}
+                    {typeof mcpManualResult !== 'undefined' && mcpManualResult !== null ? (
+                      <pre className="mcp-code">{JSON.stringify(mcpManualResult, null, 2)}</pre>
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="mcp-empty">MCP providers unavailable.</p>
+                )}
+              </section>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("mcp_github_bridge")
@@ -27,7 +29,8 @@ class InvokeRequest(BaseModel):
 class GithubMCPBridge:
     def __init__(self, token: str, binary: Optional[str] = None) -> None:
         self._token = token
-        self._binary = binary or os.environ.get("GITHUB_MCP_BINARY", "server")
+        default_binary = "/usr/local/bin/github-mcp-server"
+        self._binary = binary or os.environ.get("GITHUB_MCP_BINARY", default_binary)
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -190,6 +193,20 @@ class GithubMCPBridge:
 
 
 TOKEN = os.environ.get("GITHUB_PERSONAL_TOKEN") or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
+WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+WEBHOOK_DEFAULT_TOOL = os.environ.get("GITHUB_WEBHOOK_TOOL", "run_space")
+WEBHOOK_ALLOWED_EVENTS = {
+    evt.strip()
+    for evt in os.environ.get("GITHUB_WEBHOOK_EVENTS", "").split(",")
+    if evt.strip()
+}
+try:
+    WEBHOOK_TOOL_MAP = json.loads(os.environ.get("GITHUB_WEBHOOK_TOOL_MAP", "{}"))
+    if not isinstance(WEBHOOK_TOOL_MAP, dict):
+        raise ValueError("tool map must be a JSON object")
+except (json.JSONDecodeError, ValueError) as err:
+    logger.warning("Invalid GITHUB_WEBHOOK_TOOL_MAP: %s", err)
+    WEBHOOK_TOOL_MAP = {}
 if not TOKEN:
     logger.warning("GITHUB_PERSONAL_TOKEN is not set. GitHub bridge will report degraded health.")
 
@@ -230,3 +247,68 @@ async def invoke(request: InvokeRequest) -> Dict[str, Any]:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "GITHUB_PERSONAL_TOKEN not configured")
     result = await bridge.invoke_tool(request.tool, request.arguments)
     return result
+
+
+def _signature_valid(secret: str, body: bytes, signature_header: str | None) -> bool:
+    if not secret or not signature_header:
+        return False
+    if not signature_header.startswith("sha256="):
+        return False
+    received_sig = signature_header.split("=", 1)[1]
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(received_sig, expected)
+
+
+def _resolve_tool(event_name: str) -> str:
+    return WEBHOOK_TOOL_MAP.get(event_name, WEBHOOK_DEFAULT_TOOL)
+
+
+async def _dispatch_webhook_event(event_name: str, delivery: str, payload: Dict[str, Any]) -> None:
+    if not bridge.is_running:
+        logger.error("GitHub bridge is not running; cannot process webhook %s", delivery)
+        return
+    tool = _resolve_tool(event_name)
+    args = {
+        "event": event_name,
+        "delivery": delivery,
+        "action": payload.get("action"),
+        "repository": payload.get("repository", {}).get("full_name"),
+        "payload": payload,
+    }
+    try:
+        await bridge.invoke_tool(tool, args)
+        logger.info("Processed webhook %s via tool %s", delivery, tool)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to process webhook %s", delivery)
+
+
+@app.post("/webhook", status_code=status.HTTP_202_ACCEPTED)
+async def github_webhook(request: Request, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    if not TOKEN:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "GITHUB_PERSONAL_TOKEN not configured")
+    if not WEBHOOK_SECRET:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "GITHUB_WEBHOOK_SECRET not configured")
+
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+    if not _signature_valid(WEBHOOK_SECRET, body, signature):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_signature")
+
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except json.JSONDecodeError as err:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"invalid_json: {err}") from err
+
+    event_name = request.headers.get("X-GitHub-Event", "").strip()
+    delivery = request.headers.get("X-GitHub-Delivery", "").strip()
+    if not event_name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing_event_header")
+    if not delivery:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing_delivery_header")
+
+    if WEBHOOK_ALLOWED_EVENTS and event_name not in WEBHOOK_ALLOWED_EVENTS:
+        logger.info("Ignoring webhook %s for event %s (not allowed)", delivery, event_name)
+        return {"status": "ignored", "detail": "event_not_allowed"}
+
+    background_tasks.add_task(_dispatch_webhook_event, event_name, delivery, payload)
+    return {"status": "accepted", "delivery": delivery}

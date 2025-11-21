@@ -114,6 +114,41 @@ async def root(_: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+async def manifest(_: Request) -> JSONResponse:
+    return JSONResponse(
+        {
+            "name": "yolo",
+            "version": "1.0.0",
+            "description": "YOLOv8n object detection service exposed via MCP",
+            "capabilities": {
+                "tools": [
+                    {
+                        "name": "detect_objects",
+                        "description": "Run YOLOv8n on a base64 image and return detections",
+                        "input_schema": {
+                            "type": "object",
+                            "required": ["image_base64"],
+                            "properties": {
+                                "image_base64": {
+                                    "type": "string",
+                                    "description": "Image contents encoded as base64 or data URL",
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 1,
+                                    "default": 0.25,
+                                    "description": "Minimum confidence threshold",
+                                },
+                            },
+                        },
+                    }
+                ]
+            },
+        }
+    )
+
+
 def main() -> None:
     """Entry point for running the YOLO MCP HTTP bridge."""
     host = os.getenv("MCP_HOST", "0.0.0.0")
@@ -121,7 +156,8 @@ def main() -> None:
 
     app = Starlette(routes=[
         Route("/", root, methods=["GET"]),
-        Route("/detect", detect_http, methods=["POST"])
+        Route("/detect", detect_http, methods=["POST"]),
+        Route("/.well-known/mcp.json", manifest, methods=["GET"]),
     ])
 
     uvicorn.run(app, host=host, port=port)

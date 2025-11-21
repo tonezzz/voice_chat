@@ -1,0 +1,11 @@
+node_modules
+npm-debug.log*
+*.log
+*.local
+.env*
+.vscode
+coverage/
+logs/
+scripts/
+test/
+__tests__/
