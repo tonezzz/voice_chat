@@ -1,4 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  AppBar,
+  Box,
+  Chip,
+  IconButton,
+  Menu,
+  MenuItem,
+  Stack,
+  Tab,
+  Tabs,
+  Toolbar,
+  Typography,
+  type ChipProps
+} from '@mui/material'
+import MoreVertIcon from '@mui/icons-material/MoreVert'
+import SensorsIcon from '@mui/icons-material/Sensors'
 import './style.css'
 import type { DetectionResult, DetectionTestPayload } from './types/yolo'
 
@@ -65,6 +81,18 @@ const BANK_OCR_LANG_OPTIONS = [
   { value: 'spa', label: 'Español' }
 ]
 
+const PANEL_TABS = [
+  { value: 'chat', label: 'Chat' },
+  { value: 'openvoice', label: 'OpenVoice' },
+  { value: 'image-mcp', label: 'Image lab' },
+  { value: 'yolo-detection', label: 'YOLO detection' },
+  { value: 'carwatch', label: 'CarWatch' },
+  { value: 'bank-slip', label: 'Bank slip' },
+  { value: 'meeting', label: 'Meeting' }
+] as const
+
+type PanelTabValue = (typeof PANEL_TABS)[number]['value']
+
 const downloadBase64File = (dataUrl: string, filename: string) => {
   const link = document.createElement('a')
   link.href = dataUrl
@@ -73,6 +101,8 @@ const downloadBase64File = (dataUrl: string, filename: string) => {
   link.click()
   document.body.removeChild(link)
 }
+
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1'])
 
 const resolveDefaultApiBase = () => {
   if (typeof window === 'undefined') {
@@ -89,7 +119,47 @@ const resolveDefaultApiBase = () => {
   return window.location.origin
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || resolveDefaultApiBase()
+const parseHostname = (url: string) => {
+  try {
+    return new URL(url).hostname
+  } catch (error) {
+    return null
+  }
+}
+
+const isLocalHostname = (value?: string | null) => {
+  if (!value) return false
+  return LOCAL_HOSTNAMES.has(value.toLowerCase()) || value.toLowerCase().endsWith('.local')
+}
+
+const resolveApiBase = () => {
+  const envBase = import.meta.env.VITE_API_BASE_URL?.trim()
+  if (!envBase) {
+    return resolveDefaultApiBase()
+  }
+
+  if (typeof window === 'undefined') {
+    return envBase
+  }
+
+  const envHost = parseHostname(envBase)
+  const currentHost = window.location.hostname
+  const currentIsLocal = isLocalHostname(currentHost)
+  const envIsLocal = isLocalHostname(envHost)
+
+  if (!envIsLocal) {
+    return envBase
+  }
+
+  if (currentIsLocal) {
+    return envBase
+  }
+
+  // App is served from a public host but env points to localhost; fall back to origin so ngrok / deployed UIs work.
+  return resolveDefaultApiBase()
+}
+
+const API_BASE = resolveApiBase()
 const API_URL = `${API_BASE}/voice-chat`
 const API_STREAM_URL = `${API_BASE}/voice-chat-stream`
 const API_AUDIO_URL = `${API_BASE}/voice-chat-audio`
@@ -105,6 +175,7 @@ const GENERATE_IMAGE_STREAM_URL = `${API_BASE}/generate-image-stream`
 const OCR_URL = `${API_BASE}/ocr-image`
 const VOICES_URL = `${API_BASE}/voices`
 const PREVIEW_VOICE_URL = `${API_BASE}/preview-voice`
+const CARWATCH_SNAPSHOT_URL = `${API_BASE}/carwatch/snapshot`
 
 const MCP0_PROVIDERS_API = `${API_BASE}/mcp0/providers`
 const MCP0_TOOLS_API = `${API_BASE}/mcp0/tools`
@@ -336,6 +407,8 @@ const formatServerLabel = (raw?: string | null) => {
 }
 
 type LlmProvider = 'ollama' | 'anthropic' | 'openai' | 'github'
+
+type ProviderHealthStatus = Record<LlmProvider, 'ok' | 'unknown' | 'error'>
 
 interface McpToolRun {
   provider?: string
@@ -1283,7 +1356,7 @@ export function App() {
   const [healthInfo, setHealthInfo] = useState<any>(null)
   const [statusExpanded, setStatusExpanded] = useState(false)
   const [stackSidebarCollapsed, setStackSidebarCollapsed] = useState(false)
-  const [appMenuOpen, setAppMenuOpen] = useState(false)
+  const [quickMenuAnchorEl, setQuickMenuAnchorEl] = useState<null | HTMLElement>(null)
   const [mcpPanelOpen, setMcpPanelOpen] = useState(false)
   const [mcpPanelMessageId, setMcpPanelMessageId] = useState<string | null>(null)
   const [mcpManualProvider, setMcpManualProvider] = useState('')
@@ -1449,42 +1522,10 @@ export function App() {
   const [githubModelStatus, setGithubModelStatus] = useState<{ status: string; detail?: string | null } | null>(null)
   const [githubModelChecking, setGithubModelChecking] = useState(false)
   const [githubModelError, setGithubModelError] = useState<string | null>(null)
-  const [carwatchSnapshot] = useState<CarwatchSnapshot>(() => ({
-    deviceName: 'iPhone 15 Pro',
-    connection: 'online',
-    batteryPercent: 78,
-    temperatureC: 38,
-    fps: 28,
-    latencyMs: 142,
-    timestamp: new Date().toISOString(),
-    streamUrl: 'https://demo-carwatch.ngrok.app/live',
-    thumbUrl: 'https://placehold.co/960x540/111827/FFFFFF?text=CarWatch+Live+Preview',
-    detections: [
-      { label: 'Sedan', count: 3, confidence: 0.82 },
-      { label: 'SUV', count: 1, confidence: 0.76 },
-      { label: 'Motorbike', count: 2, confidence: 0.68 }
-    ]
-  }))
-  const [carwatchEvents] = useState<CarwatchEvent[]>(() => [
-    {
-      id: 'evt-1',
-      label: 'Vehicles detected',
-      detail: '3 sedans, 1 SUV near exit gate',
-      timestamp: new Date(Date.now() - 45_000).toISOString()
-    },
-    {
-      id: 'evt-2',
-      label: 'Motorbike linger',
-      detail: 'Bike idle for 90s, flagged for follow-up',
-      timestamp: new Date(Date.now() - 120_000).toISOString()
-    },
-    {
-      id: 'evt-3',
-      label: 'Stream connected',
-      detail: 'Device switched to ngrok tunnel',
-      timestamp: new Date(Date.now() - 300_000).toISOString()
-    }
-  ])
+  const [carwatchSnapshot, setCarwatchSnapshot] = useState<CarwatchSnapshot | null>(null)
+  const [carwatchEvents, setCarwatchEvents] = useState<CarwatchEvent[]>([])
+  const [carwatchLoading, setCarwatchLoading] = useState(false)
+  const [carwatchError, setCarwatchError] = useState<string | null>(null)
   const speechLanguageHelper = SPEECH_LANGUAGE_HELPER
   const llmProviderHelper = LLM_PROVIDER_HELPER
   const whisperHelper = WHISPER_HELPER
@@ -1557,8 +1598,6 @@ export function App() {
   const detectFileInputRefBank = useRef<HTMLInputElement | null>(null)
   const chatMessagesRef = useRef<HTMLDivElement | null>(null)
   const statusWrapperRef = useRef<HTMLDivElement | null>(null)
-  const appMenuRef = useRef<HTMLDivElement | null>(null)
-  const appMenuButtonRef = useRef<HTMLButtonElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const textInputRef = useRef<HTMLTextAreaElement | null>(null)
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null)
@@ -1645,19 +1684,6 @@ export function App() {
   }, [detectionResultsAlt, secondaryDetectionTargets])
 
   useEffect(() => {
-    if (!appMenuOpen) return
-    const handleClickOutside = (event: MouseEvent) => {
-      const target = event.target as Node
-      if (appMenuRef.current?.contains(target) || appMenuButtonRef.current?.contains(target)) {
-        return
-      }
-      setAppMenuOpen(false)
-    }
-    document.addEventListener('mousedown', handleClickOutside)
-    return () => document.removeEventListener('mousedown', handleClickOutside)
-  }, [appMenuOpen])
-
-  useEffect(() => {
     if (!popupVisible) return
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -1667,17 +1693,6 @@ export function App() {
     document.addEventListener('keydown', handleEscape)
     return () => document.removeEventListener('keydown', handleEscape)
   }, [popupVisible])
-
-  useEffect(() => {
-    if (!appMenuOpen) return
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setAppMenuOpen(false)
-      }
-    }
-    document.addEventListener('keydown', handleEscape)
-    return () => document.removeEventListener('keydown', handleEscape)
-  }, [appMenuOpen])
 
   useEffect(() => {
     return () => {
@@ -2124,6 +2139,17 @@ export function App() {
     return () => document.removeEventListener('keydown', handler)
   }, [mcpPanelOpen, closeMcpPanel])
 
+  useEffect(() => {
+    if (!statusExpanded) return
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setStatusExpanded(false)
+      }
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [statusExpanded])
+
   const handleRunManualTool = useCallback(async () => {
     if (!mcpManualProvider || !mcpManualTool) {
       setMcpManualError('Select provider and tool')
@@ -2187,6 +2213,39 @@ export function App() {
     )
   }, [healthInfo])
 
+  const providerHealthStatus = useMemo<ProviderHealthStatus>(() => {
+    if (!healthServices.length) {
+      return {
+        ollama: 'unknown',
+        anthropic: 'unknown',
+        openai: 'unknown',
+        github: 'unknown'
+      }
+    }
+
+    const statusMap = new Map<string, string>()
+    for (const svc of healthServices) {
+      statusMap.set(svc.name, (svc.status || 'unknown').toLowerCase())
+    }
+
+    const resolveStatus = (...names: string[]): ProviderHealthStatus[LlmProvider] => {
+      if (names.some((name) => statusMap.get(name) === 'ok')) {
+        return 'ok'
+      }
+      if (names.some((name) => statusMap.has(name))) {
+        return 'error'
+      }
+      return 'unknown'
+    }
+
+    return {
+      ollama: resolveStatus('ollama', 'ollamaGpu'),
+      anthropic: resolveStatus('anthropic'),
+      openai: resolveStatus('openai'),
+      github: resolveStatus('githubModel')
+    }
+  }, [healthServices])
+
   const voiceFeatureEnabled = Boolean(healthInfo?.voiceFeatureEnabled)
 
   const openvoiceCpuHealthy = useMemo(
@@ -2242,12 +2301,68 @@ export function App() {
     fetchMcpProviders()
   }, [fetchHealth, fetchMcpProviders])
 
+  const fetchCarwatchSnapshot = useCallback(async () => {
+    setCarwatchLoading(true)
+    try {
+      const res = await fetch(CARWATCH_SNAPSHOT_URL)
+      if (res.status === 404) {
+        setCarwatchSnapshot(null)
+        setCarwatchEvents([])
+        setCarwatchError('No snapshot available yet')
+        return
+      }
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '')
+        throw new Error(detail || 'carwatch_fetch_failed')
+      }
+      const data = await res.json().catch(() => null)
+      if (data?.snapshot) {
+        setCarwatchSnapshot(data.snapshot as CarwatchSnapshot)
+        setCarwatchEvents(Array.isArray(data.snapshot.events) ? data.snapshot.events : [])
+        setCarwatchError(null)
+      } else {
+        setCarwatchSnapshot(null)
+        setCarwatchEvents([])
+        setCarwatchError('Snapshot missing in response')
+      }
+    } catch (err: any) {
+      setCarwatchError(err?.message || 'Unable to load CarWatch snapshot')
+    } finally {
+      setCarwatchLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchCarwatchSnapshot().catch(() => null)
+    const interval = window.setInterval(() => {
+      fetchCarwatchSnapshot().catch(() => null)
+    }, 30000)
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [fetchCarwatchSnapshot])
+
+  const handleCarwatchRefresh = useCallback(() => {
+    fetchCarwatchSnapshot().catch(() => null)
+  }, [fetchCarwatchSnapshot])
+
   useEffect(() => {
     if (!providersInitialized) return
     if (!llmProviderOptions.some((option) => option.value === llmProvider)) {
       return
     }
   }, [llmProviderOptions, llmProvider, providersInitialized])
+
+  useEffect(() => {
+    if (!providersInitialized) return
+    if (!llmProviderOptions.length) return
+    const currentStatus = providerHealthStatus[llmProvider] || 'unknown'
+    if (currentStatus === 'ok') return
+    const fallbackOption = llmProviderOptions.find((option) => providerHealthStatus[option.value] === 'ok')
+    if (fallbackOption && fallbackOption.value !== llmProvider) {
+      setLlmProvider(fallbackOption.value)
+    }
+  }, [providersInitialized, llmProviderOptions, llmProvider, providerHealthStatus])
 
   useEffect(() => {
     writeToStorage(STORAGE_KEYS.llmProvider, llmProvider)
@@ -4486,13 +4601,24 @@ export function App() {
     if (match) return match.label
     return (activeLang || '—').toUpperCase()
   }, [bankOcrResult, bankOcrLang])
+  const carwatchDetections = carwatchSnapshot?.detections ?? []
   const carwatchVehicleCount = useMemo(() => {
-    return carwatchSnapshot.detections.reduce((sum, det) => sum + det.count, 0)
-  }, [carwatchSnapshot])
+    if (!carwatchDetections.length) return 0
+    return carwatchDetections.reduce((sum: number, det: CarwatchDetectionSummary) => sum + det.count, 0)
+  }, [carwatchDetections])
   const carwatchPrimaryDetection = useMemo(() => {
-    return [...carwatchSnapshot.detections].sort((a, b) => b.count - a.count || b.confidence - a.confidence)[0] || null
-  }, [carwatchSnapshot])
-  const carwatchLastUpdatedLabel = useMemo(() => formatMeetingTimestamp(carwatchSnapshot.timestamp), [carwatchSnapshot.timestamp])
+    if (!carwatchDetections.length) return null
+    return (
+      [...carwatchDetections].sort(
+        (a: CarwatchDetectionSummary, b: CarwatchDetectionSummary) => b.count - a.count || b.confidence - a.confidence
+      )[0] || null
+    )
+  }, [carwatchDetections])
+  const carwatchLastUpdatedLabel = useMemo(() => {
+    if (!carwatchSnapshot?.timestamp) return '—'
+    return formatMeetingTimestamp(carwatchSnapshot.timestamp)
+  }, [carwatchSnapshot?.timestamp])
+  const hasCarwatchSnapshot = Boolean(carwatchSnapshot)
 
   const llmOptions = useMemo(() => {
     const unique = new Set<string>(builtInLlmModels)
@@ -4623,7 +4749,7 @@ export function App() {
 
   const handleMenuAction = useCallback(
     (action: QuickMenuAction) => {
-      setAppMenuOpen(false)
+      setQuickMenuAnchorEl(null)
 
       if (action === 'popup') {
         setPopupVisible(true)
@@ -4715,177 +4841,125 @@ export function App() {
     )
   }
 
+  const quickMenuOpen = Boolean(quickMenuAnchorEl)
+  const handleQuickMenuToggle = (event: React.MouseEvent<HTMLButtonElement>) => {
+    setQuickMenuAnchorEl(event.currentTarget)
+  }
+  const handleQuickMenuClose = () => {
+    setQuickMenuAnchorEl(null)
+  }
+  const handlePanelChange = (_event: React.SyntheticEvent, newValue: PanelTabValue) => {
+    setActivePanel(newValue)
+  }
+
+  const renderStatusChip = () => {
+    const chipColor: ChipProps['color'] = health === 'ok' ? 'success' : health === 'error' ? 'error' : 'warning'
+    return (
+      <Chip
+        icon={<SensorsIcon fontSize="small" />}
+        color={chipColor}
+        label={statusLabel}
+        onClick={() => setStatusExpanded((prev) => !prev)}
+        sx={{ fontWeight: 600 }}
+        aria-label="Show stack status"
+      />
+    )
+  }
+
   return (
     <div className="app-root">
-      <header className="app-header">
-        <div className="title">Chaba – Voice Chat</div>
-        <div className="header-actions">
-          <div className="app-menu" ref={appMenuRef}>
-            <button
-              type="button"
-              className={`menu-trigger ${appMenuOpen ? 'active' : ''}`}
-              onClick={() => setAppMenuOpen((prev) => !prev)}
-              aria-haspopup="true"
-              aria-expanded={appMenuOpen}
+      <AppBar position="static" color="transparent" elevation={0} sx={{ px: 2, py: 1 }}>
+        <Toolbar disableGutters sx={{ justifyContent: 'space-between', gap: 2 }}>
+          <Typography variant="h6" component="div">
+            Chaba – Voice Chat
+          </Typography>
+          <Stack direction="row" spacing={2} alignItems="center">
+            {renderStatusChip()}
+            <Box sx={{ display: 'flex', flexDirection: 'column', textAlign: 'right' }}>
+              <Typography variant="caption" color="text.secondary">
+                LLM: {llmModel}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                STT: {whisperModel}
+              </Typography>
+            </Box>
+            <IconButton
+              color="inherit"
               aria-label="Open quick actions menu"
-              ref={appMenuButtonRef}
+              onClick={handleQuickMenuToggle}
+              size="small"
             >
-              <span className="menu-trigger-dot" />
-              <span className="menu-trigger-dot" />
-              <span className="menu-trigger-dot" />
-            </button>
-            {appMenuOpen ? (
-              <div className="menu-dropdown" role="menu" aria-label="Quick actions">
-                <button type="button" role="menuitem" onClick={() => handleMenuAction('popup')}>
-                  Quick tips panel
-                  <span className="menu-item-subtitle">Cheat sheet with usage ideas</span>
-                </button>
-                <button type="button" role="menuitem" onClick={() => handleMenuAction('status')}>
-                  View service status
-                  <span className="menu-item-subtitle">Open detailed health dialog</span>
-                </button>
-                <button type="button" role="menuitem" onClick={() => handleMenuAction('reset')}>
-                  Reset conversation
-                  <span className="menu-item-subtitle">Clear local history & session</span>
-                </button>
-              </div>
-            ) : null}
-          </div>
-          <div className="status-wrapper" ref={statusWrapperRef}>
-          <button
-            type="button"
-            className={`status-pill status-${health}`}
-            onClick={() => setStatusExpanded((prev) => !prev)}
-            aria-haspopup="true"
-            aria-expanded={statusExpanded}
-            aria-label="Toggle service status details"
-          >
-            <span className="status-pill-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" role="presentation" focusable="false">
-                <path d="M4.5 14.5c1.5-1.7 3.6-2.8 6-2.8s4.5 1.1 6 2.8" />
-                <path d="M2 11c2.1-2.5 5.2-4 8.5-4s6.4 1.5 8.5 4" />
-                <circle cx="12" cy="18" r="1.6" />
-              </svg>
-            </span>
-            <span className="dot" /> {statusLabel}
-          </button>
-          <div className="model-info" aria-label="Model configuration">
-            LLM: {llmModel} | STT: {whisperModel}
-          </div>
-          {statusExpanded ? (
-            <div className="status-details" role="dialog" aria-label="Service status and model details">
-              <div className="status-details-header">Service health</div>
-              <div className="status-details-content">
-                {groupedServiceStatuses.length ? (
-                  <div className="status-details-groups">
-                    {groupedServiceStatuses.map((group) => (
-                      <section className="status-group" key={group.key} aria-label={group.meta.title}>
-                        <header className="status-group-heading">
-                          <span className="status-group-icon" aria-hidden="true">{group.meta.icon}</span>
-                          <div className="status-group-text">
-                            <div className="status-group-title">{group.meta.title}</div>
-                            <div className="status-group-subtitle">{group.meta.subtitle}</div>
-                          </div>
-                        </header>
-                        <div className="status-group-list">
-                          {group.services.map((svc) => {
-                            const pillState = svc.status === 'ok' ? 'ok' : svc.status === 'unconfigured' ? 'unknown' : 'error'
-                            const detailText = formatStatusDetail(svc.detail)
-                            const typeClass = `status-type-${svc.type.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
-                            return (
-                              <div className="status-service-card" key={svc.name}>
-                                <div className="status-service-header">
-                                  <span className="status-service-label">{svc.label}</span>
-                                  <span className={`status-type-pill ${typeClass}`}>{svc.type}</span>
-                                </div>
-                                <div className="status-service-body">
-                                  <span className={`status-indicator status-${pillState}`}>
-                                    <span className="dot" /> {svc.status}
-                                  </span>
-                                  {detailText ? <span className="status-details-meta">{detailText}</span> : null}
-                                </div>
-                              </div>
-                            )
-                          })}
-                        </div>
-                      </section>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="status-empty">No service data yet.</div>
-                )}
-                <div className="status-model-info-section">
-                  <div className="status-details-header">Model info</div>
-                  <div className="status-model-info-grid">
-                    <div className="status-model-info-item">
-                      <span className="label">LLM</span>
-                      <span className="value">{llmModel}</span>
-                    </div>
-                    <div className="status-model-info-item">
-                      <span className="label">STT</span>
-                      <span className="value">{whisperModel}</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          ) : null}
-          </div>
-        </div>
-      </header>
+              <MoreVertIcon />
+            </IconButton>
+            <Menu
+              anchorEl={quickMenuAnchorEl}
+              open={quickMenuOpen}
+              onClose={handleQuickMenuClose}
+              anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+              transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+            >
+              <MenuItem
+                onClick={() => {
+                  handleQuickMenuClose()
+                  handleMenuAction('popup')
+                }}
+              >
+                <Stack spacing={0.5}>
+                  <Typography variant="body2">Quick tips panel</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Cheat sheet with usage ideas
+                  </Typography>
+                </Stack>
+              </MenuItem>
+              <MenuItem
+                onClick={() => {
+                  handleQuickMenuClose()
+                  handleMenuAction('status')
+                }}
+              >
+                <Stack spacing={0.5}>
+                  <Typography variant="body2">View service status</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Open detailed health dialog
+                  </Typography>
+                </Stack>
+              </MenuItem>
+              <MenuItem
+                onClick={() => {
+                  handleQuickMenuClose()
+                  handleMenuAction('reset')
+                }}
+              >
+                <Stack spacing={0.5}>
+                  <Typography variant="body2">Reset conversation</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Clear local history & session
+                  </Typography>
+                </Stack>
+              </MenuItem>
+            </Menu>
+          </Stack>
+        </Toolbar>
+      </AppBar>
 
       <main className="app-main">
-        <div className="panel-tabs">
-          <button
-            type="button"
-            className={`panel-tab ${activePanel === 'chat' ? 'active' : ''}`}
-            onClick={() => setActivePanel('chat')}
-          >
-            Chat
-          </button>
-          <button
-            type="button"
-            className={`panel-tab ${activePanel === 'openvoice' ? 'active' : ''}`}
-            onClick={() => setActivePanel('openvoice')}
-          >
-            OpenVoice
-          </button>
-          <button
-            type="button"
-            className={`panel-tab ${activePanel === 'image-mcp' ? 'active' : ''}`}
-            onClick={() => setActivePanel('image-mcp')}
-          >
-            Image lab
-          </button>
-          <button
-            type="button"
-            className={`panel-tab ${activePanel === 'yolo-detection' ? 'active' : ''}`}
-            onClick={() => setActivePanel('yolo-detection')}
-          >
-            YOLO detection
-          </button>
-          <button
-            type="button"
-            className={`panel-tab ${activePanel === 'carwatch' ? 'active' : ''}`}
-            onClick={() => setActivePanel('carwatch')}
-          >
-            CarWatch
-          </button>
-          <button
-            type="button"
-            className={`panel-tab ${activePanel === 'bank-slip' ? 'active' : ''}`}
-            onClick={() => setActivePanel('bank-slip')}
-          >
-            Bank slip
-          </button>
-          <button
-            type="button"
-            className={`panel-tab ${activePanel === 'meeting' ? 'active' : ''}`}
-            onClick={() => setActivePanel('meeting')}
-          >
-            Meeting
-          </button>
-        </div>
+        <Tabs
+          value={activePanel}
+          onChange={handlePanelChange}
+          variant="scrollable"
+          scrollButtons="auto"
+          allowScrollButtonsMobile
+          aria-label="Panel navigation"
+        >
+          {PANEL_TABS.map((tab) => (
+            <Tab
+              key={tab.value}
+              value={tab.value}
+              label={tab.label}
+              sx={{ textTransform: 'none', fontWeight: 600, minHeight: 0 }}
+            />
+          ))}
+        </Tabs>
 
         <div className="app-workspace">
           <div className="panel-content">
@@ -5089,11 +5163,14 @@ export function App() {
                     onChange={(e) => setLlmProvider(e.target.value as LlmProvider)}
                     className="chip-select"
                   >
-                    {llmProviderOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
+                    {llmProviderOptions.map((option) => {
+                      const optionStatus = providerHealthStatus[option.value] || 'unknown'
+                      return (
+                        <option key={option.value} value={option.value} disabled={optionStatus === 'error'}>
+                          {option.label}
+                        </option>
+                      )
+                    })}
                   </select>
                 </label>
                 <label className="control-chip">
@@ -5465,98 +5542,133 @@ export function App() {
                   <h2>CarWatch live monitor</h2>
                   <p>Preview the iOS experience before wiring up the real stream.</p>
                 </div>
-                <div className={`vision-confidence carwatch-status carwatch-status-${carwatchSnapshot.connection}`}>
+                <div className={`vision-confidence carwatch-status carwatch-status-${carwatchSnapshot?.connection || 'offline'}`}>
                   <label>
-                    Status: <strong>{carwatchSnapshot.connection === 'online' ? 'Streaming' : carwatchSnapshot.connection}</strong>
+                    Status:{' '}
+                    <strong>
+                      {hasCarwatchSnapshot
+                        ? carwatchSnapshot!.connection === 'online'
+                          ? 'Streaming'
+                          : carwatchSnapshot!.connection
+                        : carwatchError || 'No data'}
+                    </strong>
                   </label>
-                  <span className="carwatch-meta">Updated {carwatchLastUpdatedLabel}</span>
+                  <span className="carwatch-meta">
+                    {hasCarwatchSnapshot ? `Updated ${carwatchLastUpdatedLabel}` : 'Waiting for snapshot'}
+                  </span>
                 </div>
+                <button
+                  type="button"
+                  className="chip-refresh"
+                  onClick={handleCarwatchRefresh}
+                  disabled={carwatchLoading}
+                >
+                  {carwatchLoading ? 'Refreshing…' : '↺ Refresh'}
+                </button>
               </div>
 
-              <div className="carwatch-body">
-                <div className="vision-image" aria-label="Live camera preview">
-                  <img src={carwatchSnapshot.thumbUrl} alt="CarWatch live preview" />
-                  <div className="vision-overlay">
-                    <div className="carwatch-overlay-chip">
-                      {carwatchSnapshot.deviceName} · {carwatchSnapshot.fps} FPS · {carwatchSnapshot.latencyMs} ms
-                    </div>
-                    <div className="carwatch-overlay-chip">
-                      Battery {carwatchSnapshot.batteryPercent}% · {carwatchSnapshot.temperatureC}°C
-                    </div>
-                  </div>
-                </div>
-
-                <div className="summary-metrics carwatch-metrics">
-                  <div className="summary-metric">
-                    <span className="summary-label">Vehicles</span>
-                    <span className="summary-value">{carwatchVehicleCount}</span>
-                    <span className="summary-sub">
-                      {carwatchPrimaryDetection
-                        ? `${carwatchPrimaryDetection.count}× ${carwatchPrimaryDetection.label}`
-                        : 'No detections'}
-                    </span>
-                  </div>
-                  <div className="summary-metric">
-                    <span className="summary-label">Top confidence</span>
-                    <span className="summary-value">
-                      {carwatchPrimaryDetection ? `${Math.round(carwatchPrimaryDetection.confidence * 100)}%` : '—'}
-                    </span>
-                    <span className="summary-sub">Model: YOLO CoreML</span>
-                  </div>
-                  <div className="summary-metric">
-                    <span className="summary-label">Link</span>
-                    <a
-                      className="summary-value link"
-                      href={carwatchSnapshot.streamUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Open ngrok stream ↗
-                    </a>
-                    <span className="summary-sub">Share with reviewers</span>
-                  </div>
-                </div>
-
-                <div className="carwatch-details">
-                  <div className="carwatch-detections">
-                    <h3>Detections</h3>
-                    {carwatchSnapshot.detections.length ? (
-                      <ul className="detection-list">
-                        {carwatchSnapshot.detections.map((det) => (
-                          <li key={det.label} className="detection-item">
-                            <div className="det-main">
-                              <strong>{det.label}</strong>
-                              <span>{det.count} objects</span>
-                            </div>
-                            <div className="det-bbox">Confidence {Math.round(det.confidence * 100)}%</div>
-                          </li>
-                        ))}
-                      </ul>
+              {hasCarwatchSnapshot ? (
+                <div className="carwatch-body">
+                  <div className="vision-image" aria-label="Live camera preview">
+                    {carwatchSnapshot?.thumbUrl ? (
+                      <img src={carwatchSnapshot.thumbUrl} alt="CarWatch live preview" />
                     ) : (
-                      <p className="vision-preview-hint">Waiting for first frame…</p>
+                      <div className="empty-state">Snapshot image unavailable.</div>
                     )}
+                    <div className="vision-overlay">
+                      <div className="carwatch-overlay-chip">
+                        {carwatchSnapshot?.deviceName || 'CarWatch device'} · {carwatchSnapshot?.fps ?? '—'} FPS ·{' '}
+                        {carwatchSnapshot?.latencyMs ?? '—'} ms
+                      </div>
+                      <div className="carwatch-overlay-chip">
+                        Battery {carwatchSnapshot?.batteryPercent ?? '—'}% · {carwatchSnapshot?.temperatureC ?? '—'}°C
+                      </div>
+                    </div>
                   </div>
 
-                  <div className="carwatch-timeline" aria-label="Recent events">
-                    <h3>Recent events</h3>
-                    {carwatchEvents.length ? (
-                      <ul className="timeline-list">
-                        {carwatchEvents.map((event) => (
-                          <li key={event.id} className="timeline-item">
-                            <div className="timeline-head">
-                              <strong>{event.label}</strong>
-                              <span>{formatMeetingTimestamp(event.timestamp)}</span>
-                            </div>
-                            <p>{event.detail}</p>
-                          </li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <p className="vision-preview-hint">No events logged yet.</p>
-                    )}
+                  <div className="summary-metrics carwatch-metrics">
+                    <div className="summary-metric">
+                      <span className="summary-label">Vehicles</span>
+                      <span className="summary-value">{carwatchVehicleCount}</span>
+                      <span className="summary-sub">
+                        {carwatchPrimaryDetection
+                          ? `${carwatchPrimaryDetection.count}× ${carwatchPrimaryDetection.label}`
+                          : 'No detections'}
+                      </span>
+                    </div>
+                    <div className="summary-metric">
+                      <span className="summary-label">Top confidence</span>
+                      <span className="summary-value">
+                        {carwatchPrimaryDetection ? `${Math.round(carwatchPrimaryDetection.confidence * 100)}%` : '—'}
+                      </span>
+                      <span className="summary-sub">Model: YOLO CoreML</span>
+                    </div>
+                    <div className="summary-metric">
+                      <span className="summary-label">Link</span>
+                      {carwatchSnapshot?.streamUrl ? (
+                        <a className="summary-value link" href={carwatchSnapshot.streamUrl} target="_blank" rel="noreferrer">
+                          Open stream ↗
+                        </a>
+                      ) : (
+                        <span className="summary-value">—</span>
+                      )}
+                      <span className="summary-sub">Latency: {carwatchSnapshot?.latencyMs ?? '—'} ms</span>
+                    </div>
+                  </div>
+
+                  <div className="carwatch-details">
+                    <div className="carwatch-detections">
+                      <h3>Detections</h3>
+                      {carwatchDetections.length ? (
+                        <ul className="detection-list">
+                          {carwatchDetections.map((det) => (
+                            <li key={det.label} className="detection-item">
+                              <div className="det-main">
+                                <strong>{det.label}</strong>
+                                <span>{det.count} vehicles</span>
+                              </div>
+                              <span className="det-confidence">{Math.round(det.confidence * 100)}% confidence</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="empty-state">No detections yet.</p>
+                      )}
+                    </div>
+
+                    <div className="carwatch-events">
+                      <h3>Recent events</h3>
+                      {carwatchEvents.length ? (
+                        <ul className="event-list">
+                          {carwatchEvents.map((event) => (
+                            <li key={event.id} className="event-item">
+                              <div className="event-main">
+                                <strong>{event.label}</strong>
+                                <span>{formatMeetingTimestamp(event.timestamp)}</span>
+                              </div>
+                              <p>{event.detail}</p>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="empty-state">No events yet.</p>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
+              ) : (
+                <div className="empty-state carwatch-empty">
+                  <p>{carwatchError || 'Waiting for the first CarWatch snapshot.'}</p>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    onClick={handleCarwatchRefresh}
+                    disabled={carwatchLoading}
+                  >
+                    {carwatchLoading ? 'Refreshing…' : '↺ Try again'}
+                  </button>
+                </div>
+              )}
             </section>
           </div>
         ) : activePanel === 'meeting' ? (
@@ -6750,6 +6862,91 @@ export function App() {
         </div>
       </main>
 
+      {statusExpanded ? (
+        <div
+          className="floating-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Service status details"
+          onClick={() => setStatusExpanded(false)}
+        >
+          <div className="floating-card status-popup" onClick={(e) => e.stopPropagation()}>
+            <header className="status-popup-header">
+              <div>
+                <p className="status-popup-eyebrow">Stack health</p>
+                <h3>{statusLabel}</h3>
+              </div>
+              <button
+                type="button"
+                className="icon-button close-button"
+                onClick={() => setStatusExpanded(false)}
+                aria-label="Close status panel"
+              >
+                ✕
+              </button>
+            </header>
+            <div className="status-popup-body">
+              <div className="status-details" role="document" aria-label="Service status and model details">
+                <div className="status-details-header">Service health</div>
+                <div className="status-details-content">
+                  {groupedServiceStatuses.length ? (
+                    <div className="status-details-groups">
+                      {groupedServiceStatuses.map((group) => (
+                        <section className="status-group" key={group.key} aria-label={group.meta.title}>
+                          <header className="status-group-heading">
+                            <span className="status-group-icon" aria-hidden="true">{group.meta.icon}</span>
+                            <div className="status-group-text">
+                              <div className="status-group-title">{group.meta.title}</div>
+                              <div className="status-group-subtitle">{group.meta.subtitle}</div>
+                            </div>
+                          </header>
+                          <div className="status-group-list">
+                            {group.services.map((svc) => {
+                              const pillState = svc.status === 'ok' ? 'ok' : svc.status === 'unconfigured' ? 'unknown' : 'error'
+                              const detailText = formatStatusDetail(svc.detail)
+                              const typeClass = `status-type-${svc.type.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+                              return (
+                                <div className="status-service-card" key={svc.name}>
+                                  <div className="status-service-header">
+                                    <span className="status-service-label">{svc.label}</span>
+                                    <span className={`status-type-pill ${typeClass}`}>{svc.type}</span>
+                                  </div>
+                                  <div className="status-service-body">
+                                    <span className={`status-indicator status-${pillState}`}>
+                                      <span className="dot" /> {svc.status}
+                                    </span>
+                                    {detailText ? <span className="status-details-meta">{detailText}</span> : null}
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </section>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="status-empty">No service data yet.</div>
+                  )}
+                  <div className="status-model-info-section">
+                    <div className="status-details-header">Model info</div>
+                    <div className="status-model-info-grid">
+                      <div className="status-model-info-item">
+                        <span className="label">LLM</span>
+                        <span className="value">{llmModel}</span>
+                      </div>
+                      <div className="status-model-info-item">
+                        <span className="label">STT</span>
+                        <span className="value">{whisperModel}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {attachmentPreview && (
         <div
           className="attachment-preview-overlay"
@@ -6789,8 +6986,14 @@ export function App() {
         </div>
       )}
       {mcpPanelOpen && activeMcpMessage ? (
-        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="MCP tools panel">
-          <div className="modal-card mcp-panel">
+        <div
+          className="floating-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="MCP tools panel"
+          onClick={closeMcpPanel}
+        >
+          <div className="floating-card mcp-panel" onClick={(e) => e.stopPropagation()}>
             <header className="modal-header">
               <div>
                 <div className="modal-title">MCP tools</div>

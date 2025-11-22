@@ -2,12 +2,19 @@ version: "2"
 # Shared ngrok agent exposes multiple internal services.
 # Edit/add tunnels here, then restart the ngrok container.
 tunnels:
-  server:
+  stack-api:
     proto: http
     addr: server:3001
+    metadata: "Stack API + GPU queue"
     # Uncomment to pin a hostname or domain you own:
     # hostname: your-subdomain.ngrok.app
-  mcp-debug:
+  mcp-debug-shell:
     proto: http
     addr: mcp-debug:7681
+    metadata: "mcp-debug ttyd"
     # For ttyd auth, update MCP_DEBUG_TTYD_EXTRA_ARGS or wrap via reverse proxy.
+  mcp-debug-proxy:
+    proto: http
+    addr: mcp-debug-proxy:8080
+    metadata: "mcp-debug nginx proxy"
+    # Use this tunnel if browser extensions block direct ttyd access.

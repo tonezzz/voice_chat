@@ -1,0 +1,128 @@
+#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const { chromium } = require('playwright');
+
+const [, , command, ...rawArgs] = process.argv;
+const logDir = process.env.LOG_DIR || '/workspace/logs';
+fs.mkdirSync(logDir, { recursive: true });
+
+const headless = (process.env.BROWSER_HEADLESS || 'true').toLowerCase() !== 'false';
+const timeout = Number(process.env.BROWSER_TIMEOUT || 45000);
+const waitUntil = process.env.BROWSER_WAIT_UNTIL || 'networkidle';
+const viewportRaw = (process.env.BROWSER_VIEWPORT || '1280x720').split('x');
+const viewport = {
+  width: Number.parseInt(viewportRaw[0], 10) || 1280,
+  height: Number.parseInt(viewportRaw[1], 10) || 720,
+};
+
+function usage() {
+  console.log(`Usage:
+  mcp-browser screenshot <url> [outputPath]
+  mcp-browser html <url>
+  mcp-browser eval <url> <js snippet>
+  mcp-browser pdf <url> [outputPath]
+
+Environment overrides:
+  LOG_DIR (default ${logDir})
+  BROWSER_HEADLESS (default true)
+  BROWSER_TIMEOUT (default 45000)
+  BROWSER_VIEWPORT (default 1280x720)
+  BROWSER_WAIT_UNTIL (default networkidle)
+`);
+  process.exit(1);
+}
+
+if (!command || command === '--help' || command === '-h') {
+  usage();
+}
+
+function defaultOutput(ext) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return path.join(logDir, `browser-${stamp}.${ext}`);
+}
+
+async function withPage(fn) {
+  const browser = await chromium.launch({ headless });
+  const context = await browser.newContext({ viewport });
+  const page = await context.newPage();
+  page.setDefaultTimeout(timeout);
+  try {
+    await fn(page);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function goto(page, url) {
+  if (!url) {
+    throw new Error('URL is required');
+  }
+  await page.goto(url, { waitUntil, timeout });
+}
+
+async function handleScreenshot(args) {
+  const [url, outArg] = args;
+  const outPath = outArg || defaultOutput('png');
+  await withPage(async (page) => {
+    await goto(page, url);
+    await page.screenshot({ path: outPath, fullPage: true });
+    console.log(`[mcp-browser] Screenshot saved to ${outPath}`);
+  });
+}
+
+async function handleHtml(args) {
+  const [url] = args;
+  await withPage(async (page) => {
+    await goto(page, url);
+    const html = await page.content();
+    process.stdout.write(html);
+  });
+}
+
+async function handleEval(args) {
+  const [url, ...codeParts] = args;
+  const script = codeParts.join(' ');
+  if (!script) {
+    throw new Error('Provide a JavaScript snippet to evaluate');
+  }
+  await withPage(async (page) => {
+    await goto(page, url);
+    const result = await page.evaluate(new Function(script));
+    console.log(JSON.stringify(result, null, 2));
+  });
+}
+
+async function handlePdf(args) {
+  const [url, outArg] = args;
+  const outPath = outArg || defaultOutput('pdf');
+  await withPage(async (page) => {
+    await goto(page, url);
+    await page.pdf({ path: outPath, format: 'Letter' });
+    console.log(`[mcp-browser] PDF saved to ${outPath}`);
+  });
+}
+
+async function main() {
+  switch (command) {
+    case 'screenshot':
+      return handleScreenshot(rawArgs);
+    case 'html':
+      return handleHtml(rawArgs);
+    case 'eval':
+      return handleEval(rawArgs);
+    case 'pdf':
+      return handlePdf(rawArgs);
+    default:
+      console.error(`[mcp-browser] Unknown command: ${command}`);
+      usage();
+  }
+}
+
+main().catch((err) => {
+  console.error(`[mcp-browser] ${err.message}`);
+  if (err.stack) {
+    console.error(err.stack);
+  }
+  process.exit(1);
+});

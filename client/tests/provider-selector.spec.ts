@@ -5,8 +5,10 @@ const HEALTH_URL = `${API_BASE}/health`
 const MCP_PROVIDERS_URL = `${API_BASE}/mcp/providers`
 const VOICE_CHAT_URL = `${API_BASE}/voice-chat`
 
-const waitForHealth = (page: Page) => page.waitForResponse((res) => res.url().includes('/health'))
-const waitForMcpProviders = (page: Page) => page.waitForResponse((res) => res.url().includes('/mcp/providers'))
+const gotoApp = async (page: Page) => {
+  await page.goto('/')
+  await page.waitForLoadState('networkidle')
+}
 
 const mockHealth = async (page: Page, services: { name: string; status: string }[]) => {
   await page.route('**/health*', async (route: Route) => {
@@ -44,12 +46,13 @@ test.describe('LLM provider selector', () => {
     ])
     await mockMcpProviders(page, [])
 
-    await Promise.all([waitForHealth(page), waitForMcpProviders(page), page.goto('/')])
+    await gotoApp(page)
     const select = page.getByTestId('llm-provider-select')
     await select.selectOption('openai')
     await expect(select).toHaveValue('openai')
 
-    await Promise.all([waitForHealth(page), page.reload()])
+    await page.reload()
+    await page.waitForLoadState('networkidle')
     const selectAfterReload = page.getByTestId('llm-provider-select')
     await expect(selectAfterReload).toHaveValue('openai')
   })
@@ -63,7 +66,7 @@ test.describe('LLM provider selector', () => {
     ])
     await mockMcpProviders(page, [])
 
-    await Promise.all([waitForHealth(page), page.goto('/')])
+    await gotoApp(page)
     const select = page.getByTestId('llm-provider-select')
     await expect(async () => {
       const value = await select.inputValue()
@@ -80,13 +83,23 @@ test.describe('LLM provider selector', () => {
     await mockHealth(page, [])
     await mockMcpProviders(page, [])
 
+    await page.route('**/voice-chat-stream', async (route) => {
+      interceptedPayload = JSON.parse(route.request().postData() || '{}')
+      const body =
+        'data: {"type":"delta","delta":"hi","full":"hi"}\n\n' +
+        'data: {"type":"complete","reply":"hi","session":{}}\n\n'
+      await route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        body
+      })
+    })
     await page.route(`${VOICE_CHAT_URL}`, async (route) => {
       interceptedPayload = JSON.parse(route.request().postData() || '{}')
       await route.fulfill({ status: 200, body: JSON.stringify({ reply: 'hi', session: {} }) })
     })
 
-    await page.goto('/')
-    await Promise.all([waitForHealth(page), waitForMcpProviders(page)])
+    await gotoApp(page)
     const select = page.getByTestId('llm-provider-select')
     await select.selectOption('anthropic')
     const input = page.getByPlaceholder('Type a message or use voice controls…')
@@ -104,8 +117,7 @@ test.describe('LLM provider selector', () => {
     ])
     await mockMcpProviders(page, [{ name: 'githubModel' }])
 
-    await page.goto('/')
-    await waitForHealth(page)
+    await gotoApp(page)
 
     const select = page.getByTestId('llm-provider-select')
     const githubOption = select.locator('option[value="github"]')

@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+API_BASE="${STACK_API_BASE:-http://server:3001}"
+ENDPOINT="${GPU_JOB_ENDPOINT:-/gpu-jobs}"
+TOOL_NAME="${GPU_JOB_TOOL:-ollamaChat}"
+DEFAULT_MODEL="${GPU_JOB_MODEL:-llama3:8b}"
+
+usage() {
+  cat <<USAGE
+Usage: ${0##*/} [options] [prompt] [model]
+
+Options:
+  -t, --tool NAME             Tool name (default: env GPU_JOB_TOOL or ollamaChat)
+  -m, --model NAME            Model override (ollamaChat only)
+  -p, --prompt TEXT           Prompt text (fallbacks to first positional)
+      --negative-prompt TEXT  Imagen negative prompt
+      --steps N               Imagen num inference steps
+      --width PX              Imagen width (multiple of 8)
+      --height PX             Imagen height (multiple of 8)
+      --seed N                Imagen seed
+      --guidance VALUE        Imagen guidance scale
+      --payload-file PATH     Use raw JSON payload from file
+      --raw-payload JSON      Inline JSON payload
+  -h, --help                  Show this help
+
+Environment overrides:
+  STACK_API_BASE, GPU_JOB_ENDPOINT, GPU_JOB_TOOL, GPU_JOB_MODEL
+
+Examples:
+  ${0##*/} --prompt "Summarize the standup"
+  ${0##*/} --tool imagenGenerate -p "Neon city" --steps 30 --width 768 --height 512
+USAGE
+}
+
+PROMPT=""
+MODEL=""
+PAYLOAD_FILE=""
+RAW_PAYLOAD=""
+NEGATIVE_PROMPT=""
+GUIDANCE_SCALE=""
+STEPS=""
+WIDTH=""
+HEIGHT=""
+SEED=""
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|--tool)
+      TOOL_NAME="$2"
+      shift 2
+      ;;
+    -m|--model)
+      MODEL="$2"
+      shift 2
+      ;;
+    -p|--prompt)
+      PROMPT="$2"
+      shift 2
+      ;;
+    --negative-prompt)
+      NEGATIVE_PROMPT="$2"
+      shift 2
+      ;;
+    --steps)
+      STEPS="$2"
+      shift 2
+      ;;
+    --width)
+      WIDTH="$2"
+      shift 2
+      ;;
+    --height)
+      HEIGHT="$2"
+      shift 2
+      ;;
+    --seed)
+      SEED="$2"
+      shift 2
+      ;;
+    --guidance)
+      GUIDANCE_SCALE="$2"
+      shift 2
+      ;;
+    --payload-file)
+      PAYLOAD_FILE="$2"
+      shift 2
+      ;;
+    --raw-payload)
+      RAW_PAYLOAD="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+  if [[ -z "$PROMPT" ]]; then
+    PROMPT="${POSITIONAL[0]}"
+    POSITIONAL=(${POSITIONAL[@]:1})
+  fi
+fi
+if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+  if [[ -z "$MODEL" ]]; then
+    MODEL="${POSITIONAL[0]}"
+    POSITIONAL=(${POSITIONAL[@]:1})
+  fi
+fi
+
+PROMPT=${PROMPT:-"Test job from mcp-debug"}
+MODEL=${MODEL:-"$DEFAULT_MODEL"}
+
+queue_url="${API_BASE%/}${ENDPOINT}"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required inside mcp-debug (should already be installed)" >&2
+  exit 1
+fi
+
+build_payload() {
+  if [[ -n "$PAYLOAD_FILE" ]]; then
+    cat "$PAYLOAD_FILE"
+    return
+  fi
+  if [[ -n "$RAW_PAYLOAD" ]]; then
+    printf '%s' "$RAW_PAYLOAD"
+    return
+  fi
+
+  if [[ "$TOOL_NAME" == "imagenGenerate" ]]; then
+    if [[ -z "$PROMPT" ]]; then
+      echo "imagenGenerate requires --prompt" >&2
+      exit 1
+    fi
+    local jq_steps jq_width jq_height jq_seed jq_guidance
+    jq_steps=${STEPS:-null}
+    jq_width=${WIDTH:-null}
+    jq_height=${HEIGHT:-null}
+    jq_seed=${SEED:-null}
+    jq_guidance=${GUIDANCE_SCALE:-null}
+    jq -nc \
+      --arg tool "$TOOL_NAME" \
+      --arg prompt "$PROMPT" \
+      --arg neg "$NEGATIVE_PROMPT" \
+      --argjson steps "$jq_steps" \
+      --argjson width "$jq_width" \
+      --argjson height "$jq_height" \
+      --argjson seed "$jq_seed" \
+      --argjson guidance "$jq_guidance" \
+      '{
+        tool: $tool,
+        payload: (
+          { prompt: $prompt } +
+          (if ($neg | length) > 0 then { negative_prompt: $neg } else {} end) +
+          (if $steps != null then { num_inference_steps: $steps } else {} end) +
+          (if $width != null then { width: $width } else {} end) +
+          (if $height != null then { height: $height } else {} end) +
+          (if $seed != null then { seed: $seed } else {} end) +
+          (if $guidance != null then { guidance_scale: $guidance } else {} end)
+        )
+      }'
+    return
+  fi
+
+  jq -nc --arg tool "$TOOL_NAME" --arg model "$MODEL" --arg prompt "$PROMPT" '
+    {
+      tool: $tool,
+      payload: {
+        model: $model,
+        prompt: $prompt
+      }
+    }
+  '
+}
+
+payload=$(build_payload)
+
+echo "[mcp-gpu-job] POST $queue_url"
+response=$(curl -fsS -X POST "$queue_url" \
+  -H "Content-Type: application/json" \
+  -d "$payload")
+
+echo "$response" | jq . || echo "$response"

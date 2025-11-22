@@ -634,6 +634,7 @@ const MCP0_BASE_URL = MCP0_URL ? MCP0_URL.replace(/\/$/, '') : '';
 const MCP0_TIMEOUT_MS = Number(process.env.MCP0_TIMEOUT_MS) || 25000;
 const GITHUB_MCP_URL = process.env.GITHUB_MCP_URL || 'https://mcp.github.com';
 const GITHUB_MCP_HEALTH_PATH = process.env.GITHUB_MCP_HEALTH_PATH || '/health';
+const CARWATCH_SNAPSHOT_TTL_MS = Number(process.env.CARWATCH_SNAPSHOT_TTL_MS) || 120000;
 const OCR_DEFAULT_LANG = process.env.OCR_LANG || 'eng';
 const RAW_LLM_PROVIDER = (process.env.LLM_PROVIDER || 'ollama').toLowerCase();
 const NORMALIZED_BASE_PROVIDER =
@@ -667,6 +668,50 @@ const parsedGithubTemp = Number(process.env.GITHUB_MODEL_TEMPERATURE);
 const GITHUB_MODEL_TEMPERATURE = Number.isFinite(parsedGithubTemp) ? parsedGithubTemp : 0.2;
 const GITHUB_MODEL_MAX_TOKENS = Number(process.env.GITHUB_MODEL_MAX_TOKENS) || 1024;
 const GITHUB_API_VERSION = process.env.GITHUB_API_VERSION || '2023-07-01';
+
+const GPU_WORKER_TOKEN = (process.env.GPU_WORKER_TOKEN || '').trim();
+const GPU_MAX_PENDING_JOBS = Number(process.env.GPU_MAX_PENDING_JOBS) || 100;
+const GPU_JOB_LEASE_SECONDS = Number(process.env.GPU_JOB_LEASE_SECONDS) || 900;
+
+const gpuJobQueue = [];
+const gpuJobStore = new Map();
+
+const now = () => Date.now();
+
+const cleanupExpiredJobs = () => {
+  const cutoff = now() - GPU_JOB_LEASE_SECONDS * 1000;
+  for (const job of gpuJobStore.values()) {
+    if (job.status === 'leased' && job.startedAt && job.startedAt < cutoff) {
+      job.status = 'queued';
+      job.workerId = null;
+      job.startedAt = null;
+      gpuJobQueue.push(job);
+    }
+  }
+};
+
+const enqueueJob = (job) => {
+  if (job.priority === 'high') {
+    gpuJobQueue.unshift(job);
+  } else {
+    gpuJobQueue.push(job);
+  }
+};
+
+const requireWorkerAuth = (req, res, next) => {
+  if (!GPU_WORKER_TOKEN) {
+    return res.status(503).json({ error: 'gpu_worker_api_disabled' });
+  }
+  const header = req.headers.authorization || '';
+  if (!header.toLowerCase().startsWith('bearer ')) {
+    return res.status(401).json({ error: 'missing_worker_token' });
+  }
+  const provided = header.split(' ', 2)[1].trim();
+  if (provided !== GPU_WORKER_TOKEN) {
+    return res.status(403).json({ error: 'invalid_worker_token' });
+  }
+  next();
+};
 
 const VOICE_FEATURE_ENABLED =
   (process.env.ENABLE_VOICE_FEATURE || process.env.VOICE_FEATURE_ENABLED || '').toLowerCase() === 'true';
@@ -720,6 +765,73 @@ const providerRequiresKey = (provider) => {
 };
 
 const normalizeBaseUrl = (url) => (url || '').replace(/\/$/, '');
+
+// ---------------------------------------------------------------------------
+// GPU job queue API
+// ---------------------------------------------------------------------------
+app.post('/gpu-jobs', (req, res) => {
+  const { tool, payload, priority } = req.body || {};
+  if (typeof tool !== 'string' || !tool.trim()) {
+    return res.status(400).json({ error: 'tool_required' });
+  }
+  if (gpuJobQueue.length >= GPU_MAX_PENDING_JOBS) {
+    return res.status(429).json({ error: 'gpu_queue_full' });
+  }
+  const job = {
+    id: crypto.randomUUID(),
+    tool: tool.trim(),
+    payload: payload ?? null,
+    priority: priority === 'high' ? 'high' : 'normal',
+    status: 'queued',
+    enqueuedAt: now(),
+    startedAt: null,
+    completedAt: null,
+    workerId: null,
+    attempts: 0
+  };
+  gpuJobStore.set(job.id, job);
+  enqueueJob(job);
+  return res.json({ job });
+});
+
+app.get('/gpu-jobs/next', requireWorkerAuth, (req, res) => {
+  cleanupExpiredJobs();
+  if (!gpuJobQueue.length) {
+    return res.status(204).end();
+  }
+  const job = gpuJobQueue.shift();
+  job.status = 'leased';
+  job.workerId =
+    typeof req.query.worker === 'string' && req.query.worker.trim() ? req.query.worker.trim() : 'gpu-worker';
+  job.attempts += 1;
+  job.startedAt = now();
+  return res.json({ job });
+});
+
+app.post('/gpu-jobs/:jobId/complete', requireWorkerAuth, (req, res) => {
+  const job = gpuJobStore.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'job_not_found' });
+  }
+  if (job.status !== 'leased') {
+    return res.status(400).json({ error: 'job_not_in_progress' });
+  }
+  const { status, result, detail } = req.body || {};
+  const normalized = status === 'error' ? 'failed' : 'completed';
+  job.status = normalized;
+  job.completedAt = now();
+  job.result = result ?? null;
+  job.detail = detail ?? null;
+  return res.json({ job });
+});
+
+app.get('/gpu-jobs/:jobId', (req, res) => {
+  const job = gpuJobStore.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'job_not_found' });
+  }
+  return res.json({ job });
+});
 
 const getDefaultModelForProvider = (provider) => {
   const normalized = normalizeProvider(provider);
@@ -1073,6 +1185,106 @@ const requestWithTimeout = (url, options = {}) => {
         reject(err);
       });
   });
+};
+
+const CARWATCH_ALLOWED_CONNECTIONS = new Set(['online', 'connecting', 'offline']);
+
+const carwatchStore = {
+  snapshot: null,
+  receivedAt: null
+};
+
+const clampBetween = (value, min, max, fallback = null) => {
+  const num = Number(value);
+  if (Number.isFinite(num)) {
+    if (typeof min === 'number' && num < min) {
+      return min;
+    }
+    if (typeof max === 'number' && num > max) {
+      return max;
+    }
+    return num;
+  }
+  return fallback;
+};
+
+const normalizeCarwatchDetections = (detections) => {
+  if (!Array.isArray(detections)) return [];
+  return detections
+    .map((det, idx) => {
+      const label = typeof det?.label === 'string' && det.label.trim() ? det.label.trim() : `Object ${idx + 1}`;
+      const count = clampBetween(det?.count, 0, Number.POSITIVE_INFINITY, 0) || 0;
+      const confidence = clampBetween(det?.confidence, 0, 1, 0) || 0;
+      return { label, count, confidence };
+    })
+    .filter((det) => det.count > 0 || det.confidence > 0);
+};
+
+const normalizeCarwatchEvents = (events) => {
+  if (!Array.isArray(events)) return [];
+  return events
+    .map((event, idx) => ({
+      id: typeof event?.id === 'string' && event.id.trim() ? event.id.trim() : `evt-${idx + 1}`,
+      label: typeof event?.label === 'string' && event.label.trim() ? event.label.trim() : 'Event',
+      detail: typeof event?.detail === 'string' ? event.detail.trim() : '',
+      timestamp:
+        typeof event?.timestamp === 'string' && event.timestamp.trim()
+          ? event.timestamp.trim()
+          : new Date().toISOString()
+    }))
+    .filter((event) => !!event.label);
+};
+
+const storeCarwatchSnapshot = (payload = {}) => {
+  const now = new Date();
+  const connectionValue = (payload.connection || '').toLowerCase();
+  const connection = CARWATCH_ALLOWED_CONNECTIONS.has(connectionValue) ? connectionValue : 'online';
+  const snapshot = {
+    deviceName: typeof payload.deviceName === 'string' && payload.deviceName.trim() ? payload.deviceName.trim() : 'CarWatch device',
+    connection,
+    batteryPercent: clampBetween(payload.batteryPercent, 0, 100, null),
+    temperatureC: clampBetween(payload.temperatureC, -20, 120, null),
+    fps: clampBetween(payload.fps, 0, 120, null),
+    latencyMs: clampBetween(payload.latencyMs, 0, Number.POSITIVE_INFINITY, null),
+    streamUrl: typeof payload.streamUrl === 'string' ? payload.streamUrl.trim() : '',
+    thumbUrl: typeof payload.thumbUrl === 'string' ? payload.thumbUrl.trim() : '',
+    imageBase64: typeof payload.imageBase64 === 'string' ? payload.imageBase64.trim() : '',
+    detections: normalizeCarwatchDetections(payload.detections),
+    events: normalizeCarwatchEvents(payload.events),
+    timestamp: typeof payload.timestamp === 'string' && payload.timestamp.trim() ? payload.timestamp.trim() : now.toISOString()
+  };
+
+  carwatchStore.snapshot = snapshot;
+  carwatchStore.receivedAt = now.getTime();
+  return snapshot;
+};
+
+const getCarwatchSnapshot = () => {
+  if (!carwatchStore.snapshot || !carwatchStore.receivedAt) {
+    return null;
+  }
+  if (Date.now() - carwatchStore.receivedAt > CARWATCH_SNAPSHOT_TTL_MS) {
+    return null;
+  }
+  return carwatchStore.snapshot;
+};
+
+const checkCarwatchHealth = () => {
+  if (!carwatchStore.snapshot || !carwatchStore.receivedAt) {
+    return { name: 'carwatch', status: 'unavailable', detail: 'no_snapshot' };
+  }
+  const ageMs = Date.now() - carwatchStore.receivedAt;
+  if (ageMs > CARWATCH_SNAPSHOT_TTL_MS) {
+    return { name: 'carwatch', status: 'stale', detail: { ageMs } };
+  }
+  return {
+    name: 'carwatch',
+    status: 'ok',
+    detail: {
+      device: carwatchStore.snapshot.deviceName,
+      ageMs
+    }
+  };
 };
 
 const buildMcpProxyUrl = (provider, relativePath = '') => {
@@ -2307,6 +2519,36 @@ app.post('/attachments', (req, res) => {
   });
 });
 
+app.post('/carwatch/snapshot', async (req, res) => {
+  try {
+    const payload = req.body || {};
+    if (!payload || typeof payload !== 'object') {
+      return res.status(400).json({ error: 'invalid_payload' });
+    }
+
+    const snapshot = storeCarwatchSnapshot(payload);
+    console.log('[carwatch] snapshot stored', {
+      device: snapshot.deviceName,
+      detections: snapshot.detections.length,
+      events: snapshot.events.length
+    });
+
+    return res.json({ status: 'ok', snapshot });
+  } catch (err) {
+    console.error('Failed to store CarWatch snapshot:', err);
+    return res.status(500).json({ error: 'server_error', detail: err?.message || 'carwatch_snapshot_failed' });
+  }
+});
+
+app.get('/carwatch/snapshot', (req, res) => {
+  const snapshot = getCarwatchSnapshot();
+  if (!snapshot) {
+    return res.status(404).json({ error: 'no_snapshot' });
+  }
+  const ageMs = carwatchStore.receivedAt ? Date.now() - carwatchStore.receivedAt : null;
+  return res.json({ snapshot, ageMs });
+});
+
 app.post('/detect-image', upload.single('image'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'image file is required' });
@@ -2583,7 +2825,7 @@ app.get('/health', async (_req, res) => {
     );
   }
 
-  const serviceChecks = await Promise.all(coreServiceChecks);
+  const serviceChecks = await Promise.all([...coreServiceChecks, Promise.resolve(checkCarwatchHealth())]);
 
   const hasError = serviceChecks.some((svc) => svc.status === 'error');
 

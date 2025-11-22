@@ -84,22 +84,42 @@ class ProviderRegistry:
     def _headers_for(self, descriptor: ProviderDescriptor) -> Dict[str, str] | None:
         return self._auth_headers.get(descriptor.name.lower())
 
+    def _build_provider_info(self, descriptor: ProviderDescriptor) -> ProviderInfo:
+        return ProviderInfo(
+            name=descriptor.name,
+            base_url=descriptor.base_url,
+            health_path=descriptor.health_path,
+            capabilities_path=descriptor.capabilities_path,
+            default_tools=descriptor.default_tools,
+            health=self._health.get(descriptor.name),
+            capabilities=self._capabilities.get(descriptor.name),
+            capabilities_updated_at=self._capabilities_updated_at.get(descriptor.name),
+        )
+
     def list_providers(self) -> List[ProviderInfo]:
-        info: List[ProviderInfo] = []
-        for descriptor in self._providers.values():
-            info.append(
-                ProviderInfo(
-                    name=descriptor.name,
-                    base_url=descriptor.base_url,
-                    health_path=descriptor.health_path,
-                    capabilities_path=descriptor.capabilities_path,
-                    default_tools=descriptor.default_tools,
-                    health=self._health.get(descriptor.name),
-                    capabilities=self._capabilities.get(descriptor.name),
-                    capabilities_updated_at=self._capabilities_updated_at.get(descriptor.name),
-                )
-            )
-        return info
+        return [self._build_provider_info(descriptor) for descriptor in self._providers.values()]
+
+    def get_provider_info(self, provider_name: str) -> Optional[ProviderInfo]:
+        descriptor = self._providers.get(provider_name)
+        if not descriptor:
+            return None
+        return self._build_provider_info(descriptor)
+
+    def upsert_provider(self, descriptor: ProviderDescriptor, headers: Optional[Dict[str, str]] = None) -> ProviderInfo:
+        self._providers[descriptor.name] = descriptor
+        if headers:
+            self._auth_headers[descriptor.name.lower()] = headers
+        return self._build_provider_info(descriptor)
+
+    def remove_provider(self, provider_name: str) -> bool:
+        descriptor = self._providers.pop(provider_name, None)
+        if not descriptor:
+            return False
+        self._health.pop(provider_name, None)
+        self._capabilities.pop(provider_name, None)
+        self._capabilities_updated_at.pop(provider_name, None)
+        self._auth_headers.pop(provider_name.lower(), None)
+        return True
 
     async def collect_health(self) -> AggregatedHealth:
         async with httpx.AsyncClient(timeout=self._timeout) as client:

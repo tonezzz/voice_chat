@@ -40,7 +40,10 @@ RUN apt-get update \
         wget \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g wscat \
-    && npx --yes playwright@1.49.1 install chromium
+    && npx --yes playwright@1.49.1 install chromium \
+    && npm install --prefix /opt/mcp-browser --omit=dev playwright@1.49.1
+
+ENV NODE_PATH=/opt/mcp-browser/node_modules
 
 ARG TTYD_VERSION=1.7.7
 RUN curl -L "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" -o /usr/local/bin/ttyd \

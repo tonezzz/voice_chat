@@ -1,3 +1,31 @@
+### Remote browser control (`mcp-browser`)
+
+`mcp-browser` exposes Playwright-powered actions without diving into a full test runner. Common flows:
+
+```bash
+# Screenshot a page and save into /workspace/logs
+mcp-browser screenshot http://server:3001/jobs
+
+# Dump rendered HTML to STDOUT
+mcp-browser html http://client:5173
+
+# Run an inline JS snippet (JSON printed)
+mcp-browser eval http://client:5173 "return document.title"
+
+# Generate a PDF (optional custom path)
+mcp-browser pdf https://example.com /workspace/logs/example.pdf
+```
+
+Environment knobs (all optional):
+
+- `LOG_DIR` (defaults to `/workspace/logs`)
+- `BROWSER_HEADLESS=true|false`
+- `BROWSER_TIMEOUT` (ms, default `45000`)
+- `BROWSER_VIEWPORT` (e.g., `1440x900`)
+- `BROWSER_WAIT_UNTIL` (`load`, `domcontentloaded`, `networkidle`, ...)
+
+Because the helper runs inside `mcp-debug`, you can trigger it via ttyd/ngrok for remote diagnostics without exposing another service.
+
 # MCP Debug Helper Container
 
 This utility container is meant to be the fastest way to poke at services from *inside* the Docker network.
@@ -43,6 +71,7 @@ Set them per invocation (e.g., `SERVER_URL=http://host.docker.internal:3001 mcp-
 | `mcp-diag` | Run the full diagnostics suite (see below). |
 | `mcp-playwright-install` | Install client dependencies + Playwright browsers for UI tests. |
 | `mcp-playwright-smoke [specPattern]` | Run Playwright tests (defaults to `meeting-panel.spec.ts`). |
+| `mcp-browser <cmd> <url>` | One-off Playwright browser control (`screenshot`, `html`, `eval`, `pdf`). |
 
 Add new scripts under `mcp_debug/bin/` (prefixed with `mcp-`) and rebuild to bake them in.
 

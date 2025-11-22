@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     provider_list: Optional[str] = Field(None, alias="MCP0_PROVIDERS")
     request_timeout: float = Field(10.0, alias="MCP0_TIMEOUT_SECONDS")
     allow_origins: str | None = Field(None, alias="MCP0_ALLOW_ORIGINS")
+    admin_token: Optional[str] = Field(None, alias="MCP0_ADMIN_TOKEN")
     github_token: Optional[str] = Field(None, alias="GITHUB_MCP_TOKEN")
     github_personal_token: Optional[str] = Field(None, alias="GITHUB_PERSONAL_TOKEN")
     enable_dynamic_github_tools: bool = Field(False, alias="MCP0_ENABLE_DYNAMIC_GITHUB_TOOLS")

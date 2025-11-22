@@ -3,14 +3,15 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import Body, Depends, FastAPI, HTTPException, Path
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from registry import ProviderRegistry
-from schemas import AggregatedHealth, ProviderInfo, ProxyResponse
+from schemas import AggregatedHealth, ProviderDescriptor, ProviderInfo, ProxyResponse
 from settings import Settings, get_settings
 from tool_loader import ToolSourceError, load_tools_from_source
 
@@ -81,6 +82,21 @@ def get_registry() -> ProviderRegistry:
 
 def get_timeout() -> float:
     return settings.request_timeout
+
+
+def require_admin(authorization: Optional[str] = Header(default=None)) -> None:
+    if not settings.admin_token:
+        raise HTTPException(status_code=503, detail="Admin API disabled")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid admin token")
+    provided = authorization.split(" ", 1)[1].strip()
+    if provided != settings.admin_token:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+class ProviderRegistration(BaseModel):
+    descriptor: ProviderDescriptor
+    headers: Optional[Dict[str, str]] = None
 
 
 @app.get("/health", response_model=AggregatedHealth)
@@ -154,6 +170,29 @@ async def proxy_path(
     timeout: float = Depends(get_timeout),
 ) -> ProxyResponse:
     return await _proxy_request(provider, relative_path, payload, registry, timeout)
+
+
+@app.post("/admin/providers", response_model=ProviderInfo)
+async def register_provider(
+    payload: ProviderRegistration,
+    registry: ProviderRegistry = Depends(get_registry),
+    _: None = Depends(require_admin),
+) -> ProviderInfo:
+    info = registry.upsert_provider(payload.descriptor, headers=payload.headers)
+    await asyncio.gather(registry.collect_health(), registry.refresh_capabilities())
+    return info
+
+
+@app.delete("/admin/providers/{provider_name}")
+async def remove_provider(
+    provider_name: str,
+    registry: ProviderRegistry = Depends(get_registry),
+    _: None = Depends(require_admin),
+) -> Dict[str, str]:
+    removed = registry.remove_provider(provider_name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
+    return {"status": "removed", "provider": provider_name}
 
 
 if __name__ == "__main__":

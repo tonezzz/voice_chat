@@ -41,6 +41,28 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Optional Google Photos MCP bridge (requires OAuth credentials)
+  mcp-gphotos:
+    build:
+      context: ./mcp_gphotos
+      <<: *build_cache
+    container_name: mcp-gphotos
+    profiles: ["optional"]
+    environment:
+      - PORT=8013
+      - GPHOTOS_CLIENT_ID=${GPHOTOS_CLIENT_ID:-}
+      - GPHOTOS_CLIENT_SECRET=${GPHOTOS_CLIENT_SECRET:-}
+      - GPHOTOS_REFRESH_TOKEN=${GPHOTOS_REFRESH_TOKEN:-}
+      - GPHOTOS_SCOPES=${GPHOTOS_SCOPES:-https://www.googleapis.com/auth/photoslibrary.readonly}
+    ports:
+      - "8013:8013"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8013/health || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
   # Optional Google Drive MCP bridge
   mcp-gdrive:
     build:
@@ -81,6 +103,18 @@ services:
       - TTYD_ENABLED=${MCP_DEBUG_TTYD_ENABLED:-true}
       - TTYD_PORT=${MCP_DEBUG_TTYD_PORT:-7681}
       - TTYD_EXTRA_ARGS=${MCP_DEBUG_TTYD_EXTRA_ARGS:-}
+
+  mcp-debug-proxy:
+    image: nginx:1.27-alpine
+    container_name: mcp-debug-proxy
+    profiles: ["debug"]
+    depends_on:
+      - mcp-debug
+    ports:
+      - "8088:8080"
+    volumes:
+      - ./mcp_debug/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./mcp_debug/proxy/index.html:/usr/share/nginx/html/index.html:ro
 
   # Optional Windows-only VMS bridge
   mcp-vms-win:
