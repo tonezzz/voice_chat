@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVER_URL="${SERVER_URL:-http://server:3001}"
+HTTP_TIMEOUT="${HTTP_TIMEOUT:-15}"
+ENTRY_LIMIT_ENV="${ENTRY_LIMIT:-}"
+
+if [ "$#" -gt 0 ]; then
+  SESSION_ID="$1"
+  ENTRY_LIMIT_ARG="${2:-$ENTRY_LIMIT_ENV}"
+  if [ -n "$ENTRY_LIMIT_ARG" ]; then
+    URL="${SERVER_URL}/meeting/sessions/${SESSION_ID}?entryLimit=${ENTRY_LIMIT_ARG}"
+  else
+    URL="${SERVER_URL}/meeting/sessions/${SESSION_ID}"
+  fi
+  LABEL="detail"
+else
+  URL="${SERVER_URL}/meeting/sessions"
+  LABEL="list"
+fi
+
+echo "[mcp-meeting-list] (${LABEL}) GET ${URL}"
+http --timeout "$HTTP_TIMEOUT" --pretty=format GET "$URL"

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT="/workspace/diagnostics/run_all.sh"
+if [ ! -x "$SCRIPT" ]; then
+  echo "Diagnostics script missing or not executable at $SCRIPT" >&2
+  exit 1
+fi
+
+exec "$SCRIPT"

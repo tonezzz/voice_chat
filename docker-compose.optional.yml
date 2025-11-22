@@ -1,0 +1,140 @@
+x-build-cache: &build_cache
+  cache_from:
+    - type=local,src=${DOCKER_CACHE_DIR:-.docker-cache}
+  cache_to:
+    - type=local,dest=${DOCKER_CACHE_DIR:-.docker-cache},mode=max
+
+services:
+  # Optional memory provider (requires manual start)
+  mcp-memento:
+    build:
+      context: ./mcp_memento
+      <<: *build_cache
+    container_name: mcp-memento
+    profiles: ["optional"]
+    environment:
+      - PORT=8005
+      - MEMORY_DB_DRIVER=${MEMENTO_DB_DRIVER:-sqlite}
+      - MEMORY_DB_PATH=${MEMENTO_DB_PATH:-/data/memento.db}
+      - MEMORY_DB_DSN=${MEMENTO_DB_DSN:-}
+      - DATABASE_URL=${MEMENTO_DB_DSN:-}
+      - SQLITE_VEC_PATH=${MEMENTO_SQLITE_VEC_PATH:-}
+      - PGHOST=${MEMENTO_PGHOST:-}
+      - PGPORT=${MEMENTO_PGPORT:-}
+      - PGUSER=${MEMENTO_PGUSER:-}
+      - PGPASSWORD=${MEMENTO_PGPASSWORD:-}
+      - PGDATABASE=${MEMENTO_PGDATABASE:-}
+      - PGSSLMODE=${MEMENTO_PGSSLMODE:-}
+      - MEMENTO_CACHE_ROOT=${MEMENTO_CACHE_ROOT:-/data/cache}
+      - TRANSFORMERS_CACHE=${MEMENTO_TRANSFORMERS_CACHE:-/data/cache/transformers}
+      - HUGGINGFACE_HUB_CACHE=${MEMENTO_HF_CACHE:-/data/cache/hf}
+      - XDG_CACHE_HOME=${MEMENTO_XDG_CACHE:-/data/cache/xdg}
+      - MEMENTO_DEBUG=${MEMENTO_DEBUG:-mcp:*}
+    volumes:
+      - ${MEMENTO_DATA_ROOT:-C:/_dev/_models/memento}:/data
+    ports:
+      - "8005:8005"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8005/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # Optional Google Drive MCP bridge
+  mcp-gdrive:
+    build:
+      context: ./mcp_gdrive
+      <<: *build_cache
+    container_name: mcp-gdrive
+    profiles: ["optional"]
+    environment:
+      - PORT=8012
+      - GDRIVE_SCOPES=${GDRIVE_SCOPES:-https://www.googleapis.com/auth/drive}
+      - GDRIVE_SERVICE_ACCOUNT_JSON=/secrets/service_account.json
+    volumes:
+      - ${GDRIVE_CREDENTIALS_FILE:-C:/_dev/_models/gdrive/service_account.json}:/secrets/service_account.json:ro
+    ports:
+      - "8012:8012"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8012/health || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # Utility container for interactive debugging (shell, curl, etc.)
+  mcp-debug:
+    build:
+      context: ./mcp_debug
+      <<: *build_cache
+    container_name: mcp-debug
+    profiles: ["debug"]
+    working_dir: /workspace
+    volumes:
+      - .:/workspace:delegated
+    environment:
+      - DEBUG=${DEBUG:-}
+      - HEARTBEAT_INTERVAL=${MCP_DEBUG_HEARTBEAT_INTERVAL:-30}
+      - LOG_DIR=${MCP_DEBUG_LOG_DIR:-/workspace/logs}
+      - TAIL_FILES=${MCP_DEBUG_TAIL_FILES:-/workspace/logs/tty-feed.log}
+      - TTYD_ENABLED=${MCP_DEBUG_TTYD_ENABLED:-true}
+      - TTYD_PORT=${MCP_DEBUG_TTYD_PORT:-7681}
+      - TTYD_EXTRA_ARGS=${MCP_DEBUG_TTYD_EXTRA_ARGS:-}
+
+  # Optional Windows-only VMS bridge
+  mcp-vms-win:
+    build:
+      context: ./mcp_vms
+      dockerfile: Dockerfile.win
+      <<: *build_cache
+    container_name: mcp-vms-win
+    platform: windows/amd64
+    profiles: ["optional"]
+    environment:
+      - PORT=8006
+      - VMS_HOST=${VMS_HOST:-}
+      - VMS_PORT=${VMS_PORT:-}
+      - VMS_ACCESS_ID=${VMS_ACCESS_ID:-}
+      - VMS_ACCESS_PW=${VMS_ACCESS_PW:-}
+      - VMS_IMG_WIDTH=${VMS_IMG_WIDTH:-320}
+      - VMS_IMG_HEIGHT=${VMS_IMG_HEIGHT:-240}
+      - VMS_PIXEL_FORMAT=${VMS_PIXEL_FORMAT:-RGB}
+    ports:
+      - "8006:8006"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "powershell",
+          "-NoLogo",
+          "-Command",
+          "try { Invoke-WebRequest -UseBasicParsing http://localhost:8006/health | Out-Null; exit 0 } catch { exit 1 }",
+        ]
+      interval: 60s
+      timeout: 15s
+      retries: 5
+    restart: unless-stopped
+
+  # Optional Tuya-to-MCP bridge
+  mcp-tuya:
+    build:
+      context: ./mcp_tuya_bridge
+      <<: *build_cache
+    container_name: mcp-tuya
+    profiles: ["optional"]
+    environment:
+      - TUYA_ENDPOINT=${TUYA_ENDPOINT:-}
+      - TUYA_ACCESS_ID=${TUYA_ACCESS_ID:-}
+      - TUYA_ACCESS_SECRET=${TUYA_ACCESS_SECRET:-}
+      - TUYA_CUSTOM_MCP_ENDPOINT=${TUYA_CUSTOM_MCP_ENDPOINT:-http://mcp0:8010/mcp}
+      - TUYA_RECONNECT_MIN_SECONDS=${TUYA_RECONNECT_MIN_SECONDS:-5}
+      - TUYA_RECONNECT_MAX_SECONDS=${TUYA_RECONNECT_MAX_SECONDS:-60}
+    ports:
+      - "8007:8007"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8007/health || exit 1"]
+      interval: 60s
+      timeout: 15s
+      retries: 5
+    restart: unless-stopped

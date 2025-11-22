@@ -1,4 +1,4 @@
-  import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './style.css'
 import type { DetectionResult, DetectionTestPayload } from './types/yolo'
 
@@ -7,6 +7,31 @@ interface ServiceStatus {
   label: string
   status: string
   detail?: unknown
+}
+
+interface MeetingSessionSummary {
+  session_id: string
+  title?: string | null
+  participants?: string[]
+  tags?: string[]
+  archived?: boolean
+  entry_count?: number
+  updated_at?: string
+  created_at?: string
+}
+
+interface MeetingTranscriptEntry {
+  text: string
+  speaker?: string | null
+  source?: string
+  created_at?: string
+  metadata?: Record<string, unknown>
+}
+
+interface MeetingSessionDetail extends MeetingSessionSummary {
+  entries?: MeetingTranscriptEntry[]
+  summary?: string | null
+  language_hint?: string | null
 }
 
 interface BankVerificationInfo {
@@ -59,7 +84,7 @@ const resolveDefaultApiBase = () => {
   const isViteDevServer = typeof import.meta !== 'undefined' && !!import.meta.env?.DEV
 
   if (isViteDevServer || (port && localPreviewPorts.has(port))) {
-    return `${protocol}//${hostname}:3002`
+    return `${protocol}//${hostname}:3001`
   }
   return window.location.origin
 }
@@ -68,6 +93,10 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL || resolveDefaultApiBase()
 const API_URL = `${API_BASE}/voice-chat`
 const API_STREAM_URL = `${API_BASE}/voice-chat-stream`
 const API_AUDIO_URL = `${API_BASE}/voice-chat-audio`
+const MEETING_TRANSCRIPT_URL = `${API_BASE}/meeting/append-transcript`
+const MEETING_SESSIONS_URL = `${API_BASE}/meeting/sessions`
+const meetingSessionDetailUrl = (sessionId: string) => `${MEETING_SESSIONS_URL}/${encodeURIComponent(sessionId)}`
+const meetingSessionSummarizeUrl = (sessionId: string) => `${meetingSessionDetailUrl(sessionId)}/summarize`
 const HEALTH_URL = `${API_BASE}/health`
 const DETECT_URL = `${API_BASE}/detect-image`
 const VERIFY_SLIP_URL = `${API_BASE}/verify-slip`
@@ -161,6 +190,13 @@ interface DiagnosticsInfo {
   timestamp?: string | null
 }
 
+interface ActiveReplyContext {
+  provider: string | null
+  accelerator: 'cpu' | 'gpu'
+  streaming: boolean
+  cancellable: boolean
+}
+
 interface StreamDeltaEvent {
   type: 'delta'
   delta: string
@@ -192,7 +228,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   ollama: 'Ollama'
 }
 
-const STREAMING_PROVIDERS = new Set<string>(['ollama'])
+const STREAMING_PROVIDERS = new Set<string>(['ollama', 'anthropic', 'openai', 'github'])
 
 const providerSupportsStreaming = (provider?: string | null) => {
   if (!provider) return false
@@ -224,11 +260,28 @@ const parseSsePayload = (chunk: string): StreamEventPayload | null => {
 
 const readSseStream = async (
   stream: ReadableStream<Uint8Array>,
-  onPayload: (payload: StreamEventPayload) => void
+  onPayload: (payload: StreamEventPayload) => void,
+  signal?: AbortSignal | null
 ) => {
   const reader = stream.getReader()
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
+
+  const handleAbort = () => {
+    try {
+      reader.cancel().catch(() => null)
+    } catch {
+      // noop
+    }
+  }
+
+  if (signal) {
+    if (signal.aborted) {
+      handleAbort()
+      return
+    }
+    signal.addEventListener('abort', handleAbort, { once: true })
+  }
 
   const processBuffer = (isFinal = false) => {
     let delimiterIndex = buffer.indexOf('\n\n')
@@ -252,6 +305,9 @@ const readSseStream = async (
   }
 
   while (true) {
+    if (signal?.aborted) {
+      break
+    }
     const { value, done } = await reader.read()
     if (done) {
       buffer += decoder.decode()
@@ -323,7 +379,9 @@ const ChipInfoIcon = ({ label, message }: ChipInfoIconProps) => {
   if (!message) return null
   return (
     <button type="button" className="chip-help" aria-label={`${label} info`} data-tooltip={message}>
-      <span aria-hidden>?</span>
+      <span className="chip-help-icon" aria-hidden role="img" aria-label="tip">
+        💡
+      </span>
     </button>
   )
 }
@@ -440,6 +498,34 @@ const serviceGroupMeta: Record<StatusGroupKey, { title: string; subtitle: string
   voice: { title: 'Voice synthesis', subtitle: 'TTS / OpenVoice engines', icon: '🎧' },
   vision: { title: 'Vision & tools', subtitle: 'YOLO / MCP utilities', icon: '🖼️' },
   other: { title: 'Other services', subtitle: 'Miscellaneous endpoints', icon: '🧩' }
+}
+
+type CarwatchConnectionState = 'online' | 'connecting' | 'offline'
+
+interface CarwatchDetectionSummary {
+  label: string
+  count: number
+  confidence: number
+}
+
+interface CarwatchSnapshot {
+  deviceName: string
+  connection: CarwatchConnectionState
+  batteryPercent: number
+  temperatureC: number
+  fps: number
+  latencyMs: number
+  timestamp: string
+  streamUrl: string
+  thumbUrl: string
+  detections: CarwatchDetectionSummary[]
+}
+
+interface CarwatchEvent {
+  id: string
+  label: string
+  detail: string
+  timestamp: string
 }
 
 const statusGroupOrder: StatusGroupKey[] = ['language', 'speech', 'voice', 'vision', 'other']
@@ -914,6 +1000,7 @@ const defaultModels = {
 const STORAGE_KEYS = {
   messages: 'chaba.messages',
   sessionId: 'chaba.sessionId',
+  meetingSessionId: 'chaba.meetingSessionId',
   accelerator: 'chaba.accelerator',
   voice: 'chaba.voice',
   speechLang: 'chaba.speechLang',
@@ -1189,11 +1276,13 @@ export function App() {
   })
   const [input, setInput] = useState('')
   const [replying, setReplying] = useState(false)
+  const [activeReplyContext, setActiveReplyContext] = useState<ActiveReplyContext | null>(null)
   const [listening, setListening] = useState(false)
   const [recording, setRecording] = useState(false)
   const [health, setHealth] = useState<'unknown' | 'ok' | 'error'>('unknown')
   const [healthInfo, setHealthInfo] = useState<any>(null)
   const [statusExpanded, setStatusExpanded] = useState(false)
+  const [stackSidebarCollapsed, setStackSidebarCollapsed] = useState(false)
   const [appMenuOpen, setAppMenuOpen] = useState(false)
   const [mcpPanelOpen, setMcpPanelOpen] = useState(false)
   const [mcpPanelMessageId, setMcpPanelMessageId] = useState<string | null>(null)
@@ -1303,7 +1392,9 @@ export function App() {
   }, [bankVerificationInfo.referenceId])
   const [bankOcrError, setBankOcrError] = useState<string | null>(null)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
-  const [activePanel, setActivePanel] = useState<'chat' | 'openvoice' | 'image-mcp' | 'yolo-detection' | 'bank-slip'>(() =>
+  const [activePanel, setActivePanel] = useState<
+    'chat' | 'openvoice' | 'carwatch' | 'image-mcp' | 'yolo-detection' | 'bank-slip' | 'meeting'
+  >(() =>
     readFromStorage(STORAGE_KEYS.activePanel, 'chat')
   )
   const [inlineSpeakerState, setInlineSpeakerState] = useState<InlineSpeakerState>({
@@ -1319,6 +1410,26 @@ export function App() {
       return null
     }
   })
+  const [meetingSessionId, setMeetingSessionId] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null
+    try {
+      return window.localStorage.getItem(STORAGE_KEYS.meetingSessionId)
+    } catch (err) {
+      console.warn('Failed to read stored meetingSessionId', err)
+      return null
+    }
+  })
+  const [meetingSessions, setMeetingSessions] = useState<MeetingSessionSummary[]>([])
+  const [meetingSessionsLoading, setMeetingSessionsLoading] = useState(false)
+  const [meetingSessionsError, setMeetingSessionsError] = useState<string | null>(null)
+  const [selectedMeetingSession, setSelectedMeetingSession] = useState<string | null>(null)
+  const [meetingSessionDetail, setMeetingSessionDetail] = useState<MeetingSessionDetail | null>(null)
+  const [meetingDetailLoading, setMeetingDetailLoading] = useState(false)
+  const [meetingDetailError, setMeetingDetailError] = useState<string | null>(null)
+  const [meetingSummaryLoading, setMeetingSummaryLoading] = useState(false)
+  const [meetingSummaryError, setMeetingSummaryError] = useState<string | null>(null)
+  const [meetingTitleInput, setMeetingTitleInput] = useState('')
+  const [meetingFilterText, setMeetingFilterText] = useState('')
   const [voiceOptions, setVoiceOptions] = useState<VoiceOption[]>([])
   const [defaultVoiceId, setDefaultVoiceId] = useState<string | null>(null)
   const [selectedVoice, setSelectedVoice] = useState<string | null>(() => {
@@ -1338,9 +1449,46 @@ export function App() {
   const [githubModelStatus, setGithubModelStatus] = useState<{ status: string; detail?: string | null } | null>(null)
   const [githubModelChecking, setGithubModelChecking] = useState(false)
   const [githubModelError, setGithubModelError] = useState<string | null>(null)
+  const [carwatchSnapshot] = useState<CarwatchSnapshot>(() => ({
+    deviceName: 'iPhone 15 Pro',
+    connection: 'online',
+    batteryPercent: 78,
+    temperatureC: 38,
+    fps: 28,
+    latencyMs: 142,
+    timestamp: new Date().toISOString(),
+    streamUrl: 'https://demo-carwatch.ngrok.app/live',
+    thumbUrl: 'https://placehold.co/960x540/111827/FFFFFF?text=CarWatch+Live+Preview',
+    detections: [
+      { label: 'Sedan', count: 3, confidence: 0.82 },
+      { label: 'SUV', count: 1, confidence: 0.76 },
+      { label: 'Motorbike', count: 2, confidence: 0.68 }
+    ]
+  }))
+  const [carwatchEvents] = useState<CarwatchEvent[]>(() => [
+    {
+      id: 'evt-1',
+      label: 'Vehicles detected',
+      detail: '3 sedans, 1 SUV near exit gate',
+      timestamp: new Date(Date.now() - 45_000).toISOString()
+    },
+    {
+      id: 'evt-2',
+      label: 'Motorbike linger',
+      detail: 'Bike idle for 90s, flagged for follow-up',
+      timestamp: new Date(Date.now() - 120_000).toISOString()
+    },
+    {
+      id: 'evt-3',
+      label: 'Stream connected',
+      detail: 'Device switched to ngrok tunnel',
+      timestamp: new Date(Date.now() - 300_000).toISOString()
+    }
+  ])
   const speechLanguageHelper = SPEECH_LANGUAGE_HELPER
   const llmProviderHelper = LLM_PROVIDER_HELPER
   const whisperHelper = WHISPER_HELPER
+  const [speechStatusMessage, setSpeechStatusMessage] = useState<string | null>(null)
 
   const VOICE_SERVICE_HINT =
     'Voice service unavailable. Ensure the OpenVoice containers are running (openvoice-tts / openvoice-tts-gpu) and reload.'
@@ -1422,6 +1570,8 @@ export function App() {
   const referenceStartRef = useRef<number>(0)
   const referenceRecorderRef = useRef<MediaRecorder | null>(null)
   const referenceStreamRef = useRef<MediaStream | null>(null)
+  const activeReplyAbortControllerRef = useRef<AbortController | null>(null)
+  const userCancelledReplyRef = useRef(false)
 
   const pendingPreviewRef = useRef<PendingAttachment[]>([])
   const attachmentCounterRef = useRef(1)
@@ -1429,6 +1579,28 @@ export function App() {
   useEffect(() => {
     pendingPreviewRef.current = pendingAttachments
   }, [pendingAttachments])
+
+  useEffect(() => {
+    return () => {
+      if (activeReplyAbortControllerRef.current) {
+        activeReplyAbortControllerRef.current.abort()
+        activeReplyAbortControllerRef.current = null
+      }
+    }
+  }, [])
+
+  const handleCancelReply = useCallback(() => {
+    if (!replying) return
+    userCancelledReplyRef.current = true
+    if (activeReplyAbortControllerRef.current) {
+      try {
+        activeReplyAbortControllerRef.current.abort()
+      } catch (err) {
+        console.warn('Abort controller cancel failed', err)
+      }
+    }
+    setActiveReplyContext((ctx) => (ctx ? { ...ctx, cancellable: false } : ctx))
+  }, [replying])
 
   useEffect(() => {
     return () => {
@@ -1994,6 +2166,17 @@ export function App() {
     fetchMcpProviders()
   }, [fetchHealth, fetchMcpProviders])
 
+  useEffect(() => {
+    const run = async () => {
+      try {
+        await handleRefreshProviders()
+      } catch (err) {
+        console.warn('handleRefreshProviders failed', err)
+      }
+    }
+    run()
+  }, [handleRefreshProviders])
+
   const healthServices = useMemo<HealthServiceEntry[]>(() => {
     if (!Array.isArray(healthInfo?.services)) {
       return []
@@ -2125,6 +2308,19 @@ export function App() {
       console.error('Failed to persist sessionId', err)
     }
   }, [sessionId])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      if (meetingSessionId) {
+        window.localStorage.setItem(STORAGE_KEYS.meetingSessionId, meetingSessionId)
+      } else {
+        window.localStorage.removeItem(STORAGE_KEYS.meetingSessionId)
+      }
+    } catch (err) {
+      console.error('Failed to persist meetingSessionId', err)
+    }
+  }, [meetingSessionId])
 
   useEffect(() => {
     if (selectedVoice) {
@@ -2683,9 +2879,254 @@ export function App() {
     void sendMessage(message.text, { accelerator: acceleratorMode })
   }
 
+  const refreshMeetingSessions = useCallback(
+    async (options?: { includeArchived?: boolean }) => {
+      if (!MEETING_SESSIONS_URL) return
+      setMeetingSessionsLoading(true)
+      setMeetingSessionsError(null)
+      try {
+        const url = new URL(MEETING_SESSIONS_URL)
+        if (options?.includeArchived) {
+          url.searchParams.set('includeArchived', 'true')
+        }
+        const response = await fetch(url.toString())
+        if (!response.ok) {
+          const detail = await response.text().catch(() => '')
+          throw new Error(detail || `HTTP ${response.status}`)
+        }
+        const data = await response.json()
+        const sessions = Array.isArray(data?.sessions) ? (data.sessions as MeetingSessionSummary[]) : []
+        setMeetingSessions(sessions)
+        return sessions
+      } catch (err: any) {
+        setMeetingSessionsError(err?.message || 'Unable to load meeting sessions')
+        return []
+      } finally {
+        setMeetingSessionsLoading(false)
+      }
+    },
+    []
+  )
+
+  const createMeetingSession = useCallback(
+    async (options?: { title?: string | null }) => {
+      if (!MEETING_SESSIONS_URL) return null
+      setMeetingSessionsError(null)
+      const sessionId = `meeting-${Date.now()}`
+      try {
+        const response = await fetch(MEETING_SESSIONS_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId, title: options?.title || undefined })
+        })
+        if (!response.ok) {
+          const detail = await response.text().catch(() => '')
+          throw new Error(detail || `HTTP ${response.status}`)
+        }
+        await refreshMeetingSessions().catch(() => null)
+        return sessionId
+      } catch (err: any) {
+        setMeetingSessionsError(err?.message || 'Unable to create meeting session')
+        return null
+      }
+    },
+    [refreshMeetingSessions]
+  )
+
+  const ensureMeetingSessionId = useCallback(
+    async (options?: { title?: string | null }) => {
+      if (meetingSessionId) {
+        return meetingSessionId
+      }
+      const created = await createMeetingSession({ title: options?.title })
+      if (created) {
+        setMeetingSessionId(created)
+      }
+      return created
+    },
+    [meetingSessionId, createMeetingSession]
+  )
+
+  const fetchMeetingDetail = useCallback(
+    async (sessionId: string, entryLimit?: number) => {
+      if (!sessionId) {
+        setMeetingSessionDetail(null)
+        return null
+      }
+      setMeetingDetailLoading(true)
+      setMeetingDetailError(null)
+      try {
+        const url = new URL(meetingSessionDetailUrl(sessionId))
+        if (entryLimit && entryLimit > 0) {
+          url.searchParams.set('entryLimit', entryLimit.toString())
+        }
+        const response = await fetch(url.toString())
+        if (!response.ok) {
+          const detail = await response.text().catch(() => '')
+          throw new Error(detail || `HTTP ${response.status}`)
+        }
+        const data = (await response.json()) as MeetingSessionDetail
+        setMeetingSessionDetail(data)
+        return data
+      } catch (err: any) {
+        setMeetingDetailError(err?.message || 'Unable to load meeting detail')
+        setMeetingSessionDetail(null)
+        return null
+      } finally {
+        setMeetingDetailLoading(false)
+      }
+    },
+    []
+  )
+
+  const summarizeMeeting = useCallback(
+    async (sessionId: string, maxEntries?: number) => {
+      if (!sessionId) return null
+      setMeetingSummaryLoading(true)
+      setMeetingSummaryError(null)
+      try {
+        const response = await fetch(meetingSessionSummarizeUrl(sessionId), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ maxEntries })
+        })
+        if (!response.ok) {
+          const detail = await response.text().catch(() => '')
+          throw new Error(detail || `HTTP ${response.status}`)
+        }
+        const data = await response.json()
+        await fetchMeetingDetail(sessionId)
+        return data
+      } catch (err: any) {
+        setMeetingSummaryError(err?.message || 'Unable to summarize meeting')
+        return null
+      } finally {
+        setMeetingSummaryLoading(false)
+      }
+    },
+    [fetchMeetingDetail]
+  )
+
+  useEffect(() => {
+    if (meetingSessionId) {
+      fetchMeetingDetail(meetingSessionId).catch(() => null)
+    }
+  }, [meetingSessionId, fetchMeetingDetail])
+
+  const appendMeetingTranscript = useCallback(
+    async (text: string, options?: { speaker?: string; language?: string | null }) => {
+      const trimmed = (text || '').trim()
+      if (!trimmed) {
+        return
+      }
+      if (!MEETING_TRANSCRIPT_URL) {
+        return
+      }
+      const session = await ensureMeetingSessionId()
+      if (!session) {
+        return
+      }
+      try {
+        const response = await fetch(MEETING_TRANSCRIPT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: session,
+            text: trimmed,
+            speaker: options?.speaker,
+            language: options?.language
+          })
+        })
+        if (!response.ok) {
+          const detail = await response.text().catch(() => '')
+          console.warn('Meeting transcript append failed', detail || response.status)
+          return
+        }
+        const payload = await response.json().catch(() => null)
+        if (payload?.sessionId && payload.sessionId !== meetingSessionId) {
+          setMeetingSessionId(payload.sessionId)
+        }
+      } catch (err) {
+        console.warn('Meeting transcript append error', err)
+      }
+    },
+    [ensureMeetingSessionId, meetingSessionId]
+  )
+
   const getLanguageLabel = (code?: string | null) => getSpeechLanguageLabel(code)
 
-  const startListening = () => {
+  const formatMeetingTimestamp = (value?: string) => {
+    if (!value) return ''
+    try {
+      return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    } catch {
+      return value
+    }
+  }
+
+  const formatMeetingDate = (value?: string) => {
+    if (!value) return '—'
+    try {
+      return new Date(value).toLocaleString()
+    } catch {
+      return value
+    }
+  }
+
+  const filteredMeetingSessions = useMemo(() => {
+    if (!meetingFilterText.trim()) return meetingSessions
+    const query = meetingFilterText.trim().toLowerCase()
+    return meetingSessions.filter((session) => {
+      const fields = [
+        session.session_id,
+        session.title,
+        ...(session.participants || []),
+        ...(session.tags || [])
+      ]
+        .filter(Boolean)
+        .map((value) => String(value).toLowerCase())
+      return fields.some((field) => field.includes(query))
+    })
+  }, [meetingSessions, meetingFilterText])
+
+  const activeMeetingSessionId = selectedMeetingSession || meetingSessionId || null
+
+  const handleSelectMeetingSession = useCallback(
+    (sessionId: string) => {
+      if (!sessionId) return
+      setSelectedMeetingSession(sessionId)
+      setMeetingSessionId(sessionId)
+      fetchMeetingDetail(sessionId).catch(() => null)
+    },
+    [fetchMeetingDetail]
+  )
+
+  const handleRefreshMeetingDetail = useCallback(() => {
+    if (activeMeetingSessionId) {
+      fetchMeetingDetail(activeMeetingSessionId).catch(() => null)
+    }
+  }, [activeMeetingSessionId, fetchMeetingDetail])
+
+  const handleCreateMeetingSession = useCallback(async () => {
+    const desiredTitle = meetingTitleInput.trim() || 'Untitled meeting'
+    const sessionId = await createMeetingSession({ title: desiredTitle })
+    if (!sessionId) return
+    setMeetingTitleInput('')
+    setMeetingSessionId(sessionId)
+    handleSelectMeetingSession(sessionId)
+  }, [meetingTitleInput, createMeetingSession, handleSelectMeetingSession])
+
+  useEffect(() => {
+    refreshMeetingSessions().catch(() => null)
+  }, [refreshMeetingSessions])
+
+  useEffect(() => {
+    if (meetingSessionId && !selectedMeetingSession) {
+      setSelectedMeetingSession(meetingSessionId)
+    }
+  }, [meetingSessionId, selectedMeetingSession])
+
+  const startListening = async () => {
     if (!SpeechRecognitionImpl) {
       alert('SpeechRecognition not supported in this browser')
       return
@@ -2693,6 +3134,18 @@ export function App() {
 
     stopSpeech()
     setBrowserDetectedLanguage(null)
+
+    if (navigator.permissions?.query) {
+      try {
+        const permissionResult = await navigator.permissions.query({ name: 'microphone' as PermissionName })
+        if (permissionResult.state === 'denied') {
+          alert('Microphone permission denied. Please enable it in browser settings for speech input.')
+          return
+        }
+      } catch (err) {
+        console.warn('Microphone permission query failed', err)
+      }
+    }
 
     const Recog = SpeechRecognitionImpl
     const recognition = new Recog()
@@ -2706,6 +3159,7 @@ export function App() {
     recognition.interimResults = true
     recognition.continuous = false
 
+    setSpeechStatusMessage('Listening… please start speaking near the microphone')
     setListening(true)
 
     let finalText = ''
@@ -2726,17 +3180,37 @@ export function App() {
       }
     }
 
-    recognition.onerror = (event) => {
+    recognition.onerror = (event: Event) => {
       console.error(event)
       setListening(false)
+      const errorCode = (event as { error?: string }).error
+      if (errorCode === 'no-speech') {
+        setSpeechStatusMessage('We did not detect speech. Try speaking closer to the mic and tap Speak again.')
+        return
+      }
+      if (errorCode === 'audio-capture') {
+        alert('Microphone is busy or unavailable. Ensure no other app is using it and try again.')
+        setSpeechStatusMessage('Microphone busy. Free it up, then tap Speak again.')
+      } else if (errorCode === 'not-allowed') {
+        alert('Microphone permission denied. Please allow access in your browser settings.')
+        setSpeechStatusMessage('Microphone permission denied in browser settings.')
+      }
     }
 
     recognition.onend = () => {
       setListening(false)
       if (finalText.trim()) {
         setInput(finalText)
-        void sendMessage(finalText, { sttLanguage: detectedLang || browserDetectedLanguage })
+        const langHint =
+          detectedLang ||
+          browserDetectedLanguage ||
+          (speechLanguage && speechLanguage !== 'auto' ? speechLanguage : null)
+        void sendMessage(finalText, { sttLanguage: langHint })
+        void appendMeetingTranscript(finalText, { speaker: 'user', language: langHint })
         setBrowserDetectedLanguage(null)
+        setSpeechStatusMessage(null)
+      } else {
+        setSpeechStatusMessage('No speech captured. Please try again and begin speaking right away.')
       }
     }
 
@@ -4012,6 +4486,13 @@ export function App() {
     if (match) return match.label
     return (activeLang || '—').toUpperCase()
   }, [bankOcrResult, bankOcrLang])
+  const carwatchVehicleCount = useMemo(() => {
+    return carwatchSnapshot.detections.reduce((sum, det) => sum + det.count, 0)
+  }, [carwatchSnapshot])
+  const carwatchPrimaryDetection = useMemo(() => {
+    return [...carwatchSnapshot.detections].sort((a, b) => b.count - a.count || b.confidence - a.confidence)[0] || null
+  }, [carwatchSnapshot])
+  const carwatchLastUpdatedLabel = useMemo(() => formatMeetingTimestamp(carwatchSnapshot.timestamp), [carwatchSnapshot.timestamp])
 
   const llmOptions = useMemo(() => {
     const unique = new Set<string>(builtInLlmModels)
@@ -4051,6 +4532,19 @@ export function App() {
         .filter((section) => section.services.length > 0),
     [serviceStatuses]
   )
+
+  const stackSummary = useMemo(() => {
+    if (!serviceStatuses.length) {
+      return { total: 0, ok: 0, unhealthy: 0 }
+    }
+    const ok = serviceStatuses.filter((svc) => svc.status === 'ok').length
+    const unhealthy = serviceStatuses.length - ok
+    return {
+      total: serviceStatuses.length,
+      ok,
+      unhealthy
+    }
+  }, [serviceStatuses])
 
   const inlineSpeakerMetaFor = (messageId: string): { icon: string; label: string } => {
     if (inlineSpeakerState.messageId !== messageId) {
@@ -4123,6 +4617,7 @@ export function App() {
     stopAllAudio()
     setMessages([])
     setSessionId(null)
+    setMeetingSessionId(null)
     setInput('')
   }, [stopAllAudio])
 
@@ -4371,13 +4866,29 @@ export function App() {
           </button>
           <button
             type="button"
+            className={`panel-tab ${activePanel === 'carwatch' ? 'active' : ''}`}
+            onClick={() => setActivePanel('carwatch')}
+          >
+            CarWatch
+          </button>
+          <button
+            type="button"
             className={`panel-tab ${activePanel === 'bank-slip' ? 'active' : ''}`}
             onClick={() => setActivePanel('bank-slip')}
           >
             Bank slip
           </button>
+          <button
+            type="button"
+            className={`panel-tab ${activePanel === 'meeting' ? 'active' : ''}`}
+            onClick={() => setActivePanel('meeting')}
+          >
+            Meeting
+          </button>
         </div>
 
+        <div className="app-workspace">
+          <div className="panel-content">
         {activePanel === 'chat' ? (
           <div className="chat-layout" aria-label="Chat interface">
             <section className="chat-panel">
@@ -4529,13 +5040,13 @@ export function App() {
 
             <section className="controls-panel">
               <div className="control-chips snap-scroll" role="group" aria-label="Chat settings">
-                <label className={`control-chip${speechLanguageHelper ? ' has-chip-help' : ''}`}>
-                  <ChipInfoIcon label="Speech language" message={speechLanguageHelper} />
+                <label className="control-chip">
                   <span className="chip-header">
                     <span className="chip-icon" aria-hidden>
                       🌐
                     </span>
                     <span className="chip-label">Speech lang</span>
+                    <ChipInfoIcon label="Speech language" message={speechLanguageHelper} />
                   </span>
                   <select
                     value={speechLanguage}
@@ -4554,17 +5065,13 @@ export function App() {
                     </span>
                   ) : null}
                 </label>
-                <label
-                  className={`control-chip${llmProviderHelper ? ' has-chip-help' : ''}`}
-                  htmlFor="llm-provider-select"
-                  data-testid="llm-provider-chip"
-                >
-                  <ChipInfoIcon label="LLM provider" message={llmProviderHelper} />
+                <label className="control-chip" htmlFor="llm-provider-select" data-testid="llm-provider-chip">
                   <span className="chip-header">
                     <span className="chip-icon" aria-hidden>
                       🧠
                     </span>
                     <span className="chip-label">LLM Provider</span>
+                    <ChipInfoIcon label="LLM provider" message={llmProviderHelper} />
                     <button
                       type="button"
                       className="chip-refresh"
@@ -4608,13 +5115,13 @@ export function App() {
                     ))}
                   </select>
                 </label>
-                <label className={`control-chip${whisperHelper ? ' has-chip-help' : ''}`}>
-                  <ChipInfoIcon label="Whisper" message={whisperHelper} />
+                <label className="control-chip">
                   <span className="chip-header">
                     <span className="chip-icon" aria-hidden>
                       🗣️
                     </span>
                     <span className="chip-label">Whisper</span>
+                    <ChipInfoIcon label="Whisper" message={whisperHelper} />
                   </span>
                   <select
                     value={whisperModel}
@@ -4626,13 +5133,13 @@ export function App() {
                     <option value="small">small</option>
                   </select>
                 </label>
-                <label className={`control-chip${voiceStatusHelper ? ' has-chip-help' : ''}`}>
-                  <ChipInfoIcon label="Voice" message={voiceStatusHelper || undefined} />
+                <label className="control-chip">
                   <span className="chip-header">
                     <span className="chip-icon" aria-hidden>
                       🎙️
                     </span>
                     <span className="chip-label">Voice</span>
+                    <ChipInfoIcon label="Voice" message={voiceStatusHelper || undefined} />
                   </span>
                   <span className={`chip-status chip-status-${voiceStatusTone}`} role="status">
                     <span className="chip-status-dot" aria-hidden />
@@ -4872,6 +5379,11 @@ export function App() {
                       ? '■ Stop (server STT)'
                       : '⏺ Record (server STT)'}
                 </button>
+                {speechStatusMessage ? (
+                  <div className="speech-hint" role="status">
+                    {speechStatusMessage}
+                  </div>
+                ) : null}
                 <button onClick={stopAllAudio}>⏹ Stop Audio</button>
               </div>
               {uploadingAttachment && (
@@ -4941,6 +5453,286 @@ export function App() {
               {referenceRecorderError && (
                 <div className="reference-error" role="alert">
                   {referenceRecorderError}
+                </div>
+              )}
+            </section>
+          </div>
+        ) : activePanel === 'carwatch' ? (
+          <div className="vision-panels carwatch-panels" aria-label="CarWatch preview" data-testid="carwatch-panel">
+            <section className="vision-panel carwatch-panel">
+              <div className="vision-header">
+                <div>
+                  <h2>CarWatch live monitor</h2>
+                  <p>Preview the iOS experience before wiring up the real stream.</p>
+                </div>
+                <div className={`vision-confidence carwatch-status carwatch-status-${carwatchSnapshot.connection}`}>
+                  <label>
+                    Status: <strong>{carwatchSnapshot.connection === 'online' ? 'Streaming' : carwatchSnapshot.connection}</strong>
+                  </label>
+                  <span className="carwatch-meta">Updated {carwatchLastUpdatedLabel}</span>
+                </div>
+              </div>
+
+              <div className="carwatch-body">
+                <div className="vision-image" aria-label="Live camera preview">
+                  <img src={carwatchSnapshot.thumbUrl} alt="CarWatch live preview" />
+                  <div className="vision-overlay">
+                    <div className="carwatch-overlay-chip">
+                      {carwatchSnapshot.deviceName} · {carwatchSnapshot.fps} FPS · {carwatchSnapshot.latencyMs} ms
+                    </div>
+                    <div className="carwatch-overlay-chip">
+                      Battery {carwatchSnapshot.batteryPercent}% · {carwatchSnapshot.temperatureC}°C
+                    </div>
+                  </div>
+                </div>
+
+                <div className="summary-metrics carwatch-metrics">
+                  <div className="summary-metric">
+                    <span className="summary-label">Vehicles</span>
+                    <span className="summary-value">{carwatchVehicleCount}</span>
+                    <span className="summary-sub">
+                      {carwatchPrimaryDetection
+                        ? `${carwatchPrimaryDetection.count}× ${carwatchPrimaryDetection.label}`
+                        : 'No detections'}
+                    </span>
+                  </div>
+                  <div className="summary-metric">
+                    <span className="summary-label">Top confidence</span>
+                    <span className="summary-value">
+                      {carwatchPrimaryDetection ? `${Math.round(carwatchPrimaryDetection.confidence * 100)}%` : '—'}
+                    </span>
+                    <span className="summary-sub">Model: YOLO CoreML</span>
+                  </div>
+                  <div className="summary-metric">
+                    <span className="summary-label">Link</span>
+                    <a
+                      className="summary-value link"
+                      href={carwatchSnapshot.streamUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open ngrok stream ↗
+                    </a>
+                    <span className="summary-sub">Share with reviewers</span>
+                  </div>
+                </div>
+
+                <div className="carwatch-details">
+                  <div className="carwatch-detections">
+                    <h3>Detections</h3>
+                    {carwatchSnapshot.detections.length ? (
+                      <ul className="detection-list">
+                        {carwatchSnapshot.detections.map((det) => (
+                          <li key={det.label} className="detection-item">
+                            <div className="det-main">
+                              <strong>{det.label}</strong>
+                              <span>{det.count} objects</span>
+                            </div>
+                            <div className="det-bbox">Confidence {Math.round(det.confidence * 100)}%</div>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="vision-preview-hint">Waiting for first frame…</p>
+                    )}
+                  </div>
+
+                  <div className="carwatch-timeline" aria-label="Recent events">
+                    <h3>Recent events</h3>
+                    {carwatchEvents.length ? (
+                      <ul className="timeline-list">
+                        {carwatchEvents.map((event) => (
+                          <li key={event.id} className="timeline-item">
+                            <div className="timeline-head">
+                              <strong>{event.label}</strong>
+                              <span>{formatMeetingTimestamp(event.timestamp)}</span>
+                            </div>
+                            <p>{event.detail}</p>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="vision-preview-hint">No events logged yet.</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        ) : activePanel === 'meeting' ? (
+          <div className="meeting-layout" aria-label="Meeting session overview" data-testid="meeting-panel">
+            <section className="meeting-sessions-panel panel-surface" data-testid="meeting-sessions-panel">
+              <header className="meeting-panel-header">
+                <div>
+                  <h2>Sessions</h2>
+                  <p>Track live transcripts captured via browser STT.</p>
+                </div>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => refreshMeetingSessions().catch(() => null)}
+                  disabled={meetingSessionsLoading}
+                  data-testid="meeting-sessions-refresh"
+                >
+                  {meetingSessionsLoading ? 'Refreshing…' : '↺ Refresh'}
+                </button>
+              </header>
+              <div className="meeting-session-actions">
+                <input
+                  type="text"
+                  className="meeting-input"
+                  placeholder="Filter by title / people / tag"
+                  value={meetingFilterText}
+                  onChange={(e) => setMeetingFilterText(e.target.value)}
+                  data-testid="meeting-filter-input"
+                />
+                <div className="meeting-create-row">
+                  <input
+                    type="text"
+                    className="meeting-input"
+                    placeholder="New session title"
+                    value={meetingTitleInput}
+                    onChange={(e) => setMeetingTitleInput(e.target.value)}
+                    data-testid="meeting-title-input"
+                  />
+                  <button type="button" onClick={() => handleCreateMeetingSession()} data-testid="meeting-start-button">
+                    ➕ Start
+                  </button>
+                </div>
+              </div>
+              {meetingSessionsError ? (
+                <div className="meeting-alert" role="alert" data-testid="meeting-sessions-alert">
+                  {meetingSessionsError}
+                </div>
+              ) : null}
+              <div className="meeting-session-list" role="list" data-testid="meeting-session-list">
+                {meetingSessionsLoading ? (
+                  <div className="meeting-empty">Loading sessions…</div>
+                ) : filteredMeetingSessions.length === 0 ? (
+                  <div className="meeting-empty">No sessions yet.</div>
+                ) : (
+                  filteredMeetingSessions.map((session) => {
+                    const isActive = session.session_id === activeMeetingSessionId
+                    return (
+                      <button
+                        type="button"
+                        key={session.session_id}
+                        className={`meeting-session-card ${isActive ? 'active' : ''}`.trim()}
+                        onClick={() => handleSelectMeetingSession(session.session_id)}
+                        role="listitem"
+                        data-testid="meeting-session-card"
+                        data-session-id={session.session_id}
+                      >
+                        <div className="meeting-session-title">{session.title || 'Untitled session'}</div>
+                        <div className="meeting-session-sub">{session.participants?.join(', ') || 'Participants TBD'}</div>
+                        <div className="meeting-session-meta">
+                          <span>{session.entry_count ?? 0} entries</span>
+                          <span>{formatMeetingTimestamp(session.updated_at)}</span>
+                        </div>
+                      </button>
+                    )
+                  })
+                )}
+              </div>
+            </section>
+
+            <section className="meeting-detail-panel panel-surface" data-testid="meeting-detail-panel">
+              <header className="meeting-panel-header">
+                <div>
+                  <h2>Transcript</h2>
+                  <p>{activeMeetingSessionId ? 'Live notes and summaries.' : 'Select a session to inspect notes.'}</p>
+                </div>
+                <div className="meeting-detail-actions">
+                  <button type="button" onClick={() => handleRefreshMeetingDetail()} disabled={!activeMeetingSessionId || meetingDetailLoading}
+                    data-testid="meeting-detail-refresh"
+                  >
+                    {meetingDetailLoading ? 'Refreshing…' : '↺ Refresh detail'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => activeMeetingSessionId && summarizeMeeting(activeMeetingSessionId)}
+                    disabled={!activeMeetingSessionId || meetingSummaryLoading}
+                    data-testid="meeting-summary-button"
+                  >
+                    {meetingSummaryLoading ? 'Summarizing…' : '📝 Summarize'}
+                  </button>
+                </div>
+              </header>
+
+              {meetingSummaryError ? (
+                <div className="meeting-alert" role="alert" data-testid="meeting-summary-alert">
+                  {meetingSummaryError}
+                </div>
+              ) : null}
+              {meetingDetailError ? (
+                <div className="meeting-alert" role="alert" data-testid="meeting-detail-alert">
+                  {meetingDetailError}
+                </div>
+              ) : null}
+
+              {!activeMeetingSessionId ? (
+                <div className="meeting-empty" data-testid="meeting-detail-empty">Select or create a meeting to inspect notes.</div>
+              ) : meetingDetailLoading && !meetingSessionDetail ? (
+                <div className="meeting-empty" data-testid="meeting-detail-loading">Loading transcript…</div>
+              ) : !meetingSessionDetail ? (
+                <div className="meeting-empty" data-testid="meeting-detail-missing">No transcript yet.</div>
+              ) : (
+                <div className="meeting-detail-content" data-testid="meeting-detail">
+                  <div className="meeting-detail-meta">
+                    <div>
+                      <span className="label">Session ID</span>
+                      <span className="value mono">{meetingSessionDetail.session_id}</span>
+                    </div>
+                    <div>
+                      <span className="label">Updated</span>
+                      <span className="value">{formatMeetingDate(meetingSessionDetail.updated_at)}</span>
+                    </div>
+                    <div>
+                      <span className="label">Language</span>
+                      <span className="value">{meetingSessionDetail.language_hint || '—'}</span>
+                    </div>
+                    <div>
+                      <span className="label">Tags</span>
+                      <span className="value">{meetingSessionDetail.tags?.join(', ') || '—'}</span>
+                    </div>
+                  </div>
+
+                  {meetingSessionDetail.summary ? (
+                    <article className="meeting-summary-card" data-testid="meeting-summary-card">
+                      <header>Latest summary</header>
+                      <p>{meetingSessionDetail.summary}</p>
+                    </article>
+                  ) : null}
+
+                  <div className="meeting-entries" role="list" data-testid="meeting-entries">
+                    {meetingSessionDetail.entries && meetingSessionDetail.entries.length > 0 ? (
+                      meetingSessionDetail.entries.map((entry, idx) => (
+                        <article
+                          key={`${entry.created_at || idx}-${idx}`}
+                          className="meeting-entry"
+                          role="listitem"
+                          data-testid="meeting-entry"
+                        >
+                          <div className="meeting-entry-header">
+                            <div className="meeting-entry-speaker">{entry.speaker || 'Speaker'}</div>
+                            <div className="meeting-entry-meta">{formatMeetingTimestamp(entry.created_at)}</div>
+                          </div>
+                          <p>{entry.text}</p>
+                          {entry.metadata ? (
+                            <div className="meeting-entry-meta-detail">
+                              {Object.entries(entry.metadata).map(([key, value]) => (
+                                <span key={key}>
+                                  {key}: {String(value)}
+                                </span>
+                              ))}
+                            </div>
+                          ) : null}
+                        </article>
+                      ))
+                    ) : (
+                      <div className="meeting-empty" data-testid="meeting-entries-empty">No entries captured yet.</div>
+                    )}
+                  </div>
                 </div>
               )}
             </section>
@@ -5906,6 +6698,56 @@ export function App() {
             </section>
           </div>
         )}
+          </div>
+          <aside
+            className={`stack-sidebar ${stackSidebarCollapsed ? 'collapsed' : ''}`}
+            aria-label="Stack status sidebar"
+          >
+            <button
+              type="button"
+              className="stack-sidebar-toggle"
+              onClick={() => setStackSidebarCollapsed((prev) => !prev)}
+              aria-expanded={!stackSidebarCollapsed}
+            >
+              <span className="toggle-icon" aria-hidden="true">
+                {stackSidebarCollapsed ? '▶' : '◀'}
+              </span>
+              <span className="toggle-label">Stack status</span>
+              <span className="stack-summary-count">
+                {stackSummary.ok}/{stackSummary.total}
+              </span>
+            </button>
+            <div className="stack-sidebar-content">
+              <div className="stack-summary-counters">
+                <div className="stack-summary-item" aria-label="Healthy services">
+                  <span className="label">Healthy</span>
+                  <span className="value">{stackSummary.ok}</span>
+                </div>
+                <div className="stack-summary-item" aria-label="Services with issues">
+                  <span className="label">Issues</span>
+                  <span className="value">{stackSummary.unhealthy}</span>
+                </div>
+              </div>
+              {serviceStatuses.length ? (
+                <ul className="stack-service-list">
+                  {serviceStatuses.map((svc) => {
+                    const pillState = svc.status === 'ok' ? 'ok' : svc.status === 'unconfigured' ? 'unknown' : 'error'
+                    return (
+                      <li key={svc.name} className="stack-service-item">
+                        <span className={`status-indicator status-${pillState}`}>
+                          <span className="dot" /> {svc.label}
+                        </span>
+                        <span className="stack-service-meta">{svc.type}</span>
+                      </li>
+                    )
+                  })}
+                </ul>
+              ) : (
+                <p className="stack-sidebar-empty">No status data yet.</p>
+              )}
+            </div>
+          </aside>
+        </div>
       </main>
 
       {attachmentPreview && (

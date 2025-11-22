@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLIENT_DIR="/workspace/client"
+SPEC_PATTERN="${1:-meeting-panel.spec.ts}"
+EXTRA_ARGS="${PLAYWRIGHT_ARGS:-}"
+
+if [ ! -d "$CLIENT_DIR" ]; then
+  echo "Client directory not found at $CLIENT_DIR" >&2
+  exit 1
+fi
+
+cd "$CLIENT_DIR"
+if [ ! -d node_modules ]; then
+  echo "node_modules missing; installing dependencies via npm ci" >&2
+  npm ci
+fi
+
+BASE_URL="${BASE_URL:-http://client:5173}"
+export VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://server:3001}"
+
+echo "Running Playwright against ${BASE_URL} (API ${VITE_API_BASE_URL})"
+npx playwright test "$SPEC_PATTERN" --config=playwright.config.ts ${EXTRA_ARGS}

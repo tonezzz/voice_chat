@@ -9,10 +9,6 @@ if not exist ".env" (
   goto :error
 )
 
-if not exist ".env.secure" (
-  echo [ERROR] Missing .env.secure. Create it and keep it with the repo before pushing.
-  goto :error
-)
 
 call :section "Installing client deps (npm ci)"
 pushd client >nul
@@ -47,7 +43,7 @@ popd >nul
 
 echo.
 call :section "docker compose config validation (dotenv)"
-call npx dotenv -e .env -e .env.secure -- docker compose -f docker-compose.yml config >nul || goto :error
+call npx dotenv -e .env -- docker compose -f docker-compose.yml config >nul || goto :error
 
 echo.
 echo [OK] Pre-push checks completed.

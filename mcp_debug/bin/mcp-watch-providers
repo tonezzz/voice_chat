@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INTERVAL="${1:-30}"
+if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -le 0 ]; then
+  echo "Interval must be a positive integer (seconds)" >&2
+  exit 1
+fi
+
+echo "[mcp-watch-providers] polling every ${INTERVAL}s (Ctrl+C to stop)"
+while true; do
+  echo "--- $(date -Iseconds) ---"
+  if ! mcp-providers-refresh; then
+    echo "!! provider refresh failed"
+  fi
+  sleep "$INTERVAL"
+done

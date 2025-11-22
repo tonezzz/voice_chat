@@ -1,16 +1,19 @@
 # escape=`
-FROM mcr.microsoft.com/windows/python:3.12-windowsservercore-ltsc2022
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
 
 SHELL ["powershell", "-NoLogo", "-Command"]
 
-ENV PYTHONUNBUFFERED=1 `
+ENV PYTHON_VERSION=3.12.7 `
+    PYTHONUNBUFFERED=1 `
     PIP_NO_CACHE_DIR=1 `
     PORT=8006
+
+RUN $ErrorActionPreference = 'Stop'; $installer = 'C:/python-installer.exe'; Invoke-WebRequest -Uri "https://www.python.org/ftp/python/${Env:PYTHON_VERSION}/python-${Env:PYTHON_VERSION}-amd64.exe" -OutFile $installer; Start-Process -FilePath $installer -ArgumentList '/quiet InstallAllUsers=1 PrependPath=1 Include_test=0' -Wait; Remove-Item $installer; python -m pip install --upgrade pip
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --no-cache-dir -r requirements.txt
 
 # Copy upstream sources plus config overrides and native vendor assets
 COPY upstream/ ./src/

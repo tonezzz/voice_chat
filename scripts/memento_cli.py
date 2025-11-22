@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, Tuple
 
 
 DEFAULT_ENDPOINT = os.environ.get("MEMENTO_MCP_URL", "http://localhost:8005")
+DEFAULT_TIMEOUT = float(os.environ.get("MEMENTO_CLI_TIMEOUT", "60"))
 JSON_RPC_PATH = "/invoke"
 
 
@@ -112,7 +113,7 @@ def interpret_command(command: str) -> Tuple[str, Dict[str, Any]]:
     )
 
 
-def invoke_tool(endpoint: str, tool: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+def invoke_tool(endpoint: str, tool: str, arguments: Dict[str, Any], timeout: float) -> Dict[str, Any]:
     payload = {
         "tool": tool,
         "arguments": arguments,
@@ -124,7 +125,7 @@ def invoke_tool(endpoint: str, tool: str, arguments: Dict[str, Any]) -> Dict[str
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
             return json.loads(body)
     except urllib.error.HTTPError as exc:
@@ -158,22 +159,43 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--tool", help="Explicit tool name (overrides natural-language parser)")
     parser.add_argument("--arguments", help="JSON arguments when --tool is supplied")
+    parser.add_argument(
+        "--arguments-file",
+        help="Path to a JSON file containing arguments (handy on Windows to avoid shell escaping)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"HTTP timeout in seconds (default: {DEFAULT_TIMEOUT})",
+    )
 
     args = parser.parse_args(argv)
 
     if args.tool:
-        if not args.arguments:
-            parser.error("--arguments is required when --tool is provided")
-        try:
-            arguments = json.loads(args.arguments)
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"Invalid JSON for --arguments: {exc}") from exc
+        if args.arguments and args.arguments_file:
+            parser.error("--arguments and --arguments-file cannot be used together")
+        if args.arguments_file:
+            try:
+                with open(args.arguments_file, "r", encoding="utf-8") as handle:
+                    arguments = json.load(handle)
+            except OSError as exc:
+                raise SystemExit(f"Failed to read arguments file: {exc}") from exc
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"Invalid JSON in arguments file: {exc}") from exc
+        else:
+            if not args.arguments:
+                parser.error("Provide --arguments or --arguments-file when --tool is supplied")
+            try:
+                arguments = json.loads(args.arguments)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"Invalid JSON for --arguments: {exc}") from exc
         tool = args.tool
     else:
         tool, arguments = interpret_command(args.command)
 
     try:
-        response = invoke_tool(args.endpoint, tool, arguments)
+        response = invoke_tool(args.endpoint, tool, arguments, timeout=args.timeout)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

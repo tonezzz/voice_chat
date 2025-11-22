@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVER_URL="${SERVER_URL:-http://server:3001}"
+HTTP_TIMEOUT="${HTTP_TIMEOUT:-25}"
+URL="${SERVER_URL}/mcp/providers?refresh=true"
+
+echo "[mcp-providers-refresh] GET ${URL}"
+start_ms=$(date +%s%3N)
+if output=$(http --timeout "$HTTP_TIMEOUT" --pretty=format GET "$URL"); then
+  end_ms=$(date +%s%3N)
+  duration_ms=$((end_ms - start_ms))
+  echo "$output"
+  echo "-- duration: ${duration_ms}ms"
+else
+  status=$?
+  echo "!! refresh failed (exit ${status})"
+  exit $status
+fi

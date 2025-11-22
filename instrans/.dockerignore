@@ -1,0 +1,10 @@
+.git
+node_modules
+npm-debug.log
+Dockerfile*
+yarn.lock
+pnpm-lock.yaml
+*.log
+dist
+client/node_modules
+server/node_modules

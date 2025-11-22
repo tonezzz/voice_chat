@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_DIR="${LOG_DIR:-/workspace/logs}"
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"
+TAIL_FILES="${TAIL_FILES:-}"
+TTYD_ENABLED="${TTYD_ENABLED:-true}"
+TTYD_PORT="${TTYD_PORT:-7681}"
+TTYD_EXTRA_ARGS="${TTYD_EXTRA_ARGS:-}"
+mkdir -p "$LOG_DIR"
+
+cleanup() {
+  if [[ -n "${TAIL_PID:-}" ]]; then
+    kill "$TAIL_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${TTYD_PID:-}" ]]; then
+    kill "$TTYD_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if [[ -n "$TAIL_FILES" ]]; then
+  echo "[mcp-debug] Tailing logs: $TAIL_FILES"
+  # shellcheck disable=SC2086
+  tail -n0 -F $TAIL_FILES &
+  TAIL_PID=$!
+else
+  echo "[mcp-debug] No TAIL_FILES configured. Set TAIL_FILES='/workspace/logs/*.log' to stream logs."
+fi
+
+if [[ "$TTYD_ENABLED" != "false" ]]; then
+  echo "[mcp-debug] Starting ttyd web shell on port ${TTYD_PORT}"
+  # shellcheck disable=SC2086
+  ttyd --port "$TTYD_PORT" --interface 0.0.0.0 $TTYD_EXTRA_ARGS bash &
+  TTYD_PID=$!
+else
+  echo "[mcp-debug] ttyd disabled (set TTYD_ENABLED=true to enable web shell)"
+fi
+
+cat <<'BANNER'
+============================================================
+ MCP Debug Helper - container is running
+ Use docker exec -it mcp-debug bash  to open a shell.
+ Set TAIL_FILES="/workspace/logs/*.log" (or similar) to stream
+ matching files automatically to docker logs.
+============================================================
+BANNER
+
+while true; do
+  timestamp=$(date -Iseconds)
+  recent=$(ls -1t "$LOG_DIR" 2>/dev/null | head -n 5 || true)
+  echo "[${timestamp}] heartbeat :: LOG_DIR=${LOG_DIR}"
+  if [[ -n "${TTYD_PID:-}" ]]; then
+    echo "  ttyd status: running on port ${TTYD_PORT} (PID ${TTYD_PID})"
+  else
+    echo "  ttyd status: disabled"
+  fi
+  if [[ -n "$recent" ]]; then
+    echo "  recent logs:" $recent
+  else
+    echo "  (no log files yet)"
+  fi
+  sleep "$HEARTBEAT_INTERVAL"
+done

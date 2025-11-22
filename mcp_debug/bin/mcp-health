@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVER_URL="${SERVER_URL:-http://server:3001}"
+HTTP_TIMEOUT="${HTTP_TIMEOUT:-15}"
+
+echo "[mcp-health] GET ${SERVER_URL}/health"
+http --timeout "$HTTP_TIMEOUT" --pretty=format GET "${SERVER_URL}/health"

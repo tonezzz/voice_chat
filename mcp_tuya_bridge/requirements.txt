@@ -1,0 +1,4 @@
+fastapi==0.115.2
+uvicorn[standard]==0.32.0
+pydantic==2.10.4
+mcp-sdk @ git+https://github.com/tuya/tuya-mcp-sdk.git#subdirectory=mcp-python

@@ -1,0 +1,56 @@
+[
+  {
+    "name": "vms-get-channels",
+    "service": "vms",
+    "envVar": "VMS_MCP_URL",
+    "path": "/invoke",
+    "tool": "get_channels",
+    "arguments": {
+      "ctx": {"type": "system", "reason": "health-check" }
+    }
+  },
+  {
+    "name": "meeting-start-session",
+    "service": "meeting",
+    "envVar": "MEETING_MCP_URL",
+    "path": "/invoke",
+    "tool": "start_meeting",
+    "arguments": {
+      "session_id": "persistence-demo",
+      "title": "Persistence Demo",
+      "participants": ["bot", "human"],
+      "language_hint": "en",
+      "tags": ["automation", "persistence"]
+    }
+  },
+  {
+    "name": "meeting-append-transcript",
+    "service": "meeting",
+    "envVar": "MEETING_MCP_URL",
+    "path": "/invoke",
+    "tool": "append_transcript",
+    "arguments": {
+      "session_id": "persistence-demo",
+      "text": "Validated persistence wiring",
+      "speaker": "bot",
+      "source": "automation",
+      "metadata": {"step": "append"}
+    }
+  },
+  {
+    "name": "meeting-list-sessions",
+    "service": "meeting",
+    "envVar": "MEETING_MCP_URL",
+    "path": "/invoke",
+    "tool": "list_sessions",
+    "arguments": {}
+  },
+  {
+    "name": "memento-search-nodes",
+    "service": "memento",
+    "envVar": "MEMENTO_MCP_URL",
+    "path": "/invoke",
+    "tool": "search_nodes",
+    "arguments": {"query": "health-check"}
+  }
+]

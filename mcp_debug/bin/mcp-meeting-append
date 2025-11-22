@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVER_URL="${SERVER_URL:-http://server:3001}"
+HTTP_TIMEOUT="${HTTP_TIMEOUT:-15}"
+
+if [ "$#" -lt 2 ]; then
+  echo "Usage: mcp-meeting-append <sessionId> <text|-> [speaker]" >&2
+  exit 1
+fi
+
+SESSION_ID="$1"
+shift
+
+if [ "$1" = "-" ]; then
+  TEXT="$(cat)"
+else
+  TEXT="$1"
+fi
+shift || true
+SPEAKER="${1:-}"
+
+if [ -z "${SESSION_ID}" ]; then
+  echo "sessionId required" >&2
+  exit 1
+fi
+
+TRIMMED="$(echo "$TEXT" | sed 's/^\s\+//;s/\s\+$//')"
+if [ -z "$TRIMMED" ]; then
+  echo "text required" >&2
+  exit 1
+fi
+
+ARGS=(
+  sessionId="$SESSION_ID"
+  text="$TRIMMED"
+)
+if [ -n "$SPEAKER" ]; then
+  ARGS+=(speaker="$SPEAKER")
+fi
+
+echo "[mcp-meeting-append] POST ${SERVER_URL}/meeting/append-transcript"
+http --timeout "$HTTP_TIMEOUT" --pretty=format POST "${SERVER_URL}/meeting/append-transcript" "${ARGS[@]}"

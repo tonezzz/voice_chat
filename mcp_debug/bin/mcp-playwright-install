@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLIENT_DIR="/workspace/client"
+if [ ! -d "$CLIENT_DIR" ]; then
+  echo "Client directory not found at $CLIENT_DIR" >&2
+  exit 1
+fi
+
+cd "$CLIENT_DIR"
+if [ -f package-lock.json ]; then
+  npm ci
+else
+  npm install
+fi
+npx playwright install chromium

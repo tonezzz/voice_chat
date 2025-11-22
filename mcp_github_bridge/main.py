@@ -9,6 +9,8 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
+from contextlib import asynccontextmanager
+
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
@@ -211,20 +213,22 @@ if not TOKEN:
     logger.warning("GITHUB_PERSONAL_TOKEN is not set. GitHub bridge will report degraded health.")
 
 bridge = GithubMCPBridge(TOKEN or "")
-app = FastAPI(title="mcp-github-bridge", version="0.1.0")
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     if not TOKEN:
         logger.error("GITHUB_PERSONAL_TOKEN missing; github bridge cannot start")
+        yield
         return
     await bridge.start()
+    try:
+        yield
+    finally:
+        await bridge.stop()
 
 
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    await bridge.stop()
+app = FastAPI(title="mcp-github-bridge", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health", response_model=BridgeStatus)

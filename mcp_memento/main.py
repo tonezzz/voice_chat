@@ -7,6 +7,8 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
@@ -68,7 +70,9 @@ class MementoBridge:
             self._stderr_task = asyncio.create_task(self._drain_stream(self._proc.stderr))
         self._reader_task = asyncio.create_task(self._listen_for_responses())
 
+        logger.info("Initializing MCP session with memento")
         await self._initialize_session()
+        logger.info("MCP session initialized")
 
     async def stop(self) -> None:
         if not self._proc:
@@ -93,14 +97,14 @@ class MementoBridge:
         self._stderr_task = None
 
     async def invoke_tool(self, tool: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        params = {"tool": tool, "arguments": arguments or {}}
+        params = {"name": tool, "tool": tool, "toolName": tool, "arguments": arguments or {}}
         try:
-            return await self._request("tools/call", params)
+            return await self._request("tools.invoke", params)
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {}
             if isinstance(detail, dict) and detail.get("code") == -32601:
-                # Some MCP servers expose tools via tools.invoke (older spec). Try that as a fallback.
-                return await self._request("tools.invoke", params)
+                # Fall back to tools/call for newer servers.
+                return await self._request("tools/call", params)
             raise
 
     async def _initialize_session(self) -> None:
@@ -115,15 +119,14 @@ class MementoBridge:
         self._capabilities = init_response or {}
         await self._notify("notifications/initialized", {})
 
-    async def _request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _request(self, method: str, params: Dict[str, Any], timeout: float = 300.0) -> Dict[str, Any]:
         if not self.is_running or not self._writer:
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "memento bridge is not running")
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "memento bridge not running")
 
         async with self._lock:
             self._id_seq += 1
             req_id = self._id_seq
-            loop = asyncio.get_running_loop()
-            future: asyncio.Future[Dict[str, Any]] = loop.create_future()
+            future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
             self._pending[req_id] = future
             payload = {
                 "jsonrpc": "2.0",
@@ -131,11 +134,14 @@ class MementoBridge:
                 "method": method,
                 "params": params,
             }
-            message = json.dumps(payload) + "\n"
-            self._writer.write(message.encode("utf-8"))
-            await self._writer.drain()
+            await self._send_message(payload)
 
-        result = await future
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(req_id, None)
+            raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, f"memento request timed out ({method})")
+
         error = result.get("error") if isinstance(result, dict) else None
         if error:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=error)
@@ -149,25 +155,15 @@ class MementoBridge:
             "method": method,
             "params": params,
         }
-        message = json.dumps(payload) + "\n"
-        self._writer.write(message.encode("utf-8"))
-        await self._writer.drain()
+        await self._send_message(payload)
 
     async def _listen_for_responses(self) -> None:
         assert self._reader
         reader = self._reader
         while True:
-            line = await reader.readline()
-            if not line:
+            message = await self._read_message(reader)
+            if message is None:
                 break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line.decode("utf-8"))
-            except json.JSONDecodeError:
-                logger.warning("Failed to decode MCP message: %s", line)
-                continue
             response_id = message.get("id")
             if response_id is not None:
                 future = self._pending.pop(int(response_id), None)
@@ -175,6 +171,66 @@ class MementoBridge:
                     future.set_result(message)
             else:
                 logger.debug("Received MCP notification: %s", message)
+
+    async def _send_message(self, payload: Dict[str, Any]) -> None:
+        assert self._writer
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        if self._logger.level <= logging.DEBUG:
+            self._logger.debug("--> %s", payload)
+        self._writer.write(header + body)
+        await self._writer.drain()
+
+    async def _read_message(self, reader: asyncio.StreamReader) -> Optional[Dict[str, Any]]:
+        line = await reader.readline()
+        if not line:
+            return None
+        stripped = line.strip()
+        if not stripped:
+            return None
+        # Content-Length framed payloads (spec-compliant path)
+        if stripped.lower().startswith(b"content-length:"):
+            headers: Dict[str, str] = {}
+            first = stripped.decode("utf-8")
+            _, value = first.split(":", 1)
+            headers["content-length"] = value.strip()
+            while True:
+                header_line = await reader.readline()
+                if not header_line:
+                    return None
+                if header_line in (b"\r\n", b"\n"):
+                    break
+                decoded = header_line.decode("utf-8").strip()
+                if not decoded or ":" not in decoded:
+                    continue
+                key, val = decoded.split(":", 1)
+                headers[key.strip().lower()] = val.strip()
+            content_length = int(headers.get("content-length", "0"))
+            if content_length <= 0:
+                logger.warning("Received MCP message without Content-Length header")
+                return None
+            try:
+                body = await reader.readexactly(content_length)
+            except asyncio.IncompleteReadError:
+                return None
+            try:
+                message = json.loads(body.decode("utf-8"))
+                if self._logger.level <= logging.DEBUG:
+                    self._logger.debug("<-- %s", message)
+                return message
+            except json.JSONDecodeError:
+                logger.warning("Failed to decode MCP message body: %s", body)
+                return None
+
+        # Legacy newline-delimited JSON payloads
+        try:
+            message = json.loads(stripped.decode("utf-8"))
+            if self._logger.level <= logging.DEBUG:
+                self._logger.debug("<-- %s", message)
+            return message
+        except json.JSONDecodeError:
+            logger.warning("Failed to decode MCP line: %s", stripped)
+            return None
 
     async def _drain_stream(self, stream: asyncio.StreamReader) -> None:
         while True:
@@ -199,8 +255,14 @@ class MementoBridge:
 def _build_memento_env() -> Dict[str, str]:
     overrides: Dict[str, str] = {}
     default_db_path = os.environ.get("MEMENTO_DB_PATH", "/data/memento.db")
+    default_cache_root = os.environ.get("MEMENTO_CACHE_ROOT", "/data/cache")
     overrides.setdefault("MEMORY_DB_DRIVER", os.environ.get("MEMENTO_DB_DRIVER", "sqlite"))
     overrides.setdefault("MEMORY_DB_PATH", default_db_path)
+    overrides.setdefault("TRANSFORMERS_CACHE", os.environ.get("TRANSFORMERS_CACHE", default_cache_root))
+    overrides.setdefault("XDG_CACHE_HOME", os.environ.get("XDG_CACHE_HOME", default_cache_root))
+    overrides.setdefault("HUGGINGFACE_HUB_CACHE", os.environ.get("HUGGINGFACE_HUB_CACHE", default_cache_root))
+    if os.environ.get("MEMENTO_DEBUG"):
+        overrides["DEBUG"] = os.environ["MEMENTO_DEBUG"]
 
     passthrough_vars = [
         "MEMORY_DB_DRIVER",
@@ -214,6 +276,10 @@ def _build_memento_env() -> Dict[str, str]:
         "PGPASSWORD",
         "PGDATABASE",
         "PGSSLMODE",
+        "TRANSFORMERS_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "XDG_CACHE_HOME",
+        "DEBUG",
     ]
     for var in passthrough_vars:
         value = os.environ.get(var)
@@ -223,17 +289,18 @@ def _build_memento_env() -> Dict[str, str]:
 
 
 bridge = MementoBridge(command=os.environ.get("MEMENTO_COMMAND", "memento"), env_overrides=_build_memento_env())
-app = FastAPI(title=DEFAULT_BRIDGE_NAME, version=DEFAULT_BRIDGE_VERSION)
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     await bridge.start()
+    try:
+        yield
+    finally:
+        await bridge.stop()
 
 
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    await bridge.stop()
+app = FastAPI(title=DEFAULT_BRIDGE_NAME, version=DEFAULT_BRIDGE_VERSION, lifespan=lifespan)
 
 
 @app.get("/health", response_model=BridgeStatus)
@@ -252,7 +319,9 @@ async def manifest() -> Dict[str, Any]:
 
 @app.post("/invoke")
 async def invoke(request: InvokeRequest) -> Dict[str, Any]:
+    logger.info("/invoke %s", request.tool)
     result = await bridge.invoke_tool(request.tool, request.arguments)
+    logger.info("/invoke %s completed", request.tool)
     return result
 
 

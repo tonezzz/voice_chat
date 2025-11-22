@@ -1,0 +1,13 @@
+version: "2"
+# Shared ngrok agent exposes multiple internal services.
+# Edit/add tunnels here, then restart the ngrok container.
+tunnels:
+  server:
+    proto: http
+    addr: server:3001
+    # Uncomment to pin a hostname or domain you own:
+    # hostname: your-subdomain.ngrok.app
+  mcp-debug:
+    proto: http
+    addr: mcp-debug:7681
+    # For ttyd auth, update MCP_DEBUG_TTYD_EXTRA_ARGS or wrap via reverse proxy.

@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     allow_origins: str | None = Field(None, alias="MCP0_ALLOW_ORIGINS")
     github_token: Optional[str] = Field(None, alias="GITHUB_MCP_TOKEN")
     github_personal_token: Optional[str] = Field(None, alias="GITHUB_PERSONAL_TOKEN")
+    enable_dynamic_github_tools: bool = Field(False, alias="MCP0_ENABLE_DYNAMIC_GITHUB_TOOLS")
+    github_tool_source: Optional[str] = Field(None, alias="GITHUB_MCP_TOOLS")
 
     class Config:
         env_file = ".env"

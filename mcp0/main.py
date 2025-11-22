@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import logging
 from typing import Any, Dict, List
 
 import httpx
@@ -11,6 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from registry import ProviderRegistry
 from schemas import AggregatedHealth, ProviderInfo, ProxyResponse
 from settings import Settings, get_settings
+from tool_loader import ToolSourceError, load_tools_from_source
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -20,6 +24,33 @@ if github_bearer:
     auth_headers["github"] = {"Authorization": f"Bearer {github_bearer}"}
 
 registry = ProviderRegistry.from_env(settings.provider_list, auth_headers=auth_headers or None)
+
+
+def _apply_dynamic_github_tools() -> None:
+    if not settings.enable_dynamic_github_tools:
+        return
+    if not settings.github_tool_source:
+        logger.warning(
+            "MCP0_ENABLE_DYNAMIC_GITHUB_TOOLS is true but GITHUB_MCP_TOOLS is unset; skipping dynamic load"
+        )
+        return
+
+    descriptor = registry.get_descriptor("githubModel")
+    if not descriptor:
+        logger.warning("Dynamic GitHub tools enabled, but provider 'githubModel' not found")
+        return
+
+    try:
+        result = load_tools_from_source(settings.github_tool_source)
+    except ToolSourceError as exc:
+        logger.warning("Failed to load dynamic GitHub tools: %s", exc)
+        return
+
+    descriptor.default_tools = result.tools
+    logger.info("Loaded %d GitHub MCP tools from %s", len(result.tools), result.source)
+
+
+_apply_dynamic_github_tools()
 
 
 @asynccontextmanager

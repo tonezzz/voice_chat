@@ -1,10 +1,11 @@
+const path = require('path');
+const fs = require('fs');
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const multer = require('multer');
 const FormData = require('form-data');
-const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const Tesseract = require('tesseract.js');
 
@@ -85,6 +86,140 @@ app.post('/verify-slip', upload.single('file'), async (req, res) => {
   }
 });
 
+app.get('/meeting/sessions', async (req, res) => {
+  try {
+    if (!MEETING_MCP_URL) {
+      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
+    }
+
+    const includeArchived = String(req.query.includeArchived).toLowerCase() === 'true';
+    const payload = await invokeMeetingTool('list_sessions', {
+      include_archived: includeArchived
+    });
+    return res.json(unwrapMeetingResponse(payload));
+  } catch (err) {
+    console.error('meeting sessions list failed', err);
+    return res.status(502).json({ error: err?.message || 'meeting_sessions_failed' });
+  }
+});
+
+app.post('/meeting/sessions', async (req, res) => {
+  try {
+    if (!MEETING_MCP_URL) {
+      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
+    }
+
+    const { sessionId, title, participants, tags, language } = req.body || {};
+    if (typeof sessionId !== 'string' || !sessionId.trim()) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+    const session = await invokeMeetingTool('start_meeting', {
+      session_id: sessionId.trim(),
+      title: typeof title === 'string' ? title : undefined,
+      participants: Array.isArray(participants) ? participants : undefined,
+      language: typeof language === 'string' ? language : undefined,
+      tags: Array.isArray(tags) ? tags : undefined
+    });
+    return res.json(unwrapMeetingResponse(session));
+  } catch (err) {
+    console.error('meeting session create failed', err);
+    return res.status(502).json({ error: err?.message || 'meeting_session_create_failed' });
+  }
+});
+
+app.get('/meeting/sessions/:sessionId', async (req, res) => {
+  try {
+    if (!MEETING_MCP_URL) {
+      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
+    }
+
+    const sessionId = (req.params.sessionId || '').trim();
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+    let entryLimit;
+    if (typeof req.query.entryLimit !== 'undefined') {
+      const parsed = Number(req.query.entryLimit);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        entryLimit = parsed;
+      }
+    }
+    const payload = await invokeMeetingTool('get_meeting_notes', {
+      session_id: sessionId,
+      entry_limit: entryLimit
+    });
+    return res.json(unwrapMeetingResponse(payload));
+  } catch (err) {
+    console.error('meeting session detail failed', err);
+    return res.status(502).json({ error: err?.message || 'meeting_session_detail_failed' });
+  }
+});
+
+app.post('/meeting/sessions/:sessionId/summarize', async (req, res) => {
+  try {
+    if (!MEETING_MCP_URL) {
+      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
+    }
+
+    const sessionId = (req.params.sessionId || '').trim();
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+    let maxEntries;
+    if (typeof req.body?.maxEntries !== 'undefined') {
+      const parsed = Number(req.body.maxEntries);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        maxEntries = parsed;
+      }
+    }
+    const payload = await invokeMeetingTool('summarize_meeting', {
+      session_id: sessionId,
+      max_entries: maxEntries
+    });
+    return res.json(unwrapMeetingResponse(payload));
+  } catch (err) {
+    console.error('meeting session summarize failed', err);
+    return res.status(502).json({ error: err?.message || 'meeting_session_summarize_failed' });
+  }
+});
+
+app.post('/meeting/append-transcript', async (req, res) => {
+  try {
+    if (!MEETING_MCP_URL) {
+      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
+    }
+
+    const { sessionId, text, speaker, participants, title, tags, language } = req.body || {};
+    const trimmed = typeof text === 'string' ? text.trim() : '';
+    if (!trimmed) {
+      return res.status(400).json({ error: 'text is required' });
+    }
+
+    const meetingSessionId = typeof sessionId === 'string' && sessionId.trim().length ? sessionId.trim() : `browser-${Date.now()}`;
+
+    await invokeMeetingTool('start_meeting', {
+      session_id: meetingSessionId,
+      title: typeof title === 'string' ? title : undefined,
+      participants: Array.isArray(participants) ? participants : undefined,
+      language,
+      tags: Array.isArray(tags) ? tags : undefined
+    });
+
+    const entry = await invokeMeetingTool('append_transcript', {
+      session_id: meetingSessionId,
+      text: trimmed,
+      speaker: typeof speaker === 'string' ? speaker : undefined,
+      source_label: 'browser_stt'
+    });
+
+    return res.json({ sessionId: meetingSessionId, entry: unwrapMeetingResponse(entry) });
+  } catch (err) {
+    console.error('meeting append failed', err);
+    const detail = err?.message || 'meeting_append_failed';
+    return res.status(502).json({ error: detail });
+  }
+});
+
 app.post('/voice-chat-stream', async (req, res) => {
   setupSse(res);
   const { message, model, accelerator, sessionId, sessionName, history, voice, provider } = req.body || {};
@@ -112,6 +247,8 @@ app.post('/voice-chat-stream', async (req, res) => {
     session.provider = requestedProvider;
   }
 
+  ensureAutomationSystemMessage(session);
+
   addSessionMessage(session, {
     role: 'user',
     content: message,
@@ -128,14 +265,26 @@ app.post('/voice-chat-stream', async (req, res) => {
     let toolRuns = [];
 
     if (streamingEnabled) {
-      const streamResult = await streamOllamaCompletion({
+      const commonParams = {
         session,
         modelToUse,
         accelerator,
+        body: req.body,
         onDelta: (delta, accumulated) => {
           sendSseEvent(res, { type: 'delta', delta, full: accumulated });
         }
-      });
+      };
+
+      let streamResult;
+      if (isAnthropicProvider(session.provider)) {
+        streamResult = await streamAnthropicCompletion(commonParams);
+      } else if (isOpenAiProvider(session.provider)) {
+        streamResult = await streamOpenAiCompletion(commonParams);
+      } else if (isGithubProvider(session.provider)) {
+        streamResult = await streamGithubCompletion(commonParams);
+      } else {
+        streamResult = await streamOllamaCompletion(commonParams);
+      }
       reply = streamResult.reply;
       resolvedServer = streamResult.resolvedServer;
       if (reply && MCP0_BASE_URL) {
@@ -476,9 +625,13 @@ const IMAGE_MCP_GPU_URL = resolveServiceUrl(process.env.IMAGE_MCP_GPU_URL);
 const IDP_MCP_URL = resolveServiceUrl(process.env.IDP_MCP_URL, 'http://localhost:8004');
 const IDP_MCP_GPU_URL = resolveServiceUrl(process.env.IDP_MCP_GPU_URL, 'http://localhost:8104');
 const MEMENTO_MCP_URL = resolveServiceUrl(process.env.MEMENTO_MCP_URL, 'http://localhost:8005');
+const MEETING_MCP_URL = resolveServiceUrl(process.env.MEETING_MCP_URL, 'http://localhost:8008');
+const MEETING_PROVIDER_NAME = 'meeting';
+const VMS_MCP_URL = resolveServiceUrl(process.env.VMS_MCP_URL, 'http://localhost:8006');
+const TUYA_MCP_URL = resolveServiceUrl(process.env.TUYA_MCP_URL, 'http://localhost:8007');
 const MCP0_URL = process.env.MCP0_URL || '';
 const MCP0_BASE_URL = MCP0_URL ? MCP0_URL.replace(/\/$/, '') : '';
-const MCP0_TIMEOUT_MS = Number(process.env.MCP0_TIMEOUT_MS) || 10000;
+const MCP0_TIMEOUT_MS = Number(process.env.MCP0_TIMEOUT_MS) || 25000;
 const GITHUB_MCP_URL = process.env.GITHUB_MCP_URL || 'https://mcp.github.com';
 const GITHUB_MCP_HEALTH_PATH = process.env.GITHUB_MCP_HEALTH_PATH || '/health';
 const OCR_DEFAULT_LANG = process.env.OCR_LANG || 'eng';
@@ -543,7 +696,10 @@ const normalizeProvider = (provider) => {
   return lowered;
 };
 
-const providerSupportsStreaming = (provider) => normalizeProvider(provider) === 'ollama';
+const providerSupportsStreaming = (provider) => {
+  const normalized = normalizeProvider(provider);
+  return normalized === 'ollama' || normalized === 'anthropic' || normalized === 'openai' || normalized === 'github';
+};
 
 const isAnthropicProvider = (provider = NORMALIZED_BASE_PROVIDER) => normalizeProvider(provider) === 'anthropic';
 const isOpenAiProvider = (provider = NORMALIZED_BASE_PROVIDER) => normalizeProvider(provider) === 'openai';
@@ -654,76 +810,147 @@ const closeSse = (res) => {
   res.end();
 };
 
+const parseReadableChunks = async function* (readableStream) {
+  if (!readableStream) {
+    return;
+  }
+
+  const isWebStream = typeof readableStream.getReader === 'function';
+  const hasAsyncIterator = typeof readableStream[Symbol.asyncIterator] === 'function';
+
+  if (isWebStream) {
+    const reader = readableStream.getReader();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          if (value) {
+            yield value;
+          }
+          break;
+        }
+        if (value) {
+          yield value;
+        }
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+    return;
+  }
+
+  if (hasAsyncIterator) {
+    for await (const chunk of readableStream) {
+      yield chunk;
+    }
+    return;
+  }
+
+  // Fall back to legacy Node Readable streams without async iterator (very old libs)
+  if (typeof readableStream.on === 'function') {
+    const { once } = require('events');
+    readableStream.pause?.();
+    try {
+      while (true) {
+        const [chunk] = await once(readableStream, 'data');
+        if (!chunk) {
+          break;
+        }
+        yield chunk;
+      }
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  throw new Error('Unsupported readable stream type');
+};
+
 const parseSseStream = async function* (readableStream) {
-  const reader = readableStream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
 
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
+  const emitBufferedEvents = function* () {
+    let separatorIndex;
+    while ((separatorIndex = buffer.indexOf('\n\n')) >= 0) {
+      const rawEvent = buffer.slice(0, separatorIndex);
+      buffer = buffer.slice(separatorIndex + 2);
+      if (!rawEvent.trim()) {
+        continue;
       }
-      buffer += decoder.decode(value, { stream: true });
-
-      let separatorIndex;
-      while ((separatorIndex = buffer.indexOf('\n\n')) >= 0) {
-        const rawEvent = buffer.slice(0, separatorIndex);
-        buffer = buffer.slice(separatorIndex + 2);
-        if (!rawEvent.trim()) {
-          continue;
-        }
-        const lines = rawEvent.split(/\r?\n/);
-        const dataLines = lines
-          .filter((line) => line.startsWith('data:'))
-          .map((line) => line.slice(5).trim());
-        if (!dataLines.length) {
-          continue;
-        }
-        yield dataLines.join('\n');
+      const lines = rawEvent.split(/\r?\n/);
+      const dataLines = lines
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trim());
+      if (!dataLines.length) {
+        continue;
       }
+      yield dataLines.join('\n');
     }
+  };
 
-    const remaining = buffer.trim();
-    if (remaining.startsWith('data:')) {
-      yield remaining.slice(5).trim();
+  const flushTrailingBuffer = function* () {
+    if (!buffer.trim()) {
+      return;
     }
-  } finally {
-    reader.releaseLock?.();
+    const lines = buffer.split(/\r?\n/);
+    const dataLines = lines
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trim());
+    if (dataLines.length) {
+      yield dataLines.join('\n');
+    }
+  };
+
+  const appendChunk = (value, options) => {
+    if (typeof value === 'string') {
+      buffer += value;
+    } else if (value != null) {
+      buffer += decoder.decode(value, options);
+    }
+  };
+
+  for await (const chunk of parseReadableChunks(readableStream)) {
+    if (typeof chunk === 'string') {
+      buffer += chunk;
+    } else if (chunk) {
+      const decoded = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : decoder.decode(chunk, { stream: true });
+      buffer += decoded;
+    }
+    for (const event of emitBufferedEvents()) {
+      yield event;
+    }
+  }
+
+  appendChunk(null, { stream: false });
+  for (const event of flushTrailingBuffer()) {
+    yield event;
   }
 };
 
 const parseNewlineJsonStream = async function* (readableStream) {
-  const reader = readableStream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
 
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
-      }
-      buffer += decoder.decode(value, { stream: true });
+  for await (const chunk of parseReadableChunks(readableStream)) {
+    if (!chunk) continue;
+    buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
 
-      let newlineIndex;
-      while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
-        const rawLine = buffer.slice(0, newlineIndex).trim();
-        buffer = buffer.slice(newlineIndex + 1);
-        if (!rawLine) {
-          continue;
-        }
-        yield rawLine;
+    let newlineIndex;
+    while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+      const rawLine = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      if (!rawLine) {
+        continue;
       }
+      yield rawLine;
     }
+  }
 
-    const tail = buffer.trim();
-    if (tail) {
-      yield tail;
-    }
-  } finally {
-    reader.releaseLock?.();
+  const tail = buffer.trim();
+  if (tail) {
+    yield tail;
   }
 };
 
@@ -901,6 +1128,20 @@ const callMcpTool = async ({ provider, tool, args = {} }) => {
     throw new Error('mcp_tool_missing');
   }
   return callMcpProxy({ provider, relativePath: 'invoke', payload: { tool, arguments: args || {} } });
+};
+
+const invokeMeetingTool = async (tool, args = {}) => {
+  if (!MEETING_MCP_URL) {
+    throw new Error('meeting_mcp_unconfigured');
+  }
+  return callMcpTool({ provider: MEETING_PROVIDER_NAME, tool, args });
+};
+
+const unwrapMeetingResponse = (payload) => {
+  if (payload && typeof payload === 'object' && payload.response && typeof payload.response === 'object') {
+    return payload.response;
+  }
+  return payload;
 };
 
 const extractMcpToolInstructions = (text) => {
@@ -1226,6 +1467,209 @@ const streamOllamaCompletion = async ({ session, modelToUse, accelerator, onDelt
   }
 
   return { reply: accumulated, resolvedServer: baseUrl };
+};
+
+const streamAnthropicCompletion = async ({ session, modelToUse, body, onDelta }) => {
+  if (!ANTHROPIC_API_KEY) {
+    throw new Error('anthropic_api_key_missing');
+  }
+
+  const payload = {
+    model: modelToUse || ANTHROPIC_MODEL,
+    max_tokens: resolveAnthropicMaxTokens(body?.anthropic_max_tokens),
+    temperature: resolveAnthropicTemperature(body?.anthropic_temperature),
+    messages: formatMessagesForAnthropic(session),
+    stream: true
+  };
+
+  const response = await fetch(ANTHROPIC_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': ANTHROPIC_VERSION
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok || !response.body) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(detail || 'anthropic_stream_error');
+  }
+
+  let accumulated = '';
+  for await (const rawEvent of parseSseStream(response.body)) {
+    if (!rawEvent) continue;
+    let eventPayload;
+    try {
+      eventPayload = JSON.parse(rawEvent);
+    } catch (err) {
+      console.warn('Skipping malformed Anthropic stream chunk', rawEvent, err);
+      continue;
+    }
+
+    if (eventPayload?.type === 'content_block_delta' && eventPayload?.delta?.type === 'text_delta') {
+      const chunkText = eventPayload.delta.text || '';
+      if (chunkText) {
+        accumulated += chunkText;
+        if (typeof onDelta === 'function') {
+          onDelta(chunkText, accumulated);
+        }
+      }
+    }
+
+    if (eventPayload?.type === 'message_stop' || eventPayload?.type === 'message_delta') {
+      if (eventPayload?.delta?.stop_reason) {
+        break;
+      }
+    }
+  }
+
+  return { reply: accumulated, resolvedServer: ANTHROPIC_API_URL };
+};
+
+const extractOpenAiDeltaText = (payload) => {
+  const choice = Array.isArray(payload?.choices) ? payload.choices[0] : null;
+  const delta = choice?.delta;
+  if (!delta) {
+    return '';
+  }
+
+  if (typeof delta.content === 'string') {
+    return delta.content;
+  }
+
+  if (Array.isArray(delta.content)) {
+    return delta.content
+      .map((part) => {
+        if (!part) return '';
+        if (typeof part === 'string') return part;
+        if (typeof part?.text === 'string') return part.text;
+        return '';
+      })
+      .join('');
+  }
+
+  if (typeof delta.text === 'string') {
+    return delta.text;
+  }
+
+  if (typeof delta?.content?.text === 'string') {
+    return delta.content.text;
+  }
+
+  return '';
+};
+
+const streamOpenAiCompletion = async ({ session, modelToUse, body, onDelta }) => {
+  if (!OPENAI_API_KEY) {
+    throw new Error('openai_api_key_missing');
+  }
+
+  const payload = {
+    model: modelToUse || OPENAI_MODEL,
+    max_tokens: resolveOpenAiMaxTokens(body?.openai_max_tokens),
+    temperature: resolveOpenAiTemperature(body?.openai_temperature),
+    messages: formatMessagesForOpenAi(session),
+    stream: true
+  };
+
+  const response = await fetch(OPENAI_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENAI_API_KEY}`
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok || !response.body) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(detail || 'openai_stream_error');
+  }
+
+  let accumulated = '';
+  for await (const rawEvent of parseSseStream(response.body)) {
+    if (!rawEvent) continue;
+    if (rawEvent.trim() === '[DONE]') {
+      break;
+    }
+    let eventPayload;
+    try {
+      eventPayload = JSON.parse(rawEvent);
+    } catch (err) {
+      console.warn('Skipping malformed OpenAI stream chunk', rawEvent, err);
+      continue;
+    }
+    const chunkText = extractOpenAiDeltaText(eventPayload);
+    if (chunkText) {
+      accumulated += chunkText;
+      if (typeof onDelta === 'function') {
+        onDelta(chunkText, accumulated);
+      }
+    }
+  }
+
+  return { reply: accumulated, resolvedServer: OPENAI_API_URL };
+};
+
+const streamGithubCompletion = async ({ session, modelToUse, body, onDelta }) => {
+  if (!GITHUB_MODEL_TOKEN) {
+    throw new Error('github_model_token_missing');
+  }
+
+  const deploymentOverride = body?.github_deployment || body?.githubDeployment;
+  const endpoint = resolveGithubEndpoint(deploymentOverride);
+  if (!endpoint) {
+    throw new Error('github_deployment_missing');
+  }
+
+  const payload = {
+    model: modelToUse || GITHUB_MODEL,
+    max_tokens: resolveGithubMaxTokens(body?.github_max_tokens ?? body?.githubMaxTokens ?? body?.max_tokens),
+    temperature: resolveGithubTemperature(body?.github_temperature ?? body?.githubTemperature ?? body?.temperature),
+    messages: formatMessagesForOpenAi(session),
+    stream: true
+  };
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${GITHUB_MODEL_TOKEN}`,
+      'X-GitHub-Api-Version': GITHUB_API_VERSION
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok || !response.body) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(detail || 'github_stream_error');
+  }
+
+  let accumulated = '';
+  for await (const rawEvent of parseSseStream(response.body)) {
+    if (!rawEvent) continue;
+    if (rawEvent.trim() === '[DONE]') {
+      break;
+    }
+    let eventPayload;
+    try {
+      eventPayload = JSON.parse(rawEvent);
+    } catch (err) {
+      console.warn('Skipping malformed GitHub stream chunk', rawEvent, err);
+      continue;
+    }
+    const chunkText = extractOpenAiDeltaText(eventPayload);
+    if (chunkText) {
+      accumulated += chunkText;
+      if (typeof onDelta === 'function') {
+        onDelta(chunkText, accumulated);
+      }
+    }
+  }
+
+  return { reply: accumulated, resolvedServer: endpoint };
 };
 
 const resolveAnthropicMaxTokens = (override) => {
@@ -1807,6 +2251,7 @@ app.get('/mcp0/providers', async (_req, res) => {
     const response = await requestWithTimeout(`${MCP0_BASE_URL}/providers`, { timeoutMs: MCP0_TIMEOUT_MS });
     if (!response.ok) {
       const detail = await response.text();
+      console.warn('[mcp0] provider list error', detail);
       return res.status(502).json({ error: 'mcp0_providers_error', detail });
     }
     const data = await response.json();
@@ -2096,15 +2541,12 @@ app.get('/mcp/providers', async (req, res) => {
     });
 
     if (!response.ok) {
-      const detail = await response.text().catch(() => '');
-      return res.status(502).json({ error: 'mcp0_error', detail: detail || `HTTP ${response.status}` });
+      const detail = await response.text();
+      console.warn('[mcp0] proxy providers error', detail);
+      return res.status(502).json({ error: 'mcp0_providers_error', detail });
     }
 
-    const payload = await response.json().catch(() => null);
-    if (!Array.isArray(payload)) {
-      return res.status(502).json({ error: 'mcp0_invalid_response' });
-    }
-
+    const payload = await response.json();
     return res.json(payload);
   } catch (err) {
     console.error('Failed to load MCP providers:', err);
@@ -2125,6 +2567,9 @@ app.get('/health', async (_req, res) => {
     checkServiceHealth({ name: 'idp', baseUrl: IDP_MCP_URL, path: '/health' }),
     checkServiceHealth({ name: 'idpGpu', baseUrl: IDP_MCP_GPU_URL, path: '/health' }),
     checkServiceHealth({ name: 'memento', baseUrl: MEMENTO_MCP_URL, path: '/health' }),
+    checkServiceHealth({ name: 'meeting', baseUrl: MEETING_MCP_URL, path: '/health' }),
+    checkServiceHealth({ name: 'vms', baseUrl: VMS_MCP_URL, path: '/health' }),
+    checkServiceHealth({ name: 'tuyaBridge', baseUrl: TUYA_MCP_URL, path: '/health' }),
     checkServiceHealth({ name: 'mcp0', baseUrl: MCP0_URL, path: '/health' }),
     checkServiceHealth({ name: 'githubMcp', baseUrl: GITHUB_MCP_URL, path: GITHUB_MCP_HEALTH_PATH }),
     checkAnthropicHealth(),
@@ -2152,7 +2597,10 @@ app.get('/health', async (_req, res) => {
     sttGpuUrl: STT_GPU_URL || null,
     openvoiceUrl: VOICE_FEATURE_ENABLED ? OPENVOICE_URL || null : null,
     openvoiceGpuUrl: VOICE_FEATURE_ENABLED ? OPENVOICE_GPU_URL || null : null,
-    yoloUrl: YOLO_MCP_URL || null,
+    mementoUrl: MEMENTO_MCP_URL || null,
+    meetingUrl: MEETING_MCP_URL || null,
+    vmsUrl: VMS_MCP_URL || null,
+    tuyaMcpUrl: TUYA_MCP_URL || null,
     mcpImagenUrl: IMAGE_MCP_URL || null,
     mcpImagenGpuUrl: IMAGE_MCP_GPU_URL || null,
     idpUrl: IDP_MCP_URL || null,
