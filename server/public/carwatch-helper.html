@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CarWatch helper</title>
+    <style>
+      :root {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: #0f172a;
+        color: #0f172a;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: radial-gradient(circle at top, #e0f2fe, #f8fafc 55%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 1.25rem;
+      }
+
+      .card {
+        width: min(720px, 100%);
+        background: #ffffff;
+        border-radius: 1rem;
+        padding: 1.5rem;
+        box-shadow: 0 30px 80px rgba(15, 23, 42, 0.25);
+        display: flex;
+        flex-direction: column;
+        gap: 1.25rem;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(1.3rem, 3vw, 1.6rem);
+        color: #0f172a;
+      }
+
+      p {
+        margin: 0;
+        color: #475569;
+      }
+
+      form {
+        display: grid;
+        gap: 1rem;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }
+
+      label {
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: #374151;
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+      }
+
+      input,
+      select,
+      textarea {
+        border-radius: 0.65rem;
+        border: 1px solid #cbd5f5;
+        padding: 0.55rem 0.7rem;
+        font-size: 1rem;
+        font-family: inherit;
+      }
+
+      textarea {
+        resize: vertical;
+        min-height: 90px;
+      }
+
+      .full-width {
+        grid-column: 1 / -1;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        justify-content: flex-end;
+        grid-column: 1 / -1;
+      }
+
+      button {
+        border: none;
+        border-radius: 999px;
+        padding: 0.75rem 1.5rem;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+        background: linear-gradient(135deg, #2563eb, #7c3aed);
+        color: white;
+        box-shadow: 0 15px 30px rgba(37, 99, 235, 0.3);
+      }
+
+      .status {
+        grid-column: 1 / -1;
+        border-radius: 0.75rem;
+        padding: 0.85rem 1rem;
+        font-weight: 600;
+        display: none;
+      }
+
+      .status.success {
+        display: block;
+        background: rgba(16, 185, 129, 0.12);
+        color: #065f46;
+        border: 1px solid rgba(16, 185, 129, 0.4);
+      }
+
+      .status.error {
+        display: block;
+        background: rgba(248, 113, 113, 0.15);
+        color: #b91c1c;
+        border: 1px solid rgba(248, 113, 113, 0.4);
+      }
+
+      .helper {
+        font-size: 0.78rem;
+        color: #6b7280;
+      }
+
+      @media (max-width: 560px) {
+        .card {
+          padding: 1.1rem;
+        }
+
+        form {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <header>
+        <h1>CarWatch helper</h1>
+        <p>Snap a photo from your phone, fill the metadata, and push it straight to the dashboard.</p>
+      </header>
+
+      <form id="carwatch-form">
+        <label>
+          Device name
+          <input name="deviceName" type="text" value="GarageCam-iPhone" required />
+        </label>
+
+        <label>
+          Connection status
+          <select name="connection">
+            <option value="online">Online</option>
+            <option value="connecting">Connecting</option>
+            <option value="offline">Offline</option>
+          </select>
+        </label>
+
+        <label>
+          Battery (%)
+          <input name="batteryPercent" type="number" min="0" max="100" placeholder="91" />
+        </label>
+
+        <label>
+          Temperature (°C)
+          <input name="temperatureC" type="number" placeholder="35" />
+        </label>
+
+        <label>
+          FPS
+          <input name="fps" type="number" min="0" step="1" placeholder="30" />
+        </label>
+
+        <label>
+          Latency (ms)
+          <input name="latencyMs" type="number" min="0" step="1" placeholder="120" />
+        </label>
+
+        <label class="full-width">
+          Stream / link URL
+          <input name="streamUrl" type="url" placeholder="https://example.com/stream" />
+        </label>
+
+        <label class="full-width">
+          Snapshot photo
+          <input name="snapshot" type="file" accept="image/*" capture="environment" required />
+          <span class="helper">Tip: choose “Take Photo” for a live capture.</span>
+        </label>
+
+        <label class="full-width">
+          Detections (optional)
+          <textarea
+            name="detections"
+            placeholder="Sedan=4@0.86\nSUV=2@0.73\nMotorbike=1"
+          ></textarea>
+          <span class="helper">One per line — format: label=count@confidence (confidence optional).</span>
+        </label>
+
+        <label class="full-width">
+          Events (optional)
+          <textarea name="events" placeholder="Vehicle parked | Sedan near Gate A"></textarea>
+          <span class="helper">One per line — format: label | detail.</span>
+        </label>
+
+        <div id="status" class="status"></div>
+
+        <div class="actions">
+          <button type="submit">Send snapshot</button>
+        </div>
+      </form>
+    </main>
+
+    <script>
+      const form = document.getElementById('carwatch-form');
+      const statusBox = document.getElementById('status');
+
+      const parseDetections = (text) => {
+        if (!text.trim()) return [];
+        return text
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((line) => {
+            const [left, confidencePart] = line.split('@').map((part) => part.trim());
+            const [label, countPart] = left.split('=').map((part) => part.trim());
+            const count = countPart ? Number(countPart) : null;
+            const confidence = confidencePart ? Number(confidencePart) : null;
+            return {
+              label: label || 'object',
+              count: Number.isFinite(count) ? count : 1,
+              confidence: Number.isFinite(confidence) ? confidence : 0
+            };
+          });
+      };
+
+      const parseEvents = (text) => {
+        if (!text.trim()) return [];
+        return text
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((line, idx) => {
+            const [labelPart, detailPart] = line.split('|').map((part) => part.trim());
+            return {
+              id: `evt-${Date.now()}-${idx}`,
+              label: labelPart || 'Event',
+              detail: detailPart || '',
+              timestamp: new Date().toISOString()
+            };
+          });
+      };
+
+      const fileToBase64 = (file) =>
+        new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        statusBox.textContent = '';
+        statusBox.className = 'status';
+
+        const formData = new FormData(form);
+        const file = formData.get('snapshot');
+        if (!file || !file.size) {
+          statusBox.textContent = 'Snapshot photo is required.';
+          statusBox.classList.add('error');
+          return;
+        }
+
+        try {
+          const imageBase64 = await fileToBase64(file);
+          const payload = {
+            deviceName: formData.get('deviceName') || 'CarWatch device',
+            connection: formData.get('connection') || 'online',
+            batteryPercent: formData.get('batteryPercent') ? Number(formData.get('batteryPercent')) : null,
+            temperatureC: formData.get('temperatureC') ? Number(formData.get('temperatureC')) : null,
+            fps: formData.get('fps') ? Number(formData.get('fps')) : null,
+            latencyMs: formData.get('latencyMs') ? Number(formData.get('latencyMs')) : null,
+            streamUrl: formData.get('streamUrl') || '',
+            thumbUrl: '',
+            imageBase64,
+            detections: parseDetections(formData.get('detections') || ''),
+            events: parseEvents(formData.get('events') || ''),
+            timestamp: new Date().toISOString()
+          };
+
+          const response = await fetch('/carwatch/snapshot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+
+          if (!response.ok) {
+            const detail = await response.json().catch(() => ({}));
+            throw new Error(detail.error || response.statusText || 'Upload failed');
+          }
+
+          statusBox.textContent = 'Snapshot sent — check the CarWatch tab.';
+          statusBox.classList.add('success');
+          form.reset();
+        } catch (err) {
+          console.error('CarWatch helper error', err);
+          statusBox.textContent = err.message || 'Something went wrong. Try again.';
+          statusBox.classList.add('error');
+        }
+      });
+    </script>
+  </body>
+</html>

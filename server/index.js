@@ -17,6 +17,10 @@ app.use(express.urlencoded({ limit: JSON_BODY_LIMIT, extended: true }));
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+app.get('/carwatch-helper', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'carwatch-helper.html'));
+});
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.post('/verify-slip', upload.single('file'), async (req, res) => {
