@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_ROOT=${LOG_DIR:-/workspace/logs}
+CAPTURE_DIR=${VISION_CAPTURE_DIR:-${LOG_ROOT%/}/vision}
+LOG_FILE=${VISION_LOG_FILE:-${LOG_ROOT%/}/vision-monitor.log}
+INTERVAL=${VISION_INTERVAL_SECONDS:-300}
+MAX_HISTORY=${VISION_MAX_HISTORY:-0}
+RUN_ONCE=${VISION_ONCE:-false}
+DEFAULT_URL=${VISION_URL:-http://client:5173}
+URL_LIST_RAW=${VISION_URLS:-$DEFAULT_URL}
+
+mkdir -p "$LOG_ROOT" "$CAPTURE_DIR"
+
+trim() {
+  local var="$1"
+  var="${var%% }"
+  var="${var## }"
+  printf '%s' "$var"
+}
+
+declare -a URLS=()
+while IFS= read -r line; do
+  line=$(trim "$line")
+  [[ -z "$line" ]] && continue
+  URLS+=("$line")
+done < <(echo "$URL_LIST_RAW" | tr ',' '\n')
+
+if [[ ${#URLS[@]} -eq 0 ]]; then
+  echo "[mcp-browser-vision-watch] no URLs provided" >&2
+  exit 1
+fi
+
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+log() {
+  local msg="$1"
+  local stamp=$(ts)
+  echo "[$stamp] $msg" | tee -a "$LOG_FILE" >&2
+}
+
+slugify() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/^https?:\/\///' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+|-+$//g'
+}
+
+prune_history() {
+  local slug="$1"
+  [[ "$MAX_HISTORY" -le 0 ]] && return
+  find "$CAPTURE_DIR" -maxdepth 1 -type f -name "${slug}-*.png" | sort | head -n -"$MAX_HISTORY" | while read -r old; do
+    rm -f "$old" "${old%.png}.json" 2>/dev/null || true
+  done
+}
+
+run_once() {
+  for url in "${URLS[@]}"; do
+    local slug=$(slugify "$url")
+    [[ -z "$slug" ]] && slug="capture"
+    local stamp=$(date -u +"%Y%m%d-%H%M%S")
+    local png_path="${CAPTURE_DIR%/}/${slug}-${stamp}.png"
+    local json_path="${png_path%.png}.json"
+
+    log "capturing $url"
+    if ! CAPTURE_BASENAME="$slug" CAPTURE_PATH="$png_path" mcp-browser screenshot "$url" "$png_path" >/tmp/mcp-browser-vision-watch.log 2>&1; then
+      log "capture failed for $url (see $LOG_FILE)"
+      continue
+    fi
+
+    if [[ ! -s "$png_path" ]]; then
+      log "capture completed but file missing: $png_path"
+      continue
+    fi
+
+    log "running detections for $url"
+    if ! YOLO_OUTPUT_FORMAT=json YOLO_SILENT=true mcp-vision-yolo "$png_path" >"$json_path" 2>>"$LOG_FILE"; then
+      log "YOLO analysis failed for $url"
+      continue
+    fi
+
+    local count=$(jq -r '.detections | length' "$json_path" 2>/dev/null || echo "?")
+    log "detections: $count (png=$png_path json=$json_path)"
+    prune_history "$slug"
+  done
+}
+
+log "starting vision monitor (interval=${INTERVAL}s urls=${#URLS[@]} dir=$CAPTURE_DIR)"
+
+while true; do
+  run_once
+  [[ "$RUN_ONCE" == "true" ]] && break
+  sleep "$INTERVAL"
+ done

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: mcp-browser-vision [url]
+
+Steps:
+  1. Uses mcp-browser to capture a screenshot for the target URL.
+  2. Runs mcp-vision-yolo on the resulting PNG.
+
+Environment overrides:
+  VISION_URL          Default URL when none is passed (default http://client:5173)
+  CAPTURE_DIR         Directory for screenshots (default $LOG_DIR or /workspace/logs)
+  CAPTURE_BASENAME    Filename stem (default vision-capture)
+  CAPTURE_PATH        Full path override (skips auto naming)
+  YOLO_CONFIDENCE     Forwarded to mcp-vision-yolo (default 0.25)
+  YOLO_OUTPUT_FORMAT  json|table for detections (default table)
+  BROWSER_HEADLESS    Passed to mcp-browser (default true)
+  BROWSER_WAIT_UNTIL  Passed to mcp-browser (default networkidle)
+USAGE
+  exit 1
+}
+
+URL_ARG=${1:-}
+if [[ "$URL_ARG" == "-h" || "$URL_ARG" == "--help" ]]; then
+  usage
+fi
+
+TARGET_URL=${URL_ARG:-${VISION_URL:-http://client:5173}}
+LOG_DIR=${LOG_DIR:-/workspace/logs}
+CAPTURE_DIR=${CAPTURE_DIR:-${LOG_DIR}}
+mkdir -p "$CAPTURE_DIR"
+
+STAMP=$(date -u +"%Y%m%d-%H%M%S")
+BASENAME=${CAPTURE_BASENAME:-vision-capture}
+OUT_PATH=${CAPTURE_PATH:-${CAPTURE_DIR%/}/${BASENAME}-${STAMP}.png}
+
+>&2 echo "[mcp-browser-vision] capturing $TARGET_URL -> $OUT_PATH"
+
+mcp-browser screenshot "$TARGET_URL" "$OUT_PATH"
+
+if [[ ! -s "$OUT_PATH" ]]; then
+  echo "[mcp-browser-vision] capture failed (file missing: $OUT_PATH)" >&2
+  exit 1
+fi
+
+>&2 echo "[mcp-browser-vision] running YOLO on $OUT_PATH"
+YOLO_OUTPUT_FORMAT=${YOLO_OUTPUT_FORMAT:-table} \
+  mcp-vision-yolo "$OUT_PATH"

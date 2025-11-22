@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+YOLO_SILENT=${YOLO_SILENT:-false}
+
+log() {
+  if [[ "$YOLO_SILENT" != "true" ]]; then
+    >&2 echo "$1"
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: mcp-vision-yolo <image_path>
+
+Environment overrides:
+  YOLO_URL            Base URL for YOLO MCP (default http://mcp-yolo:8000)
+  YOLO_CONFIDENCE     Confidence threshold 0-1 (default 0.25)
+  YOLO_OUTPUT_FORMAT  json|table (default json)
+  MIME_TYPE           Force MIME type for data URL (auto-detected when possible)
+USAGE
+  exit 1
+}
+
+IMAGE_PATH=${1:-}
+if [[ -z "$IMAGE_PATH" ]]; then
+  echo "[mcp-vision-yolo] image path is required" >&2
+  usage
+fi
+
+if [[ ! -f "$IMAGE_PATH" ]]; then
+  echo "[mcp-vision-yolo] no file at $IMAGE_PATH" >&2
+  exit 1
+fi
+
+YOLO_URL=${YOLO_URL:-http://mcp-yolo:8000}
+YOLO_ENDPOINT="${YOLO_URL%/}/detect"
+CONF_RAW=${YOLO_CONFIDENCE:-0.25}
+
+read -r CONF CONF_ADJUSTED < <(
+python - "$CONF_RAW" <<'PY'
+import sys
+raw = sys.argv[1]
+adjusted = False
+try:
+    val = float(raw)
+except ValueError:
+    val = 0.25
+    adjusted = True
+clamped = min(1.0, max(0.0, val))
+if clamped != val:
+    adjusted = True
+print(f"{clamped:.6f}")
+print('1' if adjusted else '0')
+PY
+)
+if [[ "$CONF_ADJUSTED" == "1" ]]; then
+  log "[mcp-vision-yolo] confidence adjusted to $CONF"
+fi
+
+MIME_TYPE=${MIME_TYPE:-image/png}
+if command -v file >/dev/null 2>&1; then
+  guess=$(file --mime-type -b "$IMAGE_PATH" 2>/dev/null || true)
+  if [[ -n "$guess" ]]; then
+    MIME_TYPE=$guess
+  fi
+fi
+
+BASE64_DATA=$(base64 -w 0 "$IMAGE_PATH")
+if [[ -z "$BASE64_DATA" ]]; then
+  echo "[mcp-vision-yolo] failed to encode $IMAGE_PATH" >&2
+  exit 1
+fi
+
+PAYLOAD=$(jq -n --arg data "data:${MIME_TYPE};base64,${BASE64_DATA}" --arg conf "$CONF" '{image_base64: $data, confidence: ($conf | tonumber)}')
+
+log "[mcp-vision-yolo] POST $YOLO_ENDPOINT (confidence $CONF)"
+RAW_RESPONSE=$(curl -sfSL -X POST "$YOLO_ENDPOINT" -H 'Content-Type: application/json' -d "$PAYLOAD") || {
+  status=$?
+  echo "[mcp-vision-yolo] request failed (exit $status)" >&2
+  exit $status
+}
+
+OUTPUT_FORMAT=${YOLO_OUTPUT_FORMAT:-json}
+
+case "${OUTPUT_FORMAT,,}" in
+  table)
+    printf "class\tconfidence\tbbox\n"
+    echo "$RAW_RESPONSE" | jq -r '.detections // [] | .[] | "\(.class_name // \"-\")\t\(.confidence // 0)\t\(.bbox // [])"'
+    ;;
+  json)
+    echo "$RAW_RESPONSE" | jq .
+    ;;
+  *)
+    echo "$RAW_RESPONSE"
+    ;;
+esac
+
+COUNT="0"
+if DET=$(jq -r '.detections | length' <<<"$RAW_RESPONSE" 2>/dev/null); then
+  COUNT="$DET"
+fi
+log "[mcp-vision-yolo] detections: $COUNT"

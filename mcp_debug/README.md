@@ -26,6 +26,51 @@ Environment knobs (all optional):
 
 Because the helper runs inside `mcp-debug`, you can trigger it via ttyd/ngrok for remote diagnostics without exposing another service.
 
+### Automated capture + AI vision (`mcp-browser-vision`)
+
+Need a one-liner to screenshot a UI and immediately run object detection? The `mcp-browser-vision` helper stitches the two workflows together.
+
+```bash
+# Capture client UI (defaults to http://client:5173) and run YOLO detections
+mcp-browser-vision
+
+# Target a specific URL and tighten confidence threshold
+YOLO_CONFIDENCE=0.4 mcp-browser-vision https://example.com/dashboard
+
+# Save into a custom folder
+CAPTURE_DIR=/workspace/logs/captures mcp-browser-vision
+```
+
+Under the hood:
+
+1. `mcp-browser screenshot …` writes a PNG into `/workspace/logs` (configurable via `CAPTURE_DIR`, `CAPTURE_BASENAME`, or `CAPTURE_PATH`).
+2. `mcp-vision-yolo` base64-encodes the image and POSTs it to `${YOLO_URL:-http://mcp-yolo:8000}/detect`.
+3. Output defaults to a TSV table; set `YOLO_OUTPUT_FORMAT=json` for structured responses. Pass `YOLO_SILENT=true` to suppress progress logs when scripting.
+
+`mcp-vision-yolo` can be used directly for local PNG/JPEGs you already have:
+
+```bash
+mcp-vision-yolo /workspace/logs/browser-2025-11-22T13-45-40-557Z.png
+YOLO_URL=http://host.docker.internal:8000 YOLO_OUTPUT_FORMAT=json mcp-vision-yolo ./test.png
+```
+
+Both helpers respect `YOLO_CONFIDENCE` (clamped to `0-1`) and auto-detect mime types when the `file` utility is present inside the container.
+
+### Scheduler (`mcp-browser-vision-watch`)
+
+For hands-off monitoring, run `mcp-browser-vision-watch`. It accepts a comma-separated `VISION_URLS` list (defaults to `http://client:5173`) and captures screenshots for each on a fixed cadence.
+
+Environment knobs:
+
+- `VISION_INTERVAL_SECONDS` (default `300`)
+- `VISION_URLS` (comma-separated list of URLs)
+- `VISION_CAPTURE_DIR` (default `/workspace/logs/vision`)
+- `VISION_MAX_HISTORY` (keep N most recent captures per URL; `0` disables pruning)
+- `VISION_ONCE=true` to run a single pass (useful for cron/testing)
+- `YOLO_CONFIDENCE`, `YOLO_OUTPUT_FORMAT`, and other vars from the underlying helpers
+
+Each cycle produces `<slug>-TIMESTAMP.png` + `.json` detection files and appends summaries into `${VISION_LOG_FILE:-/workspace/logs/vision-monitor.log}`.
+
 # MCP Debug Helper Container
 
 This utility container is meant to be the fastest way to poke at services from *inside* the Docker network.
@@ -72,6 +117,9 @@ Set them per invocation (e.g., `SERVER_URL=http://host.docker.internal:3001 mcp-
 | `mcp-playwright-install` | Install client dependencies + Playwright browsers for UI tests. |
 | `mcp-playwright-smoke [specPattern]` | Run Playwright tests (defaults to `meeting-panel.spec.ts`). |
 | `mcp-browser <cmd> <url>` | One-off Playwright browser control (`screenshot`, `html`, `eval`, `pdf`). |
+| `mcp-vision-yolo <path>` | POST a local image to the YOLO MCP and pretty-print detections. |
+| `mcp-browser-vision [url]` | Capture a screenshot via `mcp-browser` then analyze it with YOLO. |
+| `mcp-browser-vision-watch` | Looping monitor that screenshots URLs on a cadence and stores YOLO results. |
 
 Add new scripts under `mcp_debug/bin/` (prefixed with `mcp-`) and rebuild to bake them in.
 
