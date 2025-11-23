@@ -66,7 +66,7 @@ services:
       - YOLO_MCP_URL=${YOLO_MCP_URL:-}
       - BSLIP_MCP_URL=${BSLIP_MCP_URL:-}
       - IMAGE_MCP_URL=${IMAGE_MCP_URL:-}
-      - IMAGE_MCP_GPU_URL=${IMAGE_MCP_GPU_URL:-}
+      - IMAGE_MCP_GPU_URL=${IMAGE_MCP_GPU_URL:-http://imagen-gpu:8001}
       - IDP_MCP_URL=${IDP_MCP_URL:-}
       - IDP_MCP_GPU_URL=${IDP_MCP_GPU_URL:-}
       - MEETING_MCP_URL=${MEETING_MCP_URL:-http://mcp-meeting:8008}
@@ -103,6 +103,37 @@ services:
       interval: 60s
       timeout: 10s
       retries: 5
+    depends_on:
+      - imagen-gpu
+
+  imagen-gpu:
+    build:
+      context: ./mcp_imagen
+      args:
+        BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
+        USE_GPU: "true"
+      <<: *build_cache
+    container_name: imagen-gpu
+    <<: *service_defaults
+    environment:
+      - USE_GPU=true
+      - TORCH_DEVICE=cuda
+      - IMAGE_MODEL_ID=${IMAGE_MODEL_ID:-runwayml/stable-diffusion-v1-5}
+      - IMAGE_MODEL_CACHE=/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - imagen-cache:/app/models
+    ports:
+      - "8001:8001"
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
 
   mcp-meeting:
     build:
@@ -184,3 +215,6 @@ services:
       - debug
     depends_on:
       - server
+
+volumes:
+  imagen-cache:

@@ -91,6 +91,8 @@ const PANEL_TABS = [
   { value: 'meeting', label: 'Meeting' }
 ] as const
 
+const IMAGE_STANDALONE_PATHS = new Set(['/imagen', '/imagen/'])
+
 type PanelTabValue = (typeof PANEL_TABS)[number]['value']
 
 const downloadBase64File = (dataUrl: string, filename: string) => {
@@ -1465,11 +1467,18 @@ export function App() {
   }, [bankVerificationInfo.referenceId])
   const [bankOcrError, setBankOcrError] = useState<string | null>(null)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
+  const [imageStandaloneMode, setImageStandaloneMode] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return IMAGE_STANDALONE_PATHS.has(window.location.pathname)
+  })
   const [activePanel, setActivePanel] = useState<
     'chat' | 'openvoice' | 'carwatch' | 'image-mcp' | 'yolo-detection' | 'bank-slip' | 'meeting'
-  >(() =>
-    readFromStorage(STORAGE_KEYS.activePanel, 'chat')
-  )
+  >(() => {
+    if (typeof window !== 'undefined' && IMAGE_STANDALONE_PATHS.has(window.location.pathname)) {
+      return 'image-mcp'
+    }
+    return readFromStorage(STORAGE_KEYS.activePanel, 'chat')
+  })
   const [inlineSpeakerState, setInlineSpeakerState] = useState<InlineSpeakerState>({
     messageId: null,
     status: 'idle'
@@ -1618,6 +1627,26 @@ export function App() {
   useEffect(() => {
     pendingPreviewRef.current = pendingAttachments
   }, [pendingAttachments])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    const updateStandaloneMode = () => {
+      const isStandalone = IMAGE_STANDALONE_PATHS.has(window.location.pathname)
+      setImageStandaloneMode(isStandalone)
+      if (isStandalone) {
+        setActivePanel('image-mcp')
+      }
+    }
+
+    updateStandaloneMode()
+    window.addEventListener('popstate', updateStandaloneMode)
+    window.addEventListener('hashchange', updateStandaloneMode)
+    return () => {
+      window.removeEventListener('popstate', updateStandaloneMode)
+      window.removeEventListener('hashchange', updateStandaloneMode)
+    }
+  }, [])
 
   useEffect(() => {
     return () => {
@@ -2484,8 +2513,9 @@ export function App() {
   }, [micMode])
 
   useEffect(() => {
+    if (imageStandaloneMode) return
     writeToStorage(STORAGE_KEYS.activePanel, activePanel)
-  }, [activePanel])
+  }, [activePanel, imageStandaloneMode])
 
   useEffect(() => {
     writeToStorage(STORAGE_KEYS.imagePrompt, imagePrompt)
@@ -4849,6 +4879,7 @@ export function App() {
     setQuickMenuAnchorEl(null)
   }
   const handlePanelChange = (_event: React.SyntheticEvent, newValue: PanelTabValue) => {
+    if (imageStandaloneMode) return
     setActivePanel(newValue)
   }
 
@@ -4867,99 +4898,103 @@ export function App() {
   }
 
   return (
-    <div className="app-root">
-      <AppBar position="static" color="transparent" elevation={0} sx={{ px: 2, py: 1 }}>
-        <Toolbar disableGutters sx={{ justifyContent: 'space-between', gap: 2 }}>
-          <Typography variant="h6" component="div">
-            Chaba – Voice Chat
-          </Typography>
-          <Stack direction="row" spacing={2} alignItems="center">
-            {renderStatusChip()}
-            <Box sx={{ display: 'flex', flexDirection: 'column', textAlign: 'right' }}>
-              <Typography variant="caption" color="text.secondary">
-                LLM: {llmModel}
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                STT: {whisperModel}
-              </Typography>
-            </Box>
-            <IconButton
-              color="inherit"
-              aria-label="Open quick actions menu"
-              onClick={handleQuickMenuToggle}
-              size="small"
-            >
-              <MoreVertIcon />
-            </IconButton>
-            <Menu
-              anchorEl={quickMenuAnchorEl}
-              open={quickMenuOpen}
-              onClose={handleQuickMenuClose}
-              anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
-              transformOrigin={{ vertical: 'top', horizontal: 'right' }}
-            >
-              <MenuItem
-                onClick={() => {
-                  handleQuickMenuClose()
-                  handleMenuAction('popup')
-                }}
+    <div className={`app-root${imageStandaloneMode ? ' imagen-standalone' : ''}`}>
+      {!imageStandaloneMode && (
+        <AppBar position="static" color="transparent" elevation={0} sx={{ px: 2, py: 1 }}>
+          <Toolbar disableGutters sx={{ justifyContent: 'space-between', gap: 2 }}>
+            <Typography variant="h6" component="div">
+              Chaba – Voice Chat
+            </Typography>
+            <Stack direction="row" spacing={2} alignItems="center">
+              {renderStatusChip()}
+              <Box sx={{ display: 'flex', flexDirection: 'column', textAlign: 'right' }}>
+                <Typography variant="caption" color="text.secondary">
+                  LLM: {llmModel}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  STT: {whisperModel}
+                </Typography>
+              </Box>
+              <IconButton
+                color="inherit"
+                aria-label="Open quick actions menu"
+                onClick={handleQuickMenuToggle}
+                size="small"
               >
-                <Stack spacing={0.5}>
-                  <Typography variant="body2">Quick tips panel</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Cheat sheet with usage ideas
-                  </Typography>
-                </Stack>
-              </MenuItem>
-              <MenuItem
-                onClick={() => {
-                  handleQuickMenuClose()
-                  handleMenuAction('status')
-                }}
+                <MoreVertIcon />
+              </IconButton>
+              <Menu
+                anchorEl={quickMenuAnchorEl}
+                open={quickMenuOpen}
+                onClose={handleQuickMenuClose}
+                anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+                transformOrigin={{ vertical: 'top', horizontal: 'right' }}
               >
-                <Stack spacing={0.5}>
-                  <Typography variant="body2">View service status</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Open detailed health dialog
-                  </Typography>
-                </Stack>
-              </MenuItem>
-              <MenuItem
-                onClick={() => {
-                  handleQuickMenuClose()
-                  handleMenuAction('reset')
-                }}
-              >
-                <Stack spacing={0.5}>
-                  <Typography variant="body2">Reset conversation</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Clear local history & session
-                  </Typography>
-                </Stack>
-              </MenuItem>
-            </Menu>
-          </Stack>
-        </Toolbar>
-      </AppBar>
+                <MenuItem
+                  onClick={() => {
+                    handleQuickMenuClose()
+                    handleMenuAction('popup')
+                  }}
+                >
+                  <Stack spacing={0.5}>
+                    <Typography variant="body2">Quick tips panel</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Cheat sheet with usage ideas
+                    </Typography>
+                  </Stack>
+                </MenuItem>
+                <MenuItem
+                  onClick={() => {
+                    handleQuickMenuClose()
+                    handleMenuAction('status')
+                  }}
+                >
+                  <Stack spacing={0.5}>
+                    <Typography variant="body2">View service status</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Open detailed health dialog
+                    </Typography>
+                  </Stack>
+                </MenuItem>
+                <MenuItem
+                  onClick={() => {
+                    handleQuickMenuClose()
+                    handleMenuAction('reset')
+                  }}
+                >
+                  <Stack spacing={0.5}>
+                    <Typography variant="body2">Reset conversation</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Clear local history & session
+                    </Typography>
+                  </Stack>
+                </MenuItem>
+              </Menu>
+            </Stack>
+          </Toolbar>
+        </AppBar>
+      )}
 
-      <main className="app-main">
-        <Tabs
-          value={activePanel}
-          onChange={handlePanelChange}
-          variant="scrollable"
-          scrollButtons="auto"
-          allowScrollButtonsMobile
-          aria-label="Panel navigation"
-        >
-          {PANEL_TABS.map((tab) => (
-            <Tab
-              key={tab.value}
-              value={tab.value}
-              label={tab.label}
-              sx={{ textTransform: 'none', fontWeight: 600, minHeight: 0 }}
-            />
-          ))}
-        </Tabs>
+      <main className={`app-main${imageStandaloneMode ? ' imagen-main' : ''}`}>
+        {!imageStandaloneMode && (
+          <Tabs
+            value={activePanel}
+            onChange={handlePanelChange}
+            variant="scrollable"
+            scrollButtons="auto"
+            allowScrollButtonsMobile
+            aria-label="Panel navigation"
+          >
+            {PANEL_TABS.map((tab) => (
+              <Tab
+                key={tab.value}
+                value={tab.value}
+                label={tab.label}
+                sx={{ textTransform: 'none', fontWeight: 600, minHeight: 0 }}
+              />
+            ))}
+          </Tabs>
+        )}
 
         <div className="app-workspace">
           <div className="panel-content">
@@ -6811,58 +6846,60 @@ export function App() {
           </div>
         )}
           </div>
-          <aside
-            className={`stack-sidebar ${stackSidebarCollapsed ? 'collapsed' : ''}`}
-            aria-label="Stack status sidebar"
-          >
-            <button
-              type="button"
-              className="stack-sidebar-toggle"
-              onClick={() => setStackSidebarCollapsed((prev) => !prev)}
-              aria-expanded={!stackSidebarCollapsed}
+          {!imageStandaloneMode && (
+            <aside
+              className={`stack-sidebar ${stackSidebarCollapsed ? 'collapsed' : ''}`}
+              aria-label="Stack status sidebar"
             >
-              <span className="toggle-icon" aria-hidden="true">
-                {stackSidebarCollapsed ? '▶' : '◀'}
-              </span>
-              <span className="toggle-label">Stack status</span>
-              <span className="stack-summary-count">
-                {stackSummary.ok}/{stackSummary.total}
-              </span>
-            </button>
-            <div className="stack-sidebar-content">
-              <div className="stack-summary-counters">
-                <div className="stack-summary-item" aria-label="Healthy services">
-                  <span className="label">Healthy</span>
-                  <span className="value">{stackSummary.ok}</span>
+              <button
+                type="button"
+                className="stack-sidebar-toggle"
+                onClick={() => setStackSidebarCollapsed((prev) => !prev)}
+                aria-expanded={!stackSidebarCollapsed}
+              >
+                <span className="toggle-icon" aria-hidden="true">
+                  {stackSidebarCollapsed ? '▶' : '◀'}
+                </span>
+                <span className="toggle-label">Stack status</span>
+                <span className="stack-summary-count">
+                  {stackSummary.ok}/{stackSummary.total}
+                </span>
+              </button>
+              <div className="stack-sidebar-content">
+                <div className="stack-summary-counters">
+                  <div className="stack-summary-item" aria-label="Healthy services">
+                    <span className="label">Healthy</span>
+                    <span className="value">{stackSummary.ok}</span>
+                  </div>
+                  <div className="stack-summary-item" aria-label="Services with issues">
+                    <span className="label">Issues</span>
+                    <span className="value">{stackSummary.unhealthy}</span>
+                  </div>
                 </div>
-                <div className="stack-summary-item" aria-label="Services with issues">
-                  <span className="label">Issues</span>
-                  <span className="value">{stackSummary.unhealthy}</span>
-                </div>
+                {serviceStatuses.length ? (
+                  <ul className="stack-service-list">
+                    {serviceStatuses.map((svc) => {
+                      const pillState = svc.status === 'ok' ? 'ok' : svc.status === 'unconfigured' ? 'unknown' : 'error'
+                      return (
+                        <li key={svc.name} className="stack-service-item">
+                          <span className={`status-indicator status-${pillState}`}>
+                            <span className="dot" /> {svc.label}
+                          </span>
+                          <span className="stack-service-meta">{svc.type}</span>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                ) : (
+                  <p className="stack-sidebar-empty">No status data yet.</p>
+                )}
               </div>
-              {serviceStatuses.length ? (
-                <ul className="stack-service-list">
-                  {serviceStatuses.map((svc) => {
-                    const pillState = svc.status === 'ok' ? 'ok' : svc.status === 'unconfigured' ? 'unknown' : 'error'
-                    return (
-                      <li key={svc.name} className="stack-service-item">
-                        <span className={`status-indicator status-${pillState}`}>
-                          <span className="dot" /> {svc.label}
-                        </span>
-                        <span className="stack-service-meta">{svc.type}</span>
-                      </li>
-                    )
-                  })}
-                </ul>
-              ) : (
-                <p className="stack-sidebar-empty">No status data yet.</p>
-              )}
-            </div>
-          </aside>
+            </aside>
+          )}
         </div>
       </main>
 
-      {statusExpanded ? (
+      {!imageStandaloneMode && statusExpanded ? (
         <div
           className="floating-overlay"
           role="dialog"

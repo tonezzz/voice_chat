@@ -24,7 +24,7 @@ const serveClientIndex = (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 };
 
-app.get(['/preview', '/app-preview'], serveClientIndex);
+app.get(['/preview', '/app-preview', '/imagen', '/imagen/'], serveClientIndex);
 
 const registerDynamicEndpointGroup = (groupName, config = {}) => {
   const { basePath = '', routes = [], enabled = true } = config;
@@ -612,6 +612,13 @@ app.post('/generate-image-stream', async (req, res) => {
       const detail = await response.text();
       console.error('Image generator stream error:', detail);
       return res.status(502).json({ error: 'image_service_error', detail });
+    }
+
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('application/json')) {
+      const detail = await response.text().catch(() => '');
+      console.error('Image generator returned non-JSON response', { contentType, detail });
+      return res.status(502).json({ error: 'image_service_invalid_response', detail: detail || `Unexpected content-type ${contentType || 'unknown'}` });
     }
 
     res.setHeader('Content-Type', 'application/json');
