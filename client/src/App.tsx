@@ -6984,32 +6984,37 @@ export function App() {
         </div>
       ) : null}
 
-      {attachmentPreview && (
-        <div
-          className="attachment-preview-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label={attachmentPreview.name || 'Attachment preview'}
-          onClick={closeAttachmentPreview}
-        >
-          <div className="attachment-preview-modal" onClick={(e) => e.stopPropagation()}>
-            <button
-              type="button"
-              className="attachment-preview-close"
-              onClick={closeAttachmentPreview}
-              aria-label="Close image preview"
-            >
-              ×
-            </button>
-            <img
-              src={attachmentPreview.src}
-              alt={attachmentPreview.name || 'Attachment preview'}
-              className="attachment-preview-image"
-            />
-            <div className="attachment-preview-name">{attachmentPreview.name}</div>
-          </div>
-        </div>
-      )}
+      <Dialog
+        open={Boolean(attachmentPreview)}
+        onClose={closeAttachmentPreview}
+        fullWidth
+        maxWidth="sm"
+        aria-labelledby="attachment-preview-title"
+      >
+        {attachmentPreview ? (
+          <>
+            <DialogTitle id="attachment-preview-title" sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Typography variant="h6" component="span">
+                {attachmentPreview.name || 'Attachment preview'}
+              </Typography>
+              <IconButton onClick={closeAttachmentPreview} aria-label="Close attachment preview" size="small">
+                <CloseIcon />
+              </IconButton>
+            </DialogTitle>
+            <DialogContent dividers sx={{ display: 'flex', justifyContent: 'center' }}>
+              <Box
+                component="img"
+                src={attachmentPreview.src}
+                alt={attachmentPreview.name || 'Attachment preview'}
+                sx={{ maxWidth: '100%', borderRadius: 1, boxShadow: 3 }}
+              />
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={closeAttachmentPreview}>Close</Button>
+            </DialogActions>
+          </>
+        ) : null}
+      </Dialog>
 
       {showCamera && (
         <div className="camera-overlay">

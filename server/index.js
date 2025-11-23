@@ -41,7 +41,7 @@ const registerDynamicEndpointGroup = (groupName, config = {}) => {
       : `/${basePath.replace(/\/$/, '')}`
     : '';
 
-  routes.forEach(({ method = 'get', path = '', handler, description }) => {
+  routes.forEach(({ method = 'get', path = '', handler, description, middlewares = [] }) => {
     if (typeof handler !== 'function') {
       console.warn(`[dynamic-endpoints] missing handler for ${groupName}${path}`);
       return;
@@ -53,7 +53,18 @@ const registerDynamicEndpointGroup = (groupName, config = {}) => {
     }
     const normalizedPath = path ? (path.startsWith('/') ? path : `/${path}`) : '';
     const fullPath = `${normalizedBase}${normalizedPath}` || '/';
-    app[verb](fullPath, handler);
+    const stack = [];
+    if (Array.isArray(middlewares) && middlewares.length) {
+      middlewares.forEach((mw) => {
+        if (typeof mw === 'function') {
+          stack.push(mw);
+        } else {
+          console.warn(`[dynamic-endpoints] skipped invalid middleware for ${groupName}${path}`);
+        }
+      });
+    }
+    stack.push(handler);
+    app[verb](fullPath, ...stack);
     const details = description ? ` - ${description}` : '';
     console.log(`[dynamic-endpoints] registered ${verb.toUpperCase()} ${fullPath} (${groupName}${details})`);
   });
@@ -280,174 +291,35 @@ const meetingIngestAudioHandler = async (req, res) => {
       tags: Array.isArray(tags) ? tags : undefined
     });
 
-    const mimeType = req.file.mimetype || 'audio/webm';
-    const encoded = `data:${mimeType};base64,${req.file.buffer.toString('base64')}`;
-    const entry = await invokeMeetingTool('ingest_audio_chunk', {
-      session_id: meetingSessionId,
-      audio_base64: encoded,
-      speaker: typeof speaker === 'string' ? speaker : undefined,
-      language,
-      whisper_model: typeof whisperModel === 'string' ? whisperModel : undefined,
-      filename: req.file.originalname || 'meeting-audio.webm'
-    });
+}
 
-    return res.json({ sessionId: meetingSessionId, entry: unwrapMeetingResponse(entry) });
-  } catch (err) {
-    console.error('meeting audio ingest failed', err);
-    const detail = err?.message || 'meeting_audio_ingest_failed';
-    return res.status(502).json({ error: detail });
-  }
-};
-
-registerDynamicEndpointGroup('meeting', {
-  basePath: '/meeting',
-  enabled: true,
-  routes: [
-    { method: 'get', path: '/sessions', handler: meetingListSessionsHandler, description: 'list sessions' },
-    { method: 'post', path: '/sessions', handler: meetingCreateSessionHandler, description: 'start session' },
-    { method: 'get', path: '/sessions/:sessionId', handler: meetingSessionDetailHandler, description: 'session detail' },
-    { method: 'post', path: '/sessions/:sessionId/summarize', handler: meetingSummarizeHandler, description: 'summarize session' },
-    { method: 'post', path: '/append-transcript', handler: meetingAppendTranscriptHandler, description: 'append transcript' },
-    {
-      method: 'post',
-      path: '/ingest-audio',
-      handler: upload.single('audio'),
-      description: 'ingest audio chunk'
-    }
-  ]
-});
-
-app.post('/meeting/ingest-audio', upload.single('audio'), meetingIngestAudioHandler);
-
-app.post('/voice-chat-stream', async (req, res) => {
-  setupSse(res);
-  const { message, model, accelerator, sessionId, sessionName, history, voice, provider } = req.body || {};
-  if (!message) {
-    sendSseEvent(res, { type: 'error', error: 'message is required' });
-    closeSse(res);
-    return;
-  }
-
-  const requestedProvider = normalizeProvider(provider);
-  const modelToUse = resolveModelForProvider(requestedProvider, model);
-  const selectedVoice = typeof voice === 'string' ? voice.trim() : '';
-
-  if (!providerRequiresKey(requestedProvider)) {
-    sendSseEvent(res, { type: 'error', error: 'provider_unavailable' });
-    closeSse(res);
-    return;
-  }
-
-  let session = getSession(sessionId);
-  if (!session) {
-    session = createSession(sessionName, requestedProvider);
-    hydrateSessionHistory(session, history);
-  } else if (provider) {
-    session.provider = requestedProvider;
-  }
-
-  ensureAutomationSystemMessage(session);
-
-  addSessionMessage(session, {
-    role: 'user',
-    content: message,
-    model: modelToUse,
-    accelerator,
-    voiceId: typeof voice === 'string' ? voice : null
+try {
+  console.log('[bslip] forwarding verify-slip request', {
+    target: `${baseUrl}/verify`,
+    name: req.file.originalname,
+    referenceId: referenceId || undefined
   });
 
-  const streamingEnabled = providerSupportsStreaming(session.provider);
+  const response = await fetch(`${baseUrl}/verify`, {
+    method: 'POST',
+    headers: form.getHeaders(),
+    body: form
+  });
 
-  try {
-    let reply = '';
-    let resolvedServer = '';
-    let toolRuns = [];
-
-    if (streamingEnabled) {
-      const commonParams = {
-        session,
-        modelToUse,
-        accelerator,
-        body: req.body,
-        onDelta: (delta, accumulated) => {
-          sendSseEvent(res, { type: 'delta', delta, full: accumulated });
-        }
-      };
-
-      let streamResult;
-      if (isAnthropicProvider(session.provider)) {
-        streamResult = await streamAnthropicCompletion(commonParams);
-      } else if (isOpenAiProvider(session.provider)) {
-        streamResult = await streamOpenAiCompletion(commonParams);
-      } else if (isGithubProvider(session.provider)) {
-        streamResult = await streamGithubCompletion(commonParams);
-      } else {
-        streamResult = await streamOllamaCompletion(commonParams);
-      }
-      reply = streamResult.reply;
-      resolvedServer = streamResult.resolvedServer;
-      if (reply && MCP0_BASE_URL) {
-        const { cleanText, instructions } = extractMcpToolInstructions(reply);
-        reply = cleanText || reply;
-        toolRuns = await executeMcpInstructions(instructions);
-      }
-    } else {
-      const { reply: fullReply, resolvedServer: usedServer, toolRuns: resolvedTools } = await executeChatCompletion({
-        session,
-        modelToUse,
-        accelerator,
-        body: req.body
-      });
-      reply = fullReply;
-      resolvedServer = usedServer;
-      toolRuns = resolvedTools;
-      if (reply) {
-        sendSseEvent(res, { type: 'delta', delta: reply, full: reply });
-      }
+  if (!response.ok) {
+    const detailText = await response.text();
+    console.error('BSLIP MCP error:', detailText);
+    let detailJson;
+    try {
+      detailJson = JSON.parse(detailText);
+    } catch (parseErr) {
+      detailJson = undefined;
     }
 
-    addSessionMessage(session, {
-      role: 'assistant',
-      content: reply,
-      model: modelToUse,
-      accelerator,
-      voiceId: typeof selectedVoice === 'string' ? selectedVoice : null
-    });
-
-    const audioUrl = await synthesizeSpeech(reply, accelerator, selectedVoice);
-    const diagnosticsPayload = buildDiagnostics({
-      provider: session.provider,
-      model: modelToUse,
-      accelerator,
-      server:
-        resolvedServer ||
-        resolveProviderServerInfo(session.provider, {
-          accelerator,
-          githubDeployment: req.body?.github_deployment || req.body?.githubDeployment
-        })
-    });
-
-    sendSseEvent(res, {
-      type: 'complete',
-      reply,
-      audioUrl,
-      session: sessionToResponse(session),
-      provider: session.provider,
-      voiceId: typeof selectedVoice === 'string' ? selectedVoice : null,
-      diagnostics: diagnosticsPayload,
-      mcpTools: toolRuns
-    });
-  } catch (err) {
-    console.error('Streaming server error:', err);
-    sendSseEvent(res, { type: 'error', error: err?.message || 'server error' });
-  } finally {
-    closeSse(res);
-  }
-});
-
-app.get('/github-model/health', async (_req, res) => {
-  try {
-    const status = await checkGithubModelHealth();
+    return res.status(502).json({
+      error: 'bslip_mcp_error',
+      detail: detailJson || detailText,
+      target: `${baseUrl}/verify`,
     return res.json(status);
   } catch (err) {
     console.error('GitHub model health check failed:', err);
