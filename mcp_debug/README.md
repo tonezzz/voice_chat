@@ -69,7 +69,21 @@ Environment knobs:
 - `VISION_ONCE=true` to run a single pass (useful for cron/testing)
 - `YOLO_CONFIDENCE`, `YOLO_OUTPUT_FORMAT`, and other vars from the underlying helpers
 
-Each cycle produces `<slug>-TIMESTAMP.png` + `.json` detection files and appends summaries into `${VISION_LOG_FILE:-/workspace/logs/vision-monitor.log}`.
+Each cycle produces `<slug>-TIMESTAMP.png` + `.json` detection files and appends summaries into `${VISION_LOG_FILE:-/workspace/logs/vision-monitor.log}`. From Windows hosts you can launch everything (including alert/webhook presets) via `scripts/run-vision-monitor.ps1 -Preset alerts|full|baseline`, which shells into `mcp-debug` with the right environment.
+
+#### Alerts + MCP forwarding (`mcp-vision-hook`)
+
+If present in `$PATH`, `mcp-browser-vision-watch` automatically calls `mcp-vision-hook <url> <slug> <png> <json>` after every successful detection run. Configure it with environment variables:
+
+- `VISION_ALERT_CLASSES="error_banner,warning"` — only trigger when YOLO sees one of these classes (default: any class).
+- `VISION_ALERT_MIN_CONF=0.5` — minimum confidence for matches (default `0.4`).
+- `VISION_ALERT_ALWAYS=true` — force alerts even without matches (handy for heartbeat tests).
+- `VISION_ALERT_WEBHOOK_URL=https://hooks.slack.com/...` — JSON POST payload for Slack/Teams/etc.
+- `VISION_ALERT_INCLUDE_IMAGE=true` — embed the screenshot as a base64 data URL inside the payload.
+- `VISION_MCP_FORWARD_URL=http://server:3001/detect-image` — forward detections + screenshot to another MCP/HTTP endpoint. Set `VISION_MCP_FORWARD_MODE=multipart` to use file uploads instead of raw JSON, and `VISION_MCP_FORWARD_HEADERS="Authorization: Bearer abc;X-Env: prod"` for custom headers.
+- `VISION_ALERT_COMMAND='scripts/process-vision.sh'` — run a local command with payload context in `VISION_HOOK_*` env vars (ideal for chaining memento/meeting/VMS updates).
+
+The hook payload includes the source URL, slug, timestamps, summarized matches, the full YOLO detections, and the original file paths, so you can push notifications, update MCP graph stores, or kick off remediation jobs automatically.
 
 # MCP Debug Helper Container
 
@@ -120,6 +134,7 @@ Set them per invocation (e.g., `SERVER_URL=http://host.docker.internal:3001 mcp-
 | `mcp-vision-yolo <path>` | POST a local image to the YOLO MCP and pretty-print detections. |
 | `mcp-browser-vision [url]` | Capture a screenshot via `mcp-browser` then analyze it with YOLO. |
 | `mcp-browser-vision-watch` | Looping monitor that screenshots URLs on a cadence and stores YOLO results. |
+| `mcp-vision-hook` | Optional alert/MCP forwarding hook invoked after each detection pass. |
 
 Add new scripts under `mcp_debug/bin/` (prefixed with `mcp-`) and rebuild to bake them in.
 

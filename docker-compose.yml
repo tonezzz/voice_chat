@@ -18,102 +18,18 @@ x-healthcheck-slow: &healthcheck_slow
   retries: 5
 
 services:
-  # ---------------------------------------------------------------------------
-  # Core speech + TTS
-  # ---------------------------------------------------------------------------
-  openvoice-tts:
-    build:
-      context: C:/_dev/_models/openvoice/openvoice
-      <<: *build_cache
-    container_name: voice-chat-openvoice
-    profiles: ["openvoice"]
-    <<: *service_defaults
-    environment:
-      - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
-      - OPENVOICE_CHECKPOINT_DIR=/app/inference/checkpoints
-    volumes:
-      - C:/_dev/_models/openvoice_v2:/app/inference/openvoice_v2
-      - C:/_dev/_models/openvoice/data:/app/inference/.data
-      - C:/_dev/_models/openvoice/checkpoints:/app/inference/checkpoints
-      - C:/_dev/_models/openvoice/references:/app/inference/references
-      - C:/_dev/_models/openvoice/conf/openvoice:/app/conf/openvoice
-    ports:
-      - "8100:80"
-    healthcheck:
-      <<: *healthcheck_fast
-      test: ["CMD-SHELL", "curl -sf http://localhost/hc || exit 1"]
-
-  # ---------------------------------------------------------------------------
-  # Core MCP services (always on)
-  # ---------------------------------------------------------------------------
-  mcp_bslip:
-    build:
-      context: ./mcp-bslip
-      <<: *build_cache
-    container_name: mcp-bslip
-    profiles: ["bslip"]
-    <<: *service_defaults
-    environment:
-      - PORT=8002
-    ports:
-      - "8002:8002"
-    healthcheck:
-      <<: *healthcheck_fast
-      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
-
-  mcp-tuya:
-    build:
-      context: ./mcp_tuya_bridge
-      <<: *build_cache
-    container_name: mcp-tuya
-    profiles: ["tuya"]
-    <<: *service_defaults
-    environment:
-      - TUYA_ENDPOINT=${TUYA_ENDPOINT:-}
-      - TUYA_ACCESS_ID=${TUYA_ACCESS_ID:-}
-      - TUYA_ACCESS_SECRET=${TUYA_ACCESS_SECRET:-}
-      - TUYA_CUSTOM_MCP_ENDPOINT=${TUYA_CUSTOM_MCP_ENDPOINT:-http://mcp0:8010/mcp}
-      - TUYA_RECONNECT_MIN_SECONDS=${TUYA_RECONNECT_MIN_SECONDS:-5}
-      - TUYA_RECONNECT_MAX_SECONDS=${TUYA_RECONNECT_MAX_SECONDS:-60}
-    ports:
-      - "8007:8007"
-    healthcheck:
-      <<: *healthcheck_slow
-      test: ["CMD-SHELL", "curl -sf http://localhost:8007/health || exit 1"]
-
-  mcp_idp:
-    build:
-      context: ./mcp_idp
-      <<: *build_cache
-    container_name: mcp-idp
-    profiles: ["cpu"]
-    <<: *service_defaults
-    environment:
-      - IDP_DEVICE=${IDP_DEVICE:-cpu}
-      - IDP_REFERENCE_DIR=/app/reference_faces
-      - IDP_MODEL_STORAGE=/app/models
-      - PORT=8004
-    volumes:
-      - ${IDP_REFERENCE_ROOT:-C:/_dev/_models/idp/references}:/app/reference_faces
-      - ${IDP_MODEL_ROOT:-C:/_dev/_models/idp/models}:/app/models
-    ports:
-      - "8004:8004"
-    healthcheck:
-      <<: *healthcheck_slow
-      test: ["CMD-SHELL", "curl -sf http://localhost:8004/health || exit 1"]
-
   mcp0:
     build:
       context: ./mcp0
       <<: *build_cache
     container_name: mcp0
-    profiles: ["cpu", "gpu"]
     init: true
     <<: *service_defaults
     environment:
       - MCP0_HOST=0.0.0.0
       - MCP0_PORT=8010
       - MCP0_TIMEOUT_SECONDS=10
+      - MCP0_ADMIN_TOKEN=${MCP0_ADMIN_TOKEN:-}
       - GITHUB_MCP_URL=${GITHUB_MCP_URL:-http://mcp-github:8080}
       - GITHUB_MCP_HEALTH_PATH=${GITHUB_MCP_HEALTH_PATH:-/health}
       - GITHUB_MCP_TOOLS=${GITHUB_MCP_TOOLS:-list_models+run_space}
@@ -132,165 +48,11 @@ services:
       timeout: 10s
       retries: 5
     restart: unless-stopped
-
-  mcp-meeting:
-    build:
-      context: ./mcp_meeting
-      <<: *build_cache
-    container_name: mcp-meeting
-    <<: *service_defaults
-    environment:
-      - PORT=8008
-      - MEETING_STT_URL=${MEETING_STT_URL:-}
-      - MEETING_STT_HEALTH_PATH=${MEETING_STT_HEALTH_PATH:-/health}
-      - MEETING_MAX_SEGMENTS=${MEETING_MAX_SEGMENTS:-1500}
-      - MEETING_SUMMARY_MAX_ENTRIES=${MEETING_SUMMARY_MAX_ENTRIES:-20}
-      - MEETING_DEFAULT_LANGUAGE=${MEETING_DEFAULT_LANGUAGE:-}
-      - MEETING_DEFAULT_WHISPER_MODEL=${MEETING_DEFAULT_WHISPER_MODEL:-}
-      - MEETING_STORAGE_PATH=${MEETING_STORAGE_PATH:-/data/meetings.json}
-    ports:
-      - "8008:8008"
-    volumes:
-      - ${MEETING_STORAGE_ROOT:-C:/_dev/_models/meeting}:/data
-    healthcheck:
-      <<: *healthcheck_fast
-      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health || exit 1"]
-    restart: unless-stopped
-
-  mcp-github:
-    build:
-      context: ./mcp_github_bridge
-      <<: *build_cache
-    container_name: mcp-github
-    profiles: ["cpu", "gpu"]
-    environment:
-      - GITHUB_PERSONAL_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
-      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
-      - GITHUB_TOOLSETS=${GITHUB_TOOLSETS:-default}
-      - LOG_LEVEL=${GITHUB_MCP_BRIDGE_LOG_LEVEL:-INFO}
-      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
-      - GITHUB_WEBHOOK_TOOL=${GITHUB_WEBHOOK_TOOL:-run_space}
-      - GITHUB_WEBHOOK_EVENTS=${GITHUB_WEBHOOK_EVENTS:-}
-      - GITHUB_WEBHOOK_TOOL_MAP=${GITHUB_WEBHOOK_TOOL_MAP:-}
-    ports:
-      - "8200:8080"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
-    restart: unless-stopped
-
-  openvoice-tts-gpu:
-    build:
-      context: C:/_dev/_models/openvoice/openvoice
-      <<: *build_cache
-    container_name: voice-chat-openvoice-gpu
-    profiles: ["openvoice-gpu"]
-    environment:
-      - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
-      - NVIDIA_VISIBLE_DEVICES=all
-      - OPENVOICE_CHECKPOINT_DIR=/app/inference/checkpoints
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-    runtime: nvidia
-    volumes:
-      - C:/_dev/_models/openvoice_v2:/app/inference/openvoice_v2
-      - C:/_dev/_models/openvoice/data:/app/inference/.data
-      - C:/_dev/_models/openvoice/checkpoints:/app/inference/checkpoints
-      - C:/_dev/_models/openvoice/references:/app/inference/references
-      - C:/_dev/_models/openvoice/conf/openvoice:/app/conf/openvoice
-    ports:
-      - "8101:80"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost/hc || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    restart: unless-stopped
-  ollama:
-    image: ollama/ollama
-    container_name: ollama
-    profiles: ["cpu"]
-    ports:
-      - "11434:11434"
-    volumes:
-      - "C:/_dev/_models/ollama:/root/.ollama"
-    restart: unless-stopped
-
-  ollama-gpu:
-    image: ollama/ollama
-    container_name: ollama-gpu
-    profiles: ["gpu"]
-    ports:
-      - "11435:11434"
-    volumes:
-      - "C:/_dev/_models/ollama:/root/.ollama"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-    environment:
-      - OLLAMA_KEEP_ALIVE=5m
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    runtime: nvidia
-    restart: unless-stopped
-
-  # stt:
-  #   build:
-  #     context: ./stt
-  #     <<: *build_cache
-  #   container_name: stt-whisper
-  #   profiles: ["cpu"]
-  #   environment:
-  #     - WHISPER_MODEL=tiny
-  #     - WHISPER_DEVICE=cpu
-  #     - WHISPER_DOWNLOAD_DIR=/app/models
-  #   volumes:
-  #     - C:/_dev/_models/huggingface/stt:/app/models
-  #   ports:
-  #     - "5001:5001"
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 5
-  #   restart: unless-stopped
-
-  stt-gpu:
-    build:
-      context: ./stt
-      <<: *build_cache
-    container_name: stt-whisper-gpu
-    profiles: ["gpu"]
-    init: true
-    environment:
-      - WHISPER_MODEL=base
-      - WHISPER_DEVICE=cuda
-      - WHISPER_DOWNLOAD_DIR=/app/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-    runtime: nvidia
-    ports:
-      - "5002:5001"
-    volumes:
-      - ${HF_STT_MODELS:-C:/_dev/_models/huggingface/stt}:/app/models
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    restart: unless-stopped
-
   server:
     build: ./server
     container_name: voice-chat-server
     init: true
+    <<: *service_defaults
     environment:
       - NODE_ENV=production
       - OLLAMA_URL=${OLLAMA_URL:-}
@@ -333,6 +95,7 @@ services:
       - ANTHROPIC_TEMPERATURE=${ANTHROPIC_TEMPERATURE:-0.2}
       - TUYA_MCP_URL=${TUYA_MCP_URL:-http://mcp-tuya:8007}
       - ENABLE_VOICE_FEATURE=false
+      - CARWATCH_SNAPSHOT_TTL_MS=600000
     ports:
       - "3002:3001"
     healthcheck:
@@ -340,12 +103,72 @@ services:
       interval: 60s
       timeout: 10s
       retries: 5
-    restart: unless-stopped
 
+  mcp-meeting:
+    build:
+      context: ./mcp_meeting
+      <<: *build_cache
+    container_name: mcp-meeting
+    <<: *service_defaults
+    environment:
+      - PORT=8008
+      - MEETING_STT_URL=${MEETING_STT_URL:-}
+      - MEETING_STT_HEALTH_PATH=${MEETING_STT_HEALTH_PATH:-/health}
+      - MEETING_MAX_SEGMENTS=${MEETING_MAX_SEGMENTS:-1500}
+      - MEETING_SUMMARY_MAX_ENTRIES=${MEETING_SUMMARY_MAX_ENTRIES:-20}
+      - MEETING_DEFAULT_LANGUAGE=${MEETING_DEFAULT_LANGUAGE:-}
+      - MEETING_DEFAULT_WHISPER_MODEL=${MEETING_DEFAULT_WHISPER_MODEL:-}
+      - MEETING_STORAGE_PATH=${MEETING_STORAGE_PATH:-/data/meetings.json}
+    ports:
+      - "8008:8008"
+    volumes:
+      - ${MEETING_STORAGE_ROOT:-C:/_dev/_models/meeting}:/data
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health || exit 1"]
+
+  mcp-github:
+    build:
+      context: ./mcp_github_bridge
+      <<: *build_cache
+    container_name: mcp-github
+    <<: *service_defaults
+    environment:
+      - GITHUB_PERSONAL_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
+      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_TOKEN:-}
+      - GITHUB_TOOLSETS=${GITHUB_TOOLSETS:-default}
+      - LOG_LEVEL=${GITHUB_MCP_BRIDGE_LOG_LEVEL:-INFO}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
+      - GITHUB_WEBHOOK_TOOL=${GITHUB_WEBHOOK_TOOL:-run_space}
+      - GITHUB_WEBHOOK_EVENTS=${GITHUB_WEBHOOK_EVENTS:-}
+      - GITHUB_WEBHOOK_TOOL_MAP=${GITHUB_WEBHOOK_TOOL_MAP:-}
+    ports:
+      - "8200:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+
+  mcp-seqthink:
+    build:
+      context: ./mcp_seqthink
+      <<: *build_cache
+    container_name: mcp-seqthink
+    <<: *service_defaults
+    environment:
+      - PORT=8015
+      - SEQTHINK_PROVIDER_NAME=${SEQTHINK_PROVIDER_NAME:-seqthink}
+      - SEQTHINK_BASE_URL=${SEQTHINK_BASE_URL:-http://mcp-seqthink:8015}
+      - MCP0_URL=http://mcp0:8010
+      - MCP0_ADMIN_TOKEN=${MCP0_ADMIN_TOKEN:-}
+    ports:
+      - "8015:8015"
+    healthcheck:
+      <<: *healthcheck_slow
+      test: ["CMD-SHELL", "curl -sf http://localhost:8015/health || exit 1"]
 
   ngrok:
     image: ngrok/ngrok:latest
     container_name: voice-chat-ngrok
+    <<: *service_defaults
     environment:
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
     volumes:
@@ -361,83 +184,3 @@ services:
       - debug
     depends_on:
       - server
-    restart: unless-stopped
-
-  mcp_yolo:
-    build:
-      context: ./mcp_yolo
-      <<: *build_cache
-    container_name: mcp-yolo
-    environment:
-      - YOLO_MODEL=/app/models/yolov8n.pt
-    volumes:
-      - C:/_dev/_models/yolo:/app/models
-    ports:
-      - "8000:8000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/ || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    restart: unless-stopped
-
-  mcp-imagen:
-    build:
-      context: ./mcp_imagen
-      <<: *build_cache
-    container_name: mcp-imagen
-    environment:
-      - IMAGE_MODEL_ID=${IMAGE_MODEL_ID:-runwayml/stable-diffusion-v1-5}
-      - TORCH_DEVICE=${IMAGE_TORCH_DEVICE:-cpu}
-      - IMAGE_STEPS=${IMAGE_STEPS:-14}
-      - IMAGE_MAX_STEPS=${IMAGE_MAX_STEPS:-40}
-      - IMAGE_WIDTH=${IMAGE_WIDTH:-512}
-      - IMAGE_HEIGHT=${IMAGE_HEIGHT:-512}
-      - IMAGE_MODEL_CACHE=/app/models
-    volumes:
-      - C:/_dev/_models/diffusers:/app/models
-    ports:
-      - "8001:8001"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8001/ || exit 1"]
-      interval: 60s
-      timeout: 15s
-      retries: 5
-    restart: unless-stopped
-
-  mcp-imagen-gpu:
-    build:
-      context: ./mcp_imagen
-      <<: *build_cache
-      args:
-        BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
-        USE_GPU: "true"
-    container_name: mcp-imagen-gpu
-    profiles: ["gpu"]
-    environment:
-      - IMAGE_MODEL_ID=${IMAGE_MODEL_ID:-runwayml/stable-diffusion-v1-5}
-      - TORCH_DEVICE=${IMAGE_TORCH_DEVICE_GPU:-cuda}
-      - IMAGE_STEPS=${IMAGE_STEPS:-25}
-      - IMAGE_MAX_STEPS=${IMAGE_MAX_STEPS:-60}
-      - IMAGE_WIDTH=${IMAGE_WIDTH:-512}
-      - IMAGE_HEIGHT=${IMAGE_HEIGHT:-512}
-      - IMAGE_MODEL_CACHE=/app/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-    runtime: nvidia
-    volumes:
-      - ${IMAGE_MODEL_ROOT:-C:/_dev/_models/diffusers}:/app/models
-    ports:
-      - "8102:8001"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8001/ || exit 1"]
-      interval: 60s
-      timeout: 15s
-      retries: 5
-    restart: unless-stopped
-
-volumes:
-  ollama-data:

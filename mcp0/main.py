@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
+if settings.admin_token:
+    logger.info("Admin API enabled")
+else:
+    logger.warning("Admin API disabled (missing MCP0_ADMIN_TOKEN)")
+
 auth_headers: Dict[str, Dict[str, str]] = {}
 github_bearer = settings.github_personal_token or settings.github_token
 if github_bearer:
@@ -86,6 +91,7 @@ def get_timeout() -> float:
 
 def require_admin(authorization: Optional[str] = Header(default=None)) -> None:
     if not settings.admin_token:
+        logger.warning("require_admin: admin token unset; rejecting request")
         raise HTTPException(status_code=503, detail="Admin API disabled")
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid admin token")

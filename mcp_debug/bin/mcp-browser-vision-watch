@@ -39,6 +39,18 @@ log() {
   echo "[$stamp] $msg" | tee -a "$LOG_FILE" >&2
 }
 
+invoke_hook() {
+  local url="$1"
+  local slug="$2"
+  local png="$3"
+  local json="$4"
+  if command -v mcp-vision-hook >/dev/null 2>&1; then
+    if ! mcp-vision-hook "$url" "$slug" "$png" "$json" >>"$LOG_FILE" 2>&1; then
+      log "hook failed for $url"
+    fi
+  fi
+}
+
 slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/^https?:\/\///' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+|-+$//g'
 }
@@ -78,6 +90,7 @@ run_once() {
 
     local count=$(jq -r '.detections | length' "$json_path" 2>/dev/null || echo "?")
     log "detections: $count (png=$png_path json=$json_path)"
+    invoke_hook "$url" "$slug" "$png_path" "$json_path"
     prune_history "$slug"
   done
 }

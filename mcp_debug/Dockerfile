@@ -12,6 +12,7 @@ RUN apt-get update \
         iputils-ping \
         jq \
         less \
+        libasound2 \
         libatk-bridge2.0-0 \
         libatk1.0-0 \
         libcairo2 \
@@ -33,6 +34,7 @@ RUN apt-get update \
         npm \
         openssl \
         procps \
+        python3-pil \
         socat \
         sqlite3 \
         unzip \

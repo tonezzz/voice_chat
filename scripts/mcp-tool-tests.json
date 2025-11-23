@@ -52,5 +52,23 @@
     "path": "/invoke",
     "tool": "search_nodes",
     "arguments": {"query": "health-check"}
+  },
+  {
+    "name": "idp-refresh-references",
+    "service": "idp",
+    "envVar": "IDP_MCP_URL",
+    "path": "/invoke",
+    "tool": "refresh_identity_references",
+    "arguments": {}
+  },
+  {
+    "name": "idp-identify-people",
+    "service": "idp",
+    "envVar": "IDP_MCP_URL",
+    "path": "/invoke",
+    "tool": "identify_people",
+    "arguments": {
+      "image_base64": ""
+    }
   }
 ]

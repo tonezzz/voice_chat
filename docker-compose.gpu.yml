@@ -13,19 +13,6 @@ services:
     volumes:
       - ${OLLAMA_DATA_ROOT:-/data/models/ollama}:/root/.ollama
 
-  stt:
-    volumes:
-      - ${HF_STT_MODELS:-/data/models/huggingface/stt}:/app/models
-
-  stt-gpu:
-    build:
-      context: ./stt
-      <<: *build_cache
-      args:
-        BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
-    volumes:
-      - ${HF_STT_MODELS:-/data/models/huggingface/stt}:/app/models
-
   mcp_yolo:
     build:
       context: ./mcp_yolo

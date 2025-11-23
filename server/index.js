@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
@@ -10,16 +11,62 @@ const crypto = require('crypto');
 const Tesseract = require('tesseract.js');
 
 const app = express();
-const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '1mb';
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '50mb';
 app.use(cors());
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 app.use(express.urlencoded({ limit: JSON_BODY_LIMIT, extended: true }));
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.get('/carwatch-helper', (_req, res) => {
+const dynamicEndpointRegistry = new Map();
+
+const serveClientIndex = (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+};
+
+app.get(['/preview', '/app-preview'], serveClientIndex);
+
+const registerDynamicEndpointGroup = (groupName, config = {}) => {
+  const { basePath = '', routes = [], enabled = true } = config;
+  if (!enabled || !routes.length) {
+    console.log(
+      `[dynamic-endpoints] skipped group ${groupName} (enabled=${enabled}, routes=${routes.length})`
+    );
+    return;
+  }
+
+  const normalizedBase = basePath
+    ? basePath.startsWith('/')
+      ? basePath.replace(/\/$/, '')
+      : `/${basePath.replace(/\/$/, '')}`
+    : '';
+
+  routes.forEach(({ method = 'get', path = '', handler, description }) => {
+    if (typeof handler !== 'function') {
+      console.warn(`[dynamic-endpoints] missing handler for ${groupName}${path}`);
+      return;
+    }
+    const verb = method.toLowerCase();
+    if (typeof app[verb] !== 'function') {
+      console.warn(`[dynamic-endpoints] unsupported method ${method} for ${groupName}${path}`);
+      return;
+    }
+    const normalizedPath = path ? (path.startsWith('/') ? path : `/${path}`) : '';
+    const fullPath = `${normalizedBase}${normalizedPath}` || '/';
+    app[verb](fullPath, handler);
+    const details = description ? ` - ${description}` : '';
+    console.log(`[dynamic-endpoints] registered ${verb.toUpperCase()} ${fullPath} (${groupName}${details})`);
+  });
+
+  dynamicEndpointRegistry.set(groupName, { basePath: normalizedBase, routes: [...routes] });
+};
+
+const serveCarwatchHelper = (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'carwatch-helper.html'));
-});
+};
+
+app.get('/carwatch-helper', serveCarwatchHelper);
+app.get('/carwatch-helper-v2', serveCarwatchHelper);
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -90,29 +137,29 @@ app.post('/verify-slip', upload.single('file'), async (req, res) => {
   }
 });
 
-app.get('/meeting/sessions', async (req, res) => {
-  try {
-    if (!MEETING_MCP_URL) {
-      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
-    }
+const ensureMeetingConfigured = (res) => {
+  if (!MEETING_MCP_URL) {
+    res.status(503).json({ error: 'meeting_mcp_unconfigured' });
+    return false;
+  }
+  return true;
+};
 
+const meetingListSessionsHandler = async (req, res) => {
+  try {
+    if (!ensureMeetingConfigured(res)) return;
     const includeArchived = String(req.query.includeArchived).toLowerCase() === 'true';
-    const payload = await invokeMeetingTool('list_sessions', {
-      include_archived: includeArchived
-    });
+    const payload = await invokeMeetingTool('list_sessions', { include_archived: includeArchived });
     return res.json(unwrapMeetingResponse(payload));
   } catch (err) {
     console.error('meeting sessions list failed', err);
     return res.status(502).json({ error: err?.message || 'meeting_sessions_failed' });
   }
-});
+};
 
-app.post('/meeting/sessions', async (req, res) => {
+const meetingCreateSessionHandler = async (req, res) => {
   try {
-    if (!MEETING_MCP_URL) {
-      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
-    }
-
+    if (!ensureMeetingConfigured(res)) return;
     const { sessionId, title, participants, tags, language } = req.body || {};
     if (typeof sessionId !== 'string' || !sessionId.trim()) {
       return res.status(400).json({ error: 'sessionId is required' });
@@ -129,14 +176,11 @@ app.post('/meeting/sessions', async (req, res) => {
     console.error('meeting session create failed', err);
     return res.status(502).json({ error: err?.message || 'meeting_session_create_failed' });
   }
-});
+};
 
-app.get('/meeting/sessions/:sessionId', async (req, res) => {
+const meetingSessionDetailHandler = async (req, res) => {
   try {
-    if (!MEETING_MCP_URL) {
-      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
-    }
-
+    if (!ensureMeetingConfigured(res)) return;
     const sessionId = (req.params.sessionId || '').trim();
     if (!sessionId) {
       return res.status(400).json({ error: 'sessionId is required' });
@@ -157,14 +201,11 @@ app.get('/meeting/sessions/:sessionId', async (req, res) => {
     console.error('meeting session detail failed', err);
     return res.status(502).json({ error: err?.message || 'meeting_session_detail_failed' });
   }
-});
+};
 
-app.post('/meeting/sessions/:sessionId/summarize', async (req, res) => {
+const meetingSummarizeHandler = async (req, res) => {
   try {
-    if (!MEETING_MCP_URL) {
-      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
-    }
-
+    if (!ensureMeetingConfigured(res)) return;
     const sessionId = (req.params.sessionId || '').trim();
     if (!sessionId) {
       return res.status(400).json({ error: 'sessionId is required' });
@@ -185,14 +226,11 @@ app.post('/meeting/sessions/:sessionId/summarize', async (req, res) => {
     console.error('meeting session summarize failed', err);
     return res.status(502).json({ error: err?.message || 'meeting_session_summarize_failed' });
   }
-});
+};
 
-app.post('/meeting/append-transcript', async (req, res) => {
+const meetingAppendTranscriptHandler = async (req, res) => {
   try {
-    if (!MEETING_MCP_URL) {
-      return res.status(503).json({ error: 'meeting_mcp_unconfigured' });
-    }
-
+    if (!ensureMeetingConfigured(res)) return;
     const { sessionId, text, speaker, participants, title, tags, language } = req.body || {};
     const trimmed = typeof text === 'string' ? text.trim() : '';
     if (!trimmed) {
@@ -222,7 +260,64 @@ app.post('/meeting/append-transcript', async (req, res) => {
     const detail = err?.message || 'meeting_append_failed';
     return res.status(502).json({ error: detail });
   }
+};
+
+const meetingIngestAudioHandler = async (req, res) => {
+  try {
+    if (!ensureMeetingConfigured(res)) return;
+    const { sessionId, speaker, title, participants, tags, language, whisperModel } = req.body || {};
+    if (!req.file?.buffer) {
+      return res.status(400).json({ error: 'audio file is required' });
+    }
+
+    const meetingSessionId = typeof sessionId === 'string' && sessionId.trim().length ? sessionId.trim() : `browser-${Date.now()}`;
+
+    await invokeMeetingTool('start_meeting', {
+      session_id: meetingSessionId,
+      title: typeof title === 'string' ? title : undefined,
+      participants: Array.isArray(participants) ? participants : undefined,
+      language,
+      tags: Array.isArray(tags) ? tags : undefined
+    });
+
+    const mimeType = req.file.mimetype || 'audio/webm';
+    const encoded = `data:${mimeType};base64,${req.file.buffer.toString('base64')}`;
+    const entry = await invokeMeetingTool('ingest_audio_chunk', {
+      session_id: meetingSessionId,
+      audio_base64: encoded,
+      speaker: typeof speaker === 'string' ? speaker : undefined,
+      language,
+      whisper_model: typeof whisperModel === 'string' ? whisperModel : undefined,
+      filename: req.file.originalname || 'meeting-audio.webm'
+    });
+
+    return res.json({ sessionId: meetingSessionId, entry: unwrapMeetingResponse(entry) });
+  } catch (err) {
+    console.error('meeting audio ingest failed', err);
+    const detail = err?.message || 'meeting_audio_ingest_failed';
+    return res.status(502).json({ error: detail });
+  }
+};
+
+registerDynamicEndpointGroup('meeting', {
+  basePath: '/meeting',
+  enabled: true,
+  routes: [
+    { method: 'get', path: '/sessions', handler: meetingListSessionsHandler, description: 'list sessions' },
+    { method: 'post', path: '/sessions', handler: meetingCreateSessionHandler, description: 'start session' },
+    { method: 'get', path: '/sessions/:sessionId', handler: meetingSessionDetailHandler, description: 'session detail' },
+    { method: 'post', path: '/sessions/:sessionId/summarize', handler: meetingSummarizeHandler, description: 'summarize session' },
+    { method: 'post', path: '/append-transcript', handler: meetingAppendTranscriptHandler, description: 'append transcript' },
+    {
+      method: 'post',
+      path: '/ingest-audio',
+      handler: upload.single('audio'),
+      description: 'ingest audio chunk'
+    }
+  ]
 });
+
+app.post('/meeting/ingest-audio', upload.single('audio'), meetingIngestAudioHandler);
 
 app.post('/voice-chat-stream', async (req, res) => {
   setupSse(res);
@@ -547,6 +642,57 @@ app.post('/generate-image-stream', async (req, res) => {
   }
 });
 
+const buildImagenJobPayload = (body = {}) => {
+  const { prompt, negative_prompt, guidance_scale, num_inference_steps, width, height, seed } = body;
+  if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+    throw new Error('prompt_required');
+  }
+  const payload = { prompt: prompt.trim() };
+  if (typeof negative_prompt === 'string' && negative_prompt.trim()) {
+    payload.negative_prompt = negative_prompt.trim();
+  }
+  const numericFields = [
+    ['guidance_scale', guidance_scale],
+    ['num_inference_steps', num_inference_steps],
+    ['width', width],
+    ['height', height],
+    ['seed', seed]
+  ];
+  for (const [key, value] of numericFields) {
+    if (typeof value === 'undefined' || value === null || value === '') continue;
+    const parsed = Number(value);
+    if (!Number.isNaN(parsed)) {
+      payload[key] = key === 'seed' ? Math.trunc(parsed) : parsed;
+    }
+  }
+  return payload;
+};
+
+app.post('/generate-image-queued', (req, res) => {
+  if (!isGpuWorkerAvailable()) {
+    return res.status(503).json({ error: 'gpu_worker_unavailable' });
+  }
+  if (isGpuQueueFull()) {
+    return res.status(429).json({ error: 'gpu_queue_full' });
+  }
+
+  let payload;
+  try {
+    payload = buildImagenJobPayload(req.body || {});
+  } catch (err) {
+    if (err.message === 'prompt_required') {
+      return res.status(400).json({ error: 'prompt_required' });
+    }
+    console.error('Failed to normalize queued imagen payload', err);
+    return res.status(500).json({ error: 'server_error' });
+  }
+
+  const priority = (req.body && req.body.priority) || 'normal';
+  const job = createGpuJob({ tool: 'imagenGenerate', payload, priority });
+  console.log('[gpu-jobs] queued imagen job', { jobId: job.id, priority: job.priority });
+  return res.json({ job });
+});
+
 const uploadsDir = path.join(__dirname, 'public', 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
@@ -677,8 +823,41 @@ const GPU_WORKER_TOKEN = (process.env.GPU_WORKER_TOKEN || '').trim();
 const GPU_MAX_PENDING_JOBS = Number(process.env.GPU_MAX_PENDING_JOBS) || 100;
 const GPU_JOB_LEASE_SECONDS = Number(process.env.GPU_JOB_LEASE_SECONDS) || 900;
 
+const ENABLE_EDGE_JOBS = (process.env.ENABLE_EDGE_JOBS || '').toLowerCase() === 'true';
+const EDGE_MAX_PENDING_JOBS = Number(process.env.EDGE_MAX_PENDING_JOBS) || 200;
+const EDGE_JOB_LEASE_SECONDS = Number(process.env.EDGE_JOB_LEASE_SECONDS) || 120;
+const EDGE_HEARTBEAT_SECONDS = Number(process.env.EDGE_HEARTBEAT_SECONDS) || 45;
+
 const gpuJobQueue = [];
 const gpuJobStore = new Map();
+
+const edgeJobQueue = [];
+const edgeJobStore = new Map();
+const edgeWorkers = new Map();
+
+const isGpuQueueFull = () => gpuJobQueue.length >= GPU_MAX_PENDING_JOBS;
+const isGpuWorkerAvailable = () => Boolean(GPU_WORKER_TOKEN);
+
+const isEdgeQueueFull = () => edgeJobQueue.length >= EDGE_MAX_PENDING_JOBS;
+
+const createGpuJob = ({ tool, payload = null, priority }) => {
+  const normalizedPriority = priority === 'high' ? 'high' : 'normal';
+  const job = {
+    id: crypto.randomUUID(),
+    tool,
+    payload,
+    priority: normalizedPriority,
+    status: 'queued',
+    enqueuedAt: now(),
+    startedAt: null,
+    completedAt: null,
+    workerId: null,
+    attempts: 0
+  };
+  gpuJobStore.set(job.id, job);
+  enqueueJob(job);
+  return job;
+};
 
 const now = () => Date.now();
 
@@ -700,6 +879,114 @@ const enqueueJob = (job) => {
   } else {
     gpuJobQueue.push(job);
   }
+};
+
+const enqueueEdgeJob = (job) => {
+  if (job.priority === 'high') {
+    edgeJobQueue.unshift(job);
+  } else {
+    edgeJobQueue.push(job);
+  }
+};
+
+const normalizeEdgeTags = (input) => {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set();
+  const tags = [];
+  for (const raw of input) {
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim().toLowerCase();
+    if (!trimmed) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    tags.push(trimmed);
+  }
+  return tags;
+};
+
+const ensureEdgeWorker = (workerId) => edgeWorkers.get(workerId);
+
+const upsertEdgeWorker = ({
+  workerId,
+  tags,
+  battery,
+  capabilities
+}) => {
+  const data = {
+    workerId,
+    tags,
+    battery,
+    capabilities,
+    updatedAt: now()
+  };
+  edgeWorkers.set(workerId, data);
+  return data;
+};
+
+const cleanupExpiredEdgeJobs = () => {
+  const cutoff = now() - EDGE_JOB_LEASE_SECONDS * 1000;
+  for (const job of edgeJobStore.values()) {
+    if (job.status === 'leased' && job.startedAt && job.startedAt < cutoff) {
+      job.status = 'queued';
+      job.leaseExpiresAt = null;
+      job.workerId = null;
+      job.startedAt = null;
+      enqueueEdgeJob(job);
+    }
+  }
+};
+
+const validateLocalTask = (task) => {
+  if (!task || typeof task !== 'object') {
+    throw new Error('task_required');
+  }
+  if (typeof task.kind !== 'string' || !task.kind.trim()) {
+    throw new Error('task_kind_required');
+  }
+  if (typeof task.payload !== 'undefined' && typeof task.payload !== 'object') {
+    throw new Error('task_payload_invalid');
+  }
+};
+
+const createEdgeJob = ({ task, requirements, priority, metadata }) => {
+  validateLocalTask(task);
+  const normalizedPriority = priority === 'high' ? 'high' : priority === 'low' ? 'low' : 'normal';
+  const normalizedRequirements = normalizeEdgeTags(requirements);
+  const job = {
+    id: crypto.randomUUID(),
+    task,
+    requirements: normalizedRequirements,
+    priority: normalizedPriority,
+    status: 'queued',
+    enqueuedAt: now(),
+    startedAt: null,
+    completedAt: null,
+    leaseExpiresAt: null,
+    workerId: null,
+    attempts: 0,
+    metadata: typeof metadata === 'object' ? metadata : null,
+    result: null,
+    detail: null
+  };
+  edgeJobStore.set(job.id, job);
+  enqueueEdgeJob(job);
+  return job;
+};
+
+const matchEdgeJobForTags = (tags) => {
+  if (!Array.isArray(tags) || !tags.length) {
+    return null;
+  }
+  const tagSet = new Set(tags);
+  for (let i = 0; i < edgeJobQueue.length; i += 1) {
+    const job = edgeJobQueue[i];
+    if (!job || job.status !== 'queued') continue;
+    const canRun = job.requirements.every((req) => tagSet.has(req));
+    if (!canRun) continue;
+    edgeJobQueue.splice(i, 1);
+    return job;
+  }
+  return null;
 };
 
 const requireWorkerAuth = (req, res, next) => {
@@ -778,23 +1065,10 @@ app.post('/gpu-jobs', (req, res) => {
   if (typeof tool !== 'string' || !tool.trim()) {
     return res.status(400).json({ error: 'tool_required' });
   }
-  if (gpuJobQueue.length >= GPU_MAX_PENDING_JOBS) {
+  if (isGpuQueueFull()) {
     return res.status(429).json({ error: 'gpu_queue_full' });
   }
-  const job = {
-    id: crypto.randomUUID(),
-    tool: tool.trim(),
-    payload: payload ?? null,
-    priority: priority === 'high' ? 'high' : 'normal',
-    status: 'queued',
-    enqueuedAt: now(),
-    startedAt: null,
-    completedAt: null,
-    workerId: null,
-    attempts: 0
-  };
-  gpuJobStore.set(job.id, job);
-  enqueueJob(job);
+  const job = createGpuJob({ tool: tool.trim(), payload: payload ?? null, priority });
   return res.json({ job });
 });
 
@@ -831,6 +1105,144 @@ app.post('/gpu-jobs/:jobId/complete', requireWorkerAuth, (req, res) => {
 
 app.get('/gpu-jobs/:jobId', (req, res) => {
   const job = gpuJobStore.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'job_not_found' });
+  }
+  return res.json({ job });
+});
+
+// ---------------------------------------------------------------------------
+// Edge (local compute) job APIs
+// ---------------------------------------------------------------------------
+
+const requireEdgeJobsEnabled = (res) => {
+  if (!ENABLE_EDGE_JOBS) {
+    res.status(503).json({ error: 'edge_jobs_disabled' });
+    return false;
+  }
+  return true;
+};
+
+app.post('/edge-workers/register', (req, res) => {
+  if (!requireEdgeJobsEnabled(res)) return;
+  const { workerId, tags, battery, capabilities } = req.body || {};
+  if (typeof workerId !== 'string' || !workerId.trim()) {
+    return res.status(400).json({ error: 'workerId_required' });
+  }
+  const normalizedTags = normalizeEdgeTags(Array.isArray(tags) ? tags : []);
+  const worker = upsertEdgeWorker({
+    workerId: workerId.trim(),
+    tags: normalizedTags,
+    battery: battery && typeof battery === 'object' ? battery : null,
+    capabilities: capabilities && typeof capabilities === 'object' ? capabilities : null
+  });
+  return res.json({
+    workerId: worker.workerId,
+    leaseMs: EDGE_JOB_LEASE_SECONDS * 1000,
+    heartbeatIntervalMs: EDGE_HEARTBEAT_SECONDS * 1000,
+    tags: worker.tags
+  });
+});
+
+app.post('/edge-workers/heartbeat', (req, res) => {
+  if (!requireEdgeJobsEnabled(res)) return;
+  const { workerId, tags, battery, capabilities, activeJobId } = req.body || {};
+  if (typeof workerId !== 'string' || !workerId.trim()) {
+    return res.status(400).json({ error: 'workerId_required' });
+  }
+  const existing = ensureEdgeWorker(workerId.trim());
+  if (!existing) {
+    return res.status(404).json({ error: 'worker_not_registered' });
+  }
+  const mergedTags = normalizeEdgeTags(Array.isArray(tags) ? tags : existing.tags);
+  const worker = upsertEdgeWorker({
+    workerId: workerId.trim(),
+    tags: mergedTags,
+    battery: battery && typeof battery === 'object' ? battery : existing.battery,
+    capabilities: capabilities && typeof capabilities === 'object' ? capabilities : existing.capabilities
+  });
+  if (activeJobId && edgeJobStore.has(activeJobId)) {
+    worker.activeJobId = activeJobId;
+  } else {
+    delete worker.activeJobId;
+  }
+  return res.json({ ok: true, tags: worker.tags });
+});
+
+app.post('/edge-jobs', (req, res) => {
+  if (!requireEdgeJobsEnabled(res)) return;
+  if (isEdgeQueueFull()) {
+    return res.status(429).json({ error: 'edge_queue_full' });
+  }
+  try {
+    const { task, requirements, priority, metadata } = req.body || {};
+    const job = createEdgeJob({ task, requirements, priority, metadata });
+    return res.json({ job });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || 'edge_job_create_failed' });
+  }
+});
+
+app.get('/edge-jobs/next', (req, res) => {
+  if (!requireEdgeJobsEnabled(res)) return;
+  cleanupExpiredEdgeJobs();
+  const workerId = typeof req.query.workerId === 'string' ? req.query.workerId.trim() : '';
+  if (!workerId) {
+    return res.status(400).json({ error: 'workerId_required' });
+  }
+  const worker = ensureEdgeWorker(workerId);
+  if (!worker) {
+    return res.status(404).json({ error: 'worker_not_registered' });
+  }
+  const tagsParam = typeof req.query.tags === 'string' ? req.query.tags : '';
+  const tagList = tagsParam
+    ? tagsParam
+        .split(',')
+        .map((tag) => tag.trim().toLowerCase())
+        .filter(Boolean)
+    : worker.tags;
+  const job = matchEdgeJobForTags(tagList);
+  if (!job) {
+    return res.status(204).end();
+  }
+  job.status = 'leased';
+  job.workerId = workerId;
+  job.startedAt = now();
+  job.leaseExpiresAt = job.startedAt + EDGE_JOB_LEASE_SECONDS * 1000;
+  job.attempts += 1;
+  return res.json({
+    job: {
+      id: job.id,
+      task: job.task,
+      requirements: job.requirements,
+      priority: job.priority,
+      metadata: job.metadata
+    }
+  });
+});
+
+app.post('/edge-jobs/:jobId/complete', (req, res) => {
+  if (!requireEdgeJobsEnabled(res)) return;
+  const job = edgeJobStore.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'job_not_found' });
+  }
+  if (job.status !== 'leased') {
+    return res.status(400).json({ error: 'job_not_in_progress' });
+  }
+  const { status, result, detail } = req.body || {};
+  const normalized = status === 'error' ? 'failed' : 'completed';
+  job.status = normalized;
+  job.completedAt = now();
+  job.result = typeof result === 'undefined' ? null : result;
+  job.detail = typeof detail === 'undefined' ? null : detail;
+  job.leaseExpiresAt = null;
+  return res.json({ job });
+});
+
+app.get('/edge-jobs/:jobId', (req, res) => {
+  if (!requireEdgeJobsEnabled(res)) return;
+  const job = edgeJobStore.get(req.params.jobId);
   if (!job) {
     return res.status(404).json({ error: 'job_not_found' });
   }
@@ -2035,7 +2447,7 @@ const callGithubModelMessages = async ({ messages, model, maxTokens, temperature
         .trim()
     : '';
 
-  return { text, data };
+  return { text, data, endpoint: resolvedEndpoint };
 };
 
 const callOpenAiMessages = async ({ messages, model, maxTokens, temperature }) => {
@@ -2130,7 +2542,17 @@ app.post('/sessions/:id/messages', (req, res) => {
   return res.json({ session: sessionToResponse(session) });
 });
 
-app.post('/github-model/chat', async (req, res) => {
+const githubModelHealthHandler = async (_req, res) => {
+  try {
+    const status = await checkGithubModelHealth();
+    return res.json(status);
+  } catch (err) {
+    console.error('GitHub model health check failed:', err);
+    return res.status(500).json({ name: 'githubModel', status: 'error', detail: err?.message || 'unknown_error' });
+  }
+};
+
+const githubModelChatHandler = async (req, res) => {
   const { messages, model, maxTokens, max_tokens, temperature, deployment } = req.body || {};
 
   try {
@@ -2147,6 +2569,108 @@ app.post('/github-model/chat', async (req, res) => {
     const status = err.message === 'github_model_token_missing' || err.message === 'github_messages_missing' ? 400 : 500;
     return res.status(status).json({ error: 'github_model_error', detail: err.message });
   }
+};
+
+const githubModelCompareHandler = async (req, res) => {
+  if (!GITHUB_MODEL_TOKEN) {
+    return res.status(503).json({ error: 'github_model_token_missing' });
+  }
+
+  const body = req.body || {};
+  const rawMessages = Array.isArray(body.messages) && body.messages.length
+    ? body.messages
+    : typeof body.prompt === 'string' && body.prompt.trim()
+      ? [{ role: 'user', content: body.prompt.trim() }]
+      : null;
+
+  if (!rawMessages) {
+    return res.status(400).json({ error: 'messages_required' });
+  }
+
+  const sanitizedMessages = rawMessages
+    .map((msg) => {
+      const role = typeof msg?.role === 'string' ? msg.role : 'user';
+      const content = typeof msg?.content === 'string'
+        ? msg.content
+        : typeof msg?.content === 'object'
+          ? JSON.stringify(msg.content)
+          : String(msg?.content ?? '');
+      if (!content.trim()) {
+        return null;
+      }
+      return { role, content };
+    })
+    .filter(Boolean);
+
+  if (!sanitizedMessages.length) {
+    return res.status(400).json({ error: 'messages_required' });
+  }
+
+  const normalizeSection = (section, fallbackLabel) => {
+    const normalizeString = (value) => (typeof value === 'string' && value.trim() ? value.trim() : undefined);
+    const normalizeNumber = (value) => {
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    };
+    return {
+      label: normalizeString(section?.label) || fallbackLabel,
+      model: normalizeString(section?.model),
+      deployment: normalizeString(section?.deployment),
+      temperature: normalizeNumber(section?.temperature),
+      maxTokens: normalizeNumber(section?.maxTokens ?? section?.max_tokens),
+    };
+  };
+
+  const baselineConfig = normalizeSection(body.baseline, 'Baseline');
+  const candidateConfig = normalizeSection(body.candidate, 'Candidate');
+
+  const runComparison = async (config) => {
+    const startedAt = Date.now();
+    const result = await callGithubModelMessages({
+      messages: sanitizedMessages,
+      model: config.model,
+      maxTokens: config.maxTokens,
+      temperature: config.temperature,
+      deployment: config.deployment,
+    });
+    return {
+      label: config.label,
+      model: result?.data?.model || config.model || GITHUB_MODEL,
+      deployment: config.deployment || GITHUB_MODEL_DEPLOYMENT,
+      text: result.text,
+      endpoint: result.endpoint,
+      durationMs: Date.now() - startedAt,
+      raw: result.data,
+    };
+  };
+
+  try {
+    const [baselineResult, candidateResult] = await Promise.all([
+      runComparison(baselineConfig),
+      runComparison(candidateConfig),
+    ]);
+
+    return res.json({
+      status: 'ok',
+      comparison: {
+        baseline: baselineResult,
+        candidate: candidateResult,
+      },
+    });
+  } catch (err) {
+    console.error('GitHub compare failed:', err);
+    return res.status(502).json({ error: 'github_compare_failed', detail: err?.message || 'compare_error' });
+  }
+};
+
+registerDynamicEndpointGroup('github-model', {
+  basePath: '/github-model',
+  routes: [
+    { method: 'get', path: '/health', handler: githubModelHealthHandler, description: 'health' },
+    { method: 'post', path: '/chat', handler: githubModelChatHandler, description: 'chat proxy' },
+    { method: 'post', path: '/compare', handler: githubModelCompareHandler, description: 'model compare' }
+  ]
 });
 
 const pickSttBase = (accelerator) => {
@@ -2546,10 +3070,12 @@ app.post('/carwatch/snapshot', async (req, res) => {
 
 app.get('/carwatch/snapshot', (req, res) => {
   const snapshot = getCarwatchSnapshot();
-  if (!snapshot) {
-    return res.status(404).json({ error: 'no_snapshot' });
-  }
   const ageMs = carwatchStore.receivedAt ? Date.now() - carwatchStore.receivedAt : null;
+
+  if (!snapshot) {
+    return res.json({ snapshot: null, ageMs: null, error: 'no_snapshot' });
+  }
+
   return res.json({ snapshot, ageMs });
 });
 

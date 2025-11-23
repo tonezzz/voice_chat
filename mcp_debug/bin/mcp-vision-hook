@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+URL=${1:-}
+SLUG=${2:-}
+PNG_PATH=${3:-}
+JSON_PATH=${4:-}
+
+if [[ -z "$URL" || -z "$SLUG" || -z "$PNG_PATH" || -z "$JSON_PATH" ]]; then
+  echo "Usage: mcp-vision-hook <url> <slug> <png_path> <json_path>" >&2
+  exit 1
+fi
+
+if [[ ! -f "$PNG_PATH" || ! -f "$JSON_PATH" ]]; then
+  echo "[mcp-vision-hook] missing capture assets" >&2
+  exit 0
+fi
+
+if [[ "${VISION_DISABLE_HOOK:-false}" == "true" ]]; then
+  exit 0
+fi
+
+MIN_CONF=${VISION_ALERT_MIN_CONF:-0.4}
+ALWAYS=${VISION_ALERT_ALWAYS:-false}
+INCLUDE_IMAGE=${VISION_ALERT_INCLUDE_IMAGE:-false}
+CLASSES_CSV=${VISION_ALERT_CLASSES:-}
+ALERT_WEBHOOK=${VISION_ALERT_WEBHOOK_URL:-}
+FORWARD_URL=${VISION_MCP_FORWARD_URL:-}
+FORWARD_MODE=${VISION_MCP_FORWARD_MODE:-json}
+FORWARD_HEADERS=${VISION_MCP_FORWARD_HEADERS:-}
+CUSTOM_COMMAND=${VISION_ALERT_COMMAND:-}
+SOURCE=${VISION_ALERT_SOURCE:-mcp-browser-vision}
+ROUTING_RULES=${VISION_ALERT_ROUTING:-}
+CROP_DIR=${VISION_ALERT_CROP_DIR:-}
+CROP_LIMIT=${VISION_ALERT_CROP_LIMIT:-0}
+
+trim() {
+  local val="$1"
+  val="${val##[[:space:]]*}"
+  val="${val%%[[:space:]]*}"
+  printf '%s' "$val"
+}
+
+normalize_class() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+declare -A ROUTING_MAP=()
+if [[ -n "$ROUTING_RULES" ]]; then
+  IFS=';' read -r -a routing_pairs <<<"$ROUTING_RULES"
+  for pair in "${routing_pairs[@]}"; do
+    pair=$(trim "$pair")
+    [[ -z "$pair" ]] && continue
+    class_part=${pair%%:*}
+    url_part=${pair#*:}
+    class_part=$(trim "$class_part")
+    url_part=$(trim "$url_part")
+    [[ -z "$class_part" || -z "$url_part" ]] && continue
+    ROUTING_MAP[$(normalize_class "$class_part")]="$url_part"
+  done
+fi
+
+CLASS_JSON=$(jq -n --arg csv "$CLASSES_CSV" '
+  ($csv | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)))
+')
+
+MATCHES=$(jq --arg conf "$MIN_CONF" --argjson classes "$CLASS_JSON" '
+  .detections // []
+  | map(select((.confidence // 0) >= ($conf | tonumber)))
+  | (if ($classes | length) > 0 then map(select(.class_name and ($classes | index(.class_name)))) else . end)
+' "$JSON_PATH")
+
+MATCH_COUNT=$(echo "$MATCHES" | jq 'length')
+TRIGGER=false
+if [[ "$ALWAYS" == "true" ]]; then
+  TRIGGER=true
+elif [[ "$MATCH_COUNT" -gt 0 ]]; then
+  TRIGGER=true
+fi
+
+if [[ "$TRIGGER" != "true" ]]; then
+  exit 0
+fi
+
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+SUMMARY=$(echo "$MATCHES" | jq -r 'if length == 0 then "alert_forced" else map( (.class_name // "?") + "@" + ((.confidence // 0) | tostring)) | join(", ") end')
+
+PAYLOAD=$(jq -n \
+  --arg source "$SOURCE" \
+  --arg url "$URL" \
+  --arg slug "$SLUG" \
+  --arg png "$PNG_PATH" \
+  --arg json "$JSON_PATH" \
+  --arg timestamp "$TIMESTAMP" \
+  --arg summary "$SUMMARY" \
+  --arg min_conf "$MIN_CONF" \
+  --arg match_count "$MATCH_COUNT" \
+  --arg always "$ALWAYS" \
+  --argjson matches "$MATCHES" \
+  --slurpfile det "$JSON_PATH" '
+  {
+    source: $source,
+    timestamp: $timestamp,
+    url: $url,
+    slug: $slug,
+    png_path: $png,
+    json_path: $json,
+    min_confidence: ($min_conf | tonumber),
+    alert_forced: ($always == "true"),
+    match_count: ($match_count | tonumber),
+    match_subset: $matches,
+    detections: ($det[0].detections // []) ,
+    summary: $summary
+  }
+')
+
+if [[ "$INCLUDE_IMAGE" == "true" ]]; then
+  IMG_B64=$(base64 -w 0 "$PNG_PATH" || true)
+  if [[ -n "$IMG_B64" ]]; then
+    PAYLOAD=$(echo "$PAYLOAD" | jq --arg img "data:image/png;base64,$IMG_B64" '.image_base64 = $img')
+  fi
+fi
+
+if [[ -n "$CROP_DIR" ]]; then
+  CROP_DIR=${CROP_DIR%/}
+  mkdir -p "$CROP_DIR"
+  CROP_DATA=$(python - "$PNG_PATH" "$JSON_PATH" "$CROP_DIR" "$SLUG" "$TIMESTAMP" "$CROP_LIMIT" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+png_path, json_path, crop_dir, slug, stamp, limit = sys.argv[1:7]
+try:
+    limit = int(limit)
+except ValueError:
+    limit = 0
+
+try:
+    with open(json_path, 'r', encoding='utf-8') as handle:
+        detections = json.load(handle).get('detections', [])
+except Exception:
+    detections = []
+
+if not isinstance(detections, list) or not detections:
+    print('[]', end='')
+    raise SystemExit(0)
+
+img = Image.open(png_path).convert('RGB')
+width, height = img.size
+os.makedirs(crop_dir, exist_ok=True)
+
+def sanitize(text: str) -> str:
+    allowed = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '-' for ch in text.lower())
+    collapsed = '-'.join(filter(None, allowed.split('-')))
+    return collapsed or 'det'
+
+results = []
+for idx, det in enumerate(detections):
+    if limit > 0 and len(results) >= limit:
+        break
+    bbox = det.get('bbox') if isinstance(det, dict) else None
+    if not (isinstance(bbox, list) and len(bbox) == 4):
+        continue
+    x1, y1, x2, y2 = bbox
+    if any(val is None for val in (x1, y1, x2, y2)):
+        continue
+    x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+    if x2 <= x1 or y2 <= y1:
+        continue
+    x1 = max(0, min(width, x1))
+    x2 = max(0, min(width, x2))
+    y1 = max(0, min(height, y1))
+    y2 = max(0, min(height, y2))
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        continue
+    crop = img.crop((x1, y1, x2, y2))
+    cls = det.get('class_name') or f"class{det.get('class_id', idx)}"
+    safe_class = sanitize(str(cls))
+    name = f"{slug}-{stamp}-{idx:02d}-{safe_class}.png"
+    output_path = Path(crop_dir) / name
+    crop.save(output_path, format='PNG')
+    results.append({
+        'path': str(output_path),
+        'class_name': det.get('class_name'),
+        'confidence': det.get('confidence'),
+        'bbox': bbox,
+    })
+
+print(json.dumps(results), end='')
+PY
+  )
+  if [[ -n "$CROP_DATA" && "$CROP_DATA" != "[]" ]]; then
+    PAYLOAD=$(echo "$PAYLOAD" | jq --argjson crops "$CROP_DATA" '.crop_images = $crops')
+  fi
+fi
+
+send_json() {
+  local url="$1"
+  local extra_headers=()
+  if [[ -n "$FORWARD_HEADERS" ]]; then
+    IFS=';' read -r -a header_array <<< "$FORWARD_HEADERS"
+    for h in "${header_array[@]}"; do
+      [[ -z "$h" ]] && continue
+      extra_headers+=(-H "$h")
+    done
+  fi
+  curl -sfSL -X POST "$url" -H 'Content-Type: application/json' "${extra_headers[@]}" -d "$PAYLOAD"
+}
+
+if [[ -n "$ALERT_WEBHOOK" ]]; then
+  send_json "$ALERT_WEBHOOK" || echo "[mcp-vision-hook] webhook failed" >&2
+fi
+
+declare -A ROUTED_TARGETS=()
+if [[ ${#ROUTING_MAP[@]} -gt 0 ]]; then
+  mapfile -t routed_classes < <(echo "$MATCHES" | jq -r '.[].class_name // empty' | sort -u)
+  for cls in "${routed_classes[@]}"; do
+    key=$(normalize_class "$cls")
+    route_url=${ROUTING_MAP[$key]:-}
+    [[ -z "$route_url" ]] && continue
+    if [[ -z "${ROUTED_TARGETS[$route_url]:-}" ]]; then
+      send_json "$route_url" || echo "[mcp-vision-hook] routed webhook failed ($route_url)" >&2
+      ROUTED_TARGETS[$route_url]=1
+    fi
+  done
+fi
+
+if [[ ${#ROUTED_TARGETS[@]} -gt 0 ]]; then
+  ROUTE_JSON=$(for url in "${!ROUTED_TARGETS[@]}"; do printf '%s\n' "$url"; done | jq -R . | jq -s .)
+  PAYLOAD=$(echo "$PAYLOAD" | jq --argjson routes "$ROUTE_JSON" '.routed_webhooks = $routes')
+fi
+
+if [[ -n "$FORWARD_URL" ]]; then
+  case "$FORWARD_MODE" in
+    multipart)
+      TMP_META=$(mktemp)
+      printf '%s' "$PAYLOAD" >"$TMP_META"
+      if ! curl -sfSL -X POST "$FORWARD_URL" -F "image=@$PNG_PATH;type=image/png" -F "metadata=@$TMP_META;type=application/json"; then
+        echo "[mcp-vision-hook] MCP forward failed" >&2
+      fi
+      rm -f "$TMP_META"
+      ;;
+    json|JSON|*)
+      send_json "$FORWARD_URL" || echo "[mcp-vision-hook] MCP forward failed" >&2
+      ;;
+  esac
+fi
+
+if [[ -n "$CUSTOM_COMMAND" ]]; then
+  VISION_HOOK_PAYLOAD="$PAYLOAD" VISION_HOOK_MATCH_COUNT="$MATCH_COUNT" VISION_HOOK_URL="$URL" VISION_HOOK_SLUG="$SLUG" \
+    VISION_HOOK_PNG="$PNG_PATH" VISION_HOOK_JSON="$JSON_PATH" bash -c "$CUSTOM_COMMAND" || echo "[mcp-vision-hook] command failed" >&2
+fi

@@ -11,14 +11,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$scriptDir = if ($PSScriptRoot) {
+    $PSScriptRoot
+} else {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+$repoRoot = Split-Path -Parent $scriptDir
+
 function Resolve-ComposeFiles {
     param(
         [switch]$IncludeGpu
     )
 
     $files = @()
-    $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-    $root = Split-Path -Parent $root
+    $root = $repoRoot
 
     $main = Join-Path $root 'docker-compose.yml'
     if (-not (Test-Path $main)) {
@@ -65,19 +71,15 @@ if ($VerboseOutput) {
     Write-Host "Running:`n$exe $($fullArgs -join ' ')" -ForegroundColor Cyan
 }
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $exe
-$psi.ArgumentList.Add('compose')
-foreach ($arg in $composeArgs) {
-    $psi.ArgumentList.Add($arg)
+Push-Location $repoRoot
+try {
+    & $exe @fullArgs
+    $exit = $LASTEXITCODE
 }
-$psi.WorkingDirectory = (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
-$psi.RedirectStandardOutput = $false
-$psi.RedirectStandardError = $false
-$psi.UseShellExecute = $false
+finally {
+    Pop-Location
+}
 
-$process = [System.Diagnostics.Process]::Start($psi)
-$process.WaitForExit()
-if ($process.ExitCode -ne 0) {
-    throw "docker compose exited with code $($process.ExitCode)"
+if ($exit -ne 0) {
+    throw "docker compose exited with code $exit"
 }

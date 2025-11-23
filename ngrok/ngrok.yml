@@ -6,8 +6,7 @@ tunnels:
     proto: http
     addr: server:3001
     metadata: "Stack API + GPU queue"
-    # Uncomment to pin a hostname or domain you own:
-    # hostname: your-subdomain.ngrok.app
+    hostname: stirred-horse-unlikely.ngrok-free.app
   mcp-debug-shell:
     proto: http
     addr: mcp-debug:7681

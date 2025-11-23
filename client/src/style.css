@@ -1446,6 +1446,22 @@
   background: #000;
 }
 
+.image-preview-button {
+  width: 100%;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  cursor: zoom-in;
+  display: block;
+}
+
+.image-preview-button img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
 .image-result-card img {
   display: block;
   width: 100%;
@@ -1484,6 +1500,124 @@
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
+}
+
+.image-lightbox-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  z-index: 1000;
+}
+
+.image-lightbox {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  max-width: min(90vw, 1200px);
+  max-height: 90vh;
+  background: #0f172a;
+  border-radius: 1.25rem;
+  box-shadow: 0 40px 80px rgba(15, 23, 42, 0.65);
+  padding: 1rem 1.5rem;
+  color: #e2e8f0;
+}
+
+.lightbox-image-frame {
+  margin: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.lightbox-image-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 70vh;
+  border-radius: 0.85rem;
+  object-fit: contain;
+}
+
+.lightbox-image-frame figcaption {
+  width: 100%;
+  font-size: 0.95rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.lightbox-meta {
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  border: none;
+  background: rgba(15, 23, 42, 0.6);
+  color: #e2e8f0;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 999px;
+  font-size: 1.25rem;
+  cursor: pointer;
+}
+
+.lightbox-nav {
+  border: none;
+  background: rgba(15, 23, 42, 0.6);
+  color: #e2e8f0;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 999px;
+  font-size: 1.5rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.lightbox-nav:hover,
+.lightbox-close:hover {
+  background: rgba(59, 130, 246, 0.5);
+}
+
+.lightbox-nav-prev {
+  margin-right: 0.5rem;
+}
+
+.lightbox-nav-next {
+  margin-left: 0.5rem;
+}
+
+@media (max-width: 768px) {
+  .image-lightbox {
+    flex-direction: column;
+    max-height: none;
+  }
+
+  .lightbox-nav {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+
+  .lightbox-nav-prev {
+    left: 0.75rem;
+    margin: 0;
+  }
+
+  .lightbox-nav-next {
+    right: 0.75rem;
+    margin: 0;
+  }
 }
 
 .form-error {

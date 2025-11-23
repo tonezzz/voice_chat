@@ -4,7 +4,262 @@ x-build-cache: &build_cache
   cache_to:
     - type=local,dest=${DOCKER_CACHE_DIR:-.docker-cache},mode=max
 
+x-service-defaults: &service_defaults
+  restart: unless-stopped
+
+x-healthcheck-fast: &healthcheck_fast
+  interval: 30s
+  timeout: 10s
+  retries: 5
+
+x-healthcheck-slow: &healthcheck_slow
+  interval: 60s
+  timeout: 15s
+  retries: 5
+
 services:
+  # ---------------------------------------------------------------------------
+  # Speech + TTS stacks
+  # ---------------------------------------------------------------------------
+  openvoice-tts:
+    build:
+      context: C:/_dev/_models/openvoice/openvoice
+      <<: *build_cache
+    container_name: voice-chat-openvoice
+    profiles: ["optional", "openvoice"]
+    <<: *service_defaults
+    environment:
+      - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
+      - OPENVOICE_CHECKPOINT_DIR=/app/inference/checkpoints
+    volumes:
+      - C:/_dev/_models/openvoice_v2:/app/inference/openvoice_v2
+      - C:/_dev/_models/openvoice/data:/app/inference/.data
+      - C:/_dev/_models/openvoice/checkpoints:/app/inference/checkpoints
+      - C:/_dev/_models/openvoice/references:/app/inference/references
+      - C:/_dev/_models/openvoice/conf/openvoice:/app/conf/openvoice
+    ports:
+      - "8100:80"
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost/hc || exit 1"]
+
+  openvoice-tts-gpu:
+    build:
+      context: C:/_dev/_models/openvoice/openvoice
+      <<: *build_cache
+    container_name: voice-chat-openvoice-gpu
+    profiles: ["optional", "openvoice-gpu"]
+    <<: *service_defaults
+    environment:
+      - OPENVOICE_V2_DIR=/app/inference/openvoice_v2
+      - NVIDIA_VISIBLE_DEVICES=all
+      - OPENVOICE_CHECKPOINT_DIR=/app/inference/checkpoints
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    runtime: nvidia
+    volumes:
+      - C:/_dev/_models/openvoice_v2:/app/inference/openvoice_v2
+      - C:/_dev/_models/openvoice/data:/app/inference/.data
+      - C:/_dev/_models/openvoice/checkpoints:/app/inference/checkpoints
+      - C:/_dev/_models/openvoice/references:/app/inference/references
+      - C:/_dev/_models/openvoice/conf/openvoice:/app/conf/openvoice
+    ports:
+      - "8101:80"
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost/hc || exit 1"]
+
+  stt-gpu:
+    build:
+      context: ./stt
+      <<: *build_cache
+    container_name: stt-whisper-gpu
+    profiles: ["optional", "gpu"]
+    <<: *service_defaults
+    init: true
+    environment:
+      - WHISPER_MODEL=base
+      - WHISPER_DEVICE=cuda
+      - WHISPER_DOWNLOAD_DIR=/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    runtime: nvidia
+    ports:
+      - "5002:5001"
+    volumes:
+      - ${HF_STT_MODELS:-C:/_dev/_models/huggingface/stt}:/app/models
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1"]
+
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    profiles: ["optional", "cpu"]
+    <<: *service_defaults
+    ports:
+      - "11434:11434"
+    volumes:
+      - "C:/_dev/_models/ollama:/root/.ollama"
+
+  ollama-gpu:
+    image: ollama/ollama
+    container_name: ollama-gpu
+    profiles: ["optional", "gpu"]
+    <<: *service_defaults
+    ports:
+      - "11435:11434"
+    volumes:
+      - "C:/_dev/_models/ollama:/root/.ollama"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    environment:
+      - OLLAMA_KEEP_ALIVE=5m
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    runtime: nvidia
+
+  # ---------------------------------------------------------------------------
+  # Core MCPs now optional
+  # ---------------------------------------------------------------------------
+  mcp_bslip:
+    build:
+      context: ./mcp-bslip
+      <<: *build_cache
+    container_name: mcp-bslip
+    profiles: ["optional", "internal-cpu", "bslip"]
+    <<: *service_defaults
+    environment:
+      - PORT=8002
+    ports:
+      - "8002:8002"
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
+
+  mcp-tuya:
+    build:
+      context: ./mcp_tuya_bridge
+      <<: *build_cache
+    container_name: mcp-tuya
+    profiles: ["optional", "tuya"]
+    <<: *service_defaults
+    environment:
+      - TUYA_ENDPOINT=${TUYA_ENDPOINT:-}
+      - TUYA_ACCESS_ID=${TUYA_ACCESS_ID:-}
+      - TUYA_ACCESS_SECRET=${TUYA_ACCESS_SECRET:-}
+      - TUYA_CUSTOM_MCP_ENDPOINT=${TUYA_CUSTOM_MCP_ENDPOINT:-http://mcp0:8010/mcp}
+      - TUYA_RECONNECT_MIN_SECONDS=${TUYA_RECONNECT_MIN_SECONDS:-5}
+      - TUYA_RECONNECT_MAX_SECONDS=${TUYA_RECONNECT_MAX_SECONDS:-60}
+    ports:
+      - "8007:8007"
+    healthcheck:
+      <<: *healthcheck_slow
+      test: ["CMD-SHELL", "curl -sf http://localhost:8007/health || exit 1"]
+
+  mcp_idp:
+    build:
+      context: ./mcp_idp
+      <<: *build_cache
+    container_name: mcp-idp
+    profiles: ["optional", "internal-cpu", "cpu"]
+    <<: *service_defaults
+    environment:
+      - IDP_DEVICE=${IDP_DEVICE:-cpu}
+      - IDP_REFERENCE_DIR=/app/reference_faces
+      - IDP_MODEL_STORAGE=/app/models
+      - PORT=8004
+    volumes:
+      - ${IDP_REFERENCE_ROOT:-C:/_dev/_models/idp/references}:/app/reference_faces
+      - ${IDP_MODEL_ROOT:-C:/_dev/_models/idp/models}:/app/models
+    ports:
+      - "8004:8004"
+    healthcheck:
+      <<: *healthcheck_slow
+      test: ["CMD-SHELL", "curl -sf http://localhost:8004/health || exit 1"]
+
+  mcp_yolo:
+    build:
+      context: ./mcp_yolo
+      <<: *build_cache
+    container_name: mcp-yolo
+    profiles: ["optional", "internal-cpu"]
+    <<: *service_defaults
+    environment:
+      - YOLO_MODEL=/app/models/yolov8n.pt
+    volumes:
+      - C:/_dev/_models/yolo:/app/models
+    ports:
+      - "8000:8000"
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/ || exit 1"]
+
+  mcp-imagen:
+    build:
+      context: ./mcp_imagen
+      <<: *build_cache
+    container_name: mcp-imagen
+    profiles: ["optional", "internal-cpu"]
+    <<: *service_defaults
+    environment:
+      - IMAGE_MODEL_ID=${IMAGE_MODEL_ID:-runwayml/stable-diffusion-v1-5}
+      - TORCH_DEVICE=${IMAGE_TORCH_DEVICE:-cpu}
+      - IMAGE_STEPS=${IMAGE_STEPS:-14}
+      - IMAGE_MAX_STEPS=${IMAGE_MAX_STEPS:-40}
+      - IMAGE_WIDTH=${IMAGE_WIDTH:-512}
+      - IMAGE_HEIGHT=${IMAGE_HEIGHT:-512}
+      - IMAGE_MODEL_CACHE=/app/models
+    volumes:
+      - C:/_dev/_models/diffusers:/app/models
+    ports:
+      - "8001:8001"
+    healthcheck:
+      <<: *healthcheck_slow
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/ || exit 1"]
+
+  mcp-imagen-gpu:
+    build:
+      context: ./mcp_imagen
+      <<: *build_cache
+      args:
+        BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
+        USE_GPU: "true"
+    container_name: mcp-imagen-gpu
+    profiles: ["optional", "gpu"]
+    <<: *service_defaults
+    environment:
+      - IMAGE_MODEL_ID=${IMAGE_MODEL_ID:-runwayml/stable-diffusion-v1-5}
+      - TORCH_DEVICE=${IMAGE_TORCH_DEVICE_GPU:-cuda}
+      - IMAGE_STEPS=${IMAGE_STEPS:-25}
+      - IMAGE_MAX_STEPS=${IMAGE_MAX_STEPS:-60}
+      - IMAGE_WIDTH=${IMAGE_WIDTH:-512}
+      - IMAGE_HEIGHT=${IMAGE_HEIGHT:-512}
+      - IMAGE_MODEL_CACHE=/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    runtime: nvidia
+    volumes:
+      - ${IMAGE_MODEL_ROOT:-C:/_dev/_models/diffusers}:/app/models
+    ports:
+      - "8102:8001"
+    healthcheck:
+      <<: *healthcheck_slow
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/ || exit 1"]
+
+  # Existing optional services -------------------------------------------------
   # Optional memory provider (requires manual start)
   mcp-memento:
     build:
@@ -40,6 +295,26 @@ services:
       timeout: 10s
       retries: 5
     restart: unless-stopped
+
+  # Optional Sequential Thinking MCP (self-registers with MCP0)
+  mcp-seqthink:
+    build:
+      context: ./mcp_seqthink
+      <<: *build_cache
+    container_name: mcp-seqthink
+    profiles: ["optional", "external"]
+    <<: *service_defaults
+    environment:
+      - PORT=8015
+      - SEQTHINK_PROVIDER_NAME=${SEQTHINK_PROVIDER_NAME:-seqthink}
+      - SEQTHINK_BASE_URL=${SEQTHINK_BASE_URL:-http://mcp-seqthink:8015}
+      - MCP0_URL=http://mcp0:8010
+      - MCP0_ADMIN_TOKEN=${MCP0_ADMIN_TOKEN:-}
+    ports:
+      - "8015:8015"
+    healthcheck:
+      <<: *healthcheck_slow
+      test: ["CMD-SHELL", "curl -sf http://localhost:8015/health || exit 1"]
 
   # Optional Google Photos MCP bridge (requires OAuth credentials)
   mcp-gphotos:
@@ -150,25 +425,3 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Optional Tuya-to-MCP bridge
-  mcp-tuya:
-    build:
-      context: ./mcp_tuya_bridge
-      <<: *build_cache
-    container_name: mcp-tuya
-    profiles: ["optional"]
-    environment:
-      - TUYA_ENDPOINT=${TUYA_ENDPOINT:-}
-      - TUYA_ACCESS_ID=${TUYA_ACCESS_ID:-}
-      - TUYA_ACCESS_SECRET=${TUYA_ACCESS_SECRET:-}
-      - TUYA_CUSTOM_MCP_ENDPOINT=${TUYA_CUSTOM_MCP_ENDPOINT:-http://mcp0:8010/mcp}
-      - TUYA_RECONNECT_MIN_SECONDS=${TUYA_RECONNECT_MIN_SECONDS:-5}
-      - TUYA_RECONNECT_MAX_SECONDS=${TUYA_RECONNECT_MAX_SECONDS:-60}
-    ports:
-      - "8007:8007"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8007/health || exit 1"]
-      interval: 60s
-      timeout: 15s
-      retries: 5
-    restart: unless-stopped
