@@ -67,6 +67,7 @@ services:
       - BSLIP_MCP_URL=${BSLIP_MCP_URL:-}
       - IMAGE_MCP_URL=${IMAGE_MCP_URL:-}
       - IMAGE_MCP_GPU_URL=${IMAGE_MCP_GPU_URL:-http://imagen-gpu:8001}
+      - VAJA_MCP_URL=${VAJA_MCP_URL:-http://mcp-vaja:8017}
       - IDP_MCP_URL=${IDP_MCP_URL:-}
       - IDP_MCP_GPU_URL=${IDP_MCP_GPU_URL:-}
       - MEETING_MCP_URL=${MEETING_MCP_URL:-http://mcp-meeting:8008}
@@ -110,7 +111,8 @@ services:
     build:
       context: ./mcp_imagen
       args:
-        BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
+        BASE_IMAGE_PY: ${PYTHON_BASE_IMAGE:-python:3.11-slim}
+        CUDA_BASE_IMAGE: ${CUDA_BASE_IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}
         USE_GPU: "true"
       <<: *build_cache
     container_name: imagen-gpu
@@ -195,6 +197,26 @@ services:
     healthcheck:
       <<: *healthcheck_slow
       test: ["CMD-SHELL", "curl -sf http://localhost:8015/health || exit 1"]
+
+  mcp-vaja:
+    build:
+      context: .
+      dockerfile: ./mcp_vaja/Dockerfile
+      <<: *build_cache
+    container_name: mcp-vaja
+    <<: *service_defaults
+    environment:
+      - PORT=8017
+      - AI4THAI_API_KEY=${AI4THAI_API_KEY:-}
+      - VAJA_ENDPOINT=${VAJA_ENDPOINT:-https://api.aiforthai.in.th/vaja}
+      - VAJA_OUTPUT_DIR=/output
+    volumes:
+      - ${VAJA_OUTPUT_DIR:-C:/_dev/_models/vaja_audio}:/output
+    ports:
+      - "8017:8017"
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost:8017/health || exit 1"]
 
   ngrok:
     image: ngrok/ngrok:latest

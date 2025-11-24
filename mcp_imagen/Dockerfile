@@ -1,7 +1,6 @@
-ARG BASE_IMAGE_PY=python:3.11-slim
 ARG CUDA_BASE_IMAGE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
-FROM ${BASE_IMAGE_PY} AS builder
+FROM ${CUDA_BASE_IMAGE} AS builder
 
 ARG USE_GPU=false
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -20,7 +19,7 @@ RUN rm -f /etc/apt/sources.list.d/cuda* \
         libglib2.0-0 \
     && ln -sf python3 /usr/bin/python \
     && ln -sf pip3 /usr/bin/pip \
-    && python -m venv ${VENV_PATH} \
+    && python3 -m venv ${VENV_PATH} \
     && rm -rf /var/lib/apt/lists*
 
 ENV PATH="${VENV_PATH}/bin:${PATH}"
@@ -61,12 +60,21 @@ RUN rm -f /etc/apt/sources.list.d/cuda* \
         python3 \
         python3-pip \
         python3-venv \
+    && ln -sf python3 /usr/bin/python \
+    && ln -sf pip3 /usr/bin/pip \
     && rm -rf /var/lib/apt/lists*
 
 WORKDIR /app
 
 COPY --from=builder ${VENV_PATH} ${VENV_PATH}
 COPY --from=builder /app /app
+
+RUN ln -sf /usr/bin/python3 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/local/bin/pip3 \
+    && ln -sf /usr/bin/pip3 /usr/local/bin/pip \
+    && ln -sf /usr/bin/python3 ${VENV_PATH}/bin/python \
+    && ln -sf /usr/bin/python3 ${VENV_PATH}/bin/python3
 
 RUN useradd --create-home --shell /bin/bash appuser
 USER appuser

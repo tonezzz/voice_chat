@@ -291,41 +291,44 @@ const meetingIngestAudioHandler = async (req, res) => {
       tags: Array.isArray(tags) ? tags : undefined
     });
 
-}
+    const mimeType = req.file.mimetype || 'audio/webm';
+    const encoded = `data:${mimeType};base64,${req.file.buffer.toString('base64')}`;
+    const entry = await invokeMeetingTool('ingest_audio_chunk', {
+      session_id: meetingSessionId,
+      audio_base64: encoded,
+      speaker: typeof speaker === 'string' ? speaker : undefined,
+      language,
+      whisper_model: typeof whisperModel === 'string' ? whisperModel : undefined,
+      filename: req.file.originalname || 'meeting-audio.webm'
+    });
 
-try {
-  console.log('[bslip] forwarding verify-slip request', {
-    target: `${baseUrl}/verify`,
-    name: req.file.originalname,
-    referenceId: referenceId || undefined
-  });
-
-  const response = await fetch(`${baseUrl}/verify`, {
-    method: 'POST',
-    headers: form.getHeaders(),
-    body: form
-  });
-
-  if (!response.ok) {
-    const detailText = await response.text();
-    console.error('BSLIP MCP error:', detailText);
-    let detailJson;
-    try {
-      detailJson = JSON.parse(detailText);
-    } catch (parseErr) {
-      detailJson = undefined;
-    }
-
-    return res.status(502).json({
-      error: 'bslip_mcp_error',
-      detail: detailJson || detailText,
-      target: `${baseUrl}/verify`,
-    return res.json(status);
+    return res.json({ sessionId: meetingSessionId, entry: unwrapMeetingResponse(entry) });
   } catch (err) {
-    console.error('GitHub model health check failed:', err);
-    return res.status(500).json({ name: 'githubModel', status: 'error', detail: err?.message || 'unknown_error' });
+    console.error('meeting audio ingest failed', err);
+    const detail = err?.message || 'meeting_audio_ingest_failed';
+    return res.status(502).json({ error: detail });
   }
+};
+
+registerDynamicEndpointGroup('meeting', {
+  basePath: '/meeting',
+  enabled: true,
+  routes: [
+    { method: 'get', path: '/sessions', handler: meetingListSessionsHandler, description: 'list sessions' },
+    { method: 'post', path: '/sessions', handler: meetingCreateSessionHandler, description: 'start session' },
+    { method: 'get', path: '/sessions/:sessionId', handler: meetingSessionDetailHandler, description: 'session detail' },
+    { method: 'post', path: '/sessions/:sessionId/summarize', handler: meetingSummarizeHandler, description: 'summarize session' },
+    { method: 'post', path: '/append-transcript', handler: meetingAppendTranscriptHandler, description: 'append transcript' },
+    {
+      method: 'post',
+      path: '/ingest-audio',
+      handler: upload.single('audio'),
+      description: 'ingest audio chunk'
+    }
+  ]
 });
+
+app.post('/meeting/ingest-audio', upload.single('audio'), meetingIngestAudioHandler);
 
 app.post('/identify-people', upload.single('image'), async (req, res) => {
   if (!req.file) {
@@ -487,13 +490,15 @@ app.post('/generate-image-stream', async (req, res) => {
     }
 
     const contentType = (response.headers.get('content-type') || '').toLowerCase();
-    if (!contentType.includes('application/json')) {
+    const acceptsNdjson = contentType.includes('application/x-ndjson') || contentType.includes('application/ndjson');
+    const acceptsJson = contentType.includes('application/json');
+    if (!acceptsJson && !acceptsNdjson) {
       const detail = await response.text().catch(() => '');
       console.error('Image generator returned non-JSON response', { contentType, detail });
       return res.status(502).json({ error: 'image_service_invalid_response', detail: detail || `Unexpected content-type ${contentType || 'unknown'}` });
     }
 
-    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Type', acceptsNdjson ? 'application/x-ndjson' : 'application/json');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('X-Accel-Buffering', 'no');
 
@@ -590,41 +595,18 @@ const safeJsonParse = (value, fallback) => {
 };
 
 app.post('/preview-voice', async (req, res) => {
-  if (!VOICE_FEATURE_ENABLED) {
+  if (!VAJA_ENABLED) {
     return res.status(503).json({ error: 'voice_feature_disabled' });
   }
-  const { voiceId, accelerator, text } = req.body || {};
-  const selectedVoice = typeof voiceId === 'string' && voiceId.trim() ? voiceId.trim() : '';
-  if (!selectedVoice) {
-    return res.status(400).json({ error: 'voice_id_required' });
-  }
-
-  const previewText = typeof text === 'string' && text.trim().length >= 6 ? text.trim() : 'Premium voice preview.';
+  const { voiceId, text } = req.body || {};
+  const selectedVoice = typeof voiceId === 'string' && voiceId.trim() ? voiceId.trim() : 'noina';
+  const previewText = typeof text === 'string' && text.trim().length >= 6 ? text.trim() : 'VAJA preview voice.';
   try {
-    const audioUrl = await synthesizeWithOpenvoice(previewText, accelerator, selectedVoice);
-    return res.json({ audioUrl });
+    const data = await invokeVaja({ text: previewText, speaker: selectedVoice, download: false });
+    return res.json({ audioUrl: data?.audio_url || null });
   } catch (err) {
     console.error('Voice preview failed:', err);
     return res.status(500).json({ error: 'voice_preview_failed', detail: err.message });
-  }
-});
-
-const attachmentStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (_req, file, cb) => {
-    const timestamp = Date.now();
-    const original = file.originalname || 'upload';
-    const safeName = original.replace(/[^a-zA-Z0-9._-]/g, '_');
-    cb(null, `${timestamp}-${safeName}`);
-  }
-});
-
-const attachmentUpload = multer({
-  storage: attachmentStorage,
-  limits: {
-    fileSize: Number(process.env.MAX_ATTACHMENT_BYTES) || 25 * 1024 * 1024
   }
 });
 
@@ -645,9 +627,27 @@ const MODEL = process.env.MODEL || 'llama3';
 const PORT = process.env.PORT || 3001;
 const STT_URL = resolveServiceUrl(process.env.STT_URL, 'http://localhost:5001');
 const STT_GPU_URL = resolveServiceUrl(process.env.STT_GPU_URL);
-const OPENVOICE_URL = resolveServiceUrl(process.env.OPENVOICE_URL);
-const OPENVOICE_GPU_URL = resolveServiceUrl(process.env.OPENVOICE_GPU_URL);
+const VAJA_MCP_URL = resolveServiceUrl(process.env.VAJA_MCP_URL || process.env.VAJA_ENDPOINT || '');
+const VAJA_VOICES = [
+  { id: 'nana', name: 'Nana • Female • Animation' },
+  { id: 'noina', name: 'Noina • Female • Commercial/IVR' },
+  { id: 'farah', name: 'Farah • Female • Documentary' },
+  { id: 'mewzy', name: 'Mewzy • Female • Commercial' },
+  { id: 'farsai', name: 'Farsai • Female • Animation' },
+  { id: 'prim', name: 'Prim • Female • Announcer' },
+  { id: 'ped', name: 'Ped • Female • Announcer' },
+  { id: 'poom', name: 'Poom • Male • Commercial/IVR' },
+  { id: 'doikham', name: 'Doikham • Male • Northern dialect' },
+  { id: 'praw', name: 'Praw • Girl • Youth' },
+  { id: 'wayu', name: 'Wayu • Boy • Youth' },
+  { id: 'namphueng', name: 'Namphueng • Female • Anchor style' },
+  { id: 'toon', name: 'Toon • Female • Broadcast style' },
+  { id: 'sanooch', name: 'Sanooch • Female • Teacher style' },
+  { id: 'thanwa', name: 'Thanwa • Male • Broadcast style' }
+];
 const YOLO_MCP_URL = resolveServiceUrl(process.env.YOLO_MCP_URL, 'http://localhost:8000');
+const VOICE_FEATURE_ENABLED =
+  (process.env.ENABLE_VOICE_FEATURE || process.env.VOICE_FEATURE_ENABLED || '').toLowerCase() === 'true';
 const BSLIP_MCP_URL = resolveServiceUrl(process.env.BSLIP_MCP_URL, 'http://localhost:8002');
 const IMAGE_MCP_URL = resolveServiceUrl(process.env.IMAGE_MCP_URL, 'http://localhost:8001');
 const IMAGE_MCP_GPU_URL = resolveServiceUrl(process.env.IMAGE_MCP_GPU_URL);
@@ -883,8 +883,7 @@ const requireWorkerAuth = (req, res, next) => {
   next();
 };
 
-const VOICE_FEATURE_ENABLED =
-  (process.env.ENABLE_VOICE_FEATURE || process.env.VOICE_FEATURE_ENABLED || '').toLowerCase() === 'true';
+const VAJA_ENABLED = !!VAJA_MCP_URL;
 
 const MCP_AUTOMATION_PROMPT = `You can request external tool executions via MCP0.
 When a GitHub operation is needed, emit a fenced code block labeled mcp0 using strict JSON:
@@ -2559,15 +2558,7 @@ const pickSttBase = (accelerator) => {
   return STT_URL;
 };
 
-const pickOpenvoiceBase = (accelerator) => {
-  if (!VOICE_FEATURE_ENABLED) {
-    return '';
-  }
-  if (shouldUseGpu(accelerator) && OPENVOICE_GPU_URL) {
-    return OPENVOICE_GPU_URL;
-  }
-  return OPENVOICE_URL || OPENVOICE_GPU_URL || '';
-};
+const pickVajaBase = () => (VAJA_ENABLED ? VAJA_MCP_URL : '');
 
 const pickMcpImagenBase = (accelerator) => {
   if (shouldUseGpu(accelerator) && IMAGE_MCP_GPU_URL) {
@@ -2583,107 +2574,32 @@ const pickIdpBase = (accelerator) => {
   return { baseUrl: IDP_MCP_URL || IDP_MCP_GPU_URL || '', accelerator: IDP_MCP_URL ? 'cpu' : 'gpu' };
 };
 
-const ttsDir = path.join(__dirname, 'public', 'tts');
-if (!fs.existsSync(ttsDir)) {
-  fs.mkdirSync(ttsDir, { recursive: true });
-}
-
-const writeAudioFile = async (arrayBuffer) => {
-  const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}.wav`;
-  const filepath = path.join(ttsDir, filename);
-  await fs.promises.writeFile(filepath, Buffer.from(arrayBuffer));
-  return `/tts/${filename}`;
-};
-
-const isOpenvoiceVoice = (voiceId) => typeof voiceId === 'string' && voiceId.toLowerCase().startsWith('openvoice-');
-
-const requestOpenvoiceSynthesis = async (baseUrl, text, voiceId) => {
-  if (!baseUrl) {
-    throw new Error('openvoice_unavailable');
+const invokeVaja = async ({ text, speaker = 'noina', download = false }) => {
+  if (!VAJA_ENABLED) {
+    throw new Error('vaja_unconfigured');
   }
-
-  const response = await fetch(`${normalizeBaseUrl(baseUrl)}/synthesize`, {
+  const response = await fetch(`${normalizeBaseUrl(VAJA_MCP_URL)}/invoke`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice: voiceId })
+    body: JSON.stringify({ tool: 'synthesize_speech', arguments: { text, speaker, download } })
   });
-
   if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`openvoice_synthesis_error: ${errText}`);
+    const detail = await response.text();
+    throw new Error(detail || 'vaja_failed');
   }
-
-  const arrayBuffer = await response.arrayBuffer();
-  return writeAudioFile(arrayBuffer);
+  return response.json();
 };
 
-const synthesizeWithOpenvoice = async (text, accelerator, voiceId) => {
-  if (!VOICE_FEATURE_ENABLED) {
-    throw new Error('openvoice_disabled');
-  }
-  const prefersGpu = shouldUseGpu(accelerator) && !!OPENVOICE_GPU_URL;
-  const hasCpu = !!OPENVOICE_URL;
-
-  if (!prefersGpu && !hasCpu) {
-    throw new Error('openvoice_unavailable');
-  }
-
-  const failures = [];
-  const tried = new Set();
-  const tryBase = async (baseUrl, label) => {
-    if (!baseUrl || tried.has(baseUrl)) {
-      return null;
-    }
-    tried.add(baseUrl);
-    try {
-      return await requestOpenvoiceSynthesis(baseUrl, text, voiceId);
-    } catch (err) {
-      failures.push({ label, message: err?.message || String(err) });
-      return null;
-    }
-  };
-
-  if (prefersGpu) {
-    const gpuResult = await tryBase(OPENVOICE_GPU_URL, 'gpu');
-    if (gpuResult) {
-      return gpuResult;
-    }
-  }
-
-  if (hasCpu) {
-    const cpuResult = await tryBase(OPENVOICE_URL, 'cpu');
-    if (cpuResult) {
-      return cpuResult;
-    }
-  }
-
-  const detail = failures.length
-    ? failures.map((entry) => `${entry.label}: ${entry.message}`).join('; ')
-    : 'openvoice_unavailable';
-  throw new Error(detail);
-};
-
-const synthesizeSpeech = async (text, accelerator, voice) => {
-  if (!text || !text.trim()) {
+const synthesizeSpeech = async (text, voice) => {
+  if (!text || !text.trim() || !VAJA_ENABLED) {
     return null;
   }
-
-  if (!VOICE_FEATURE_ENABLED) {
-    return null;
-  }
-
-  const selectedVoice = typeof voice === 'string' ? voice.trim() : '';
-
+  const selectedVoice = typeof voice === 'string' && voice.trim() ? voice.trim() : 'noina';
   try {
-    if (selectedVoice && isOpenvoiceVoice(selectedVoice)) {
-      return await synthesizeWithOpenvoice(text, accelerator, selectedVoice);
-    }
-    if (OPENVOICE_URL || OPENVOICE_GPU_URL) {
-      return await synthesizeWithOpenvoice(text, accelerator, selectedVoice || 'openvoice-default');
-    }
-    return null;
+    const data = await invokeVaja({ text: text.slice(0, 800), speaker: selectedVoice, download: false });
+    return data?.audio_url || null;
   } catch (err) {
-    console.error('TTS synthesis failed:', err);
+    console.error('VAJA synthesis failed:', err.message);
     return null;
   }
 };

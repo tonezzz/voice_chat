@@ -3210,31 +3210,6 @@ body {
   text-decoration: underline;
 }
 
-.camera-overlay {
-  position: fixed;
-  inset: 0;
-  background-color: rgba(15, 23, 42, 0.55);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 40;
-}
-
-.camera-modal {
-  background-color: #f9fafb;
-  padding: 1rem;
-  border-radius: 0.75rem;
-  box-shadow: 0 10px 25px rgba(15, 23, 42, 0.45);
-  max-width: 480px;
-  width: 90%;
-}
-
-.camera-modal video {
-  width: 100%;
-  border-radius: 0.75rem;
-  background-color: #000;
-}
-
 .floating-overlay {
   position: fixed;
   inset: 0;

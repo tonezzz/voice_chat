@@ -1,7 +1,20 @@
 const fs = require('fs');
 const path = require('path');
-const fetch = require('node-fetch');
 const { once } = require('events');
+
+const resolveFetch = () => {
+  if (typeof globalThis.fetch === 'function') {
+    return globalThis.fetch.bind(globalThis);
+  }
+  try {
+    // eslint-disable-next-line global-require
+    return require('node-fetch');
+  } catch (err) {
+    throw new Error('Fetch API is unavailable. Please use Node 18+ or install node-fetch.');
+  }
+};
+
+const fetch = resolveFetch();
 
 const DEFAULT_VAJA_ENDPOINT = 'https://api.aiforthai.in.th/vaja';
 
