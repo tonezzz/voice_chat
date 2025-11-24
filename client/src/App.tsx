@@ -75,6 +75,17 @@ interface BankSlipVerificationResponse {
   }
 }
 
+interface VoiceOption {
+  id: string
+  name: string
+  provider?: string | null
+  accelerator?: 'cpu' | 'gpu' | 'external' | string | null
+  tier?: string | null
+  language?: string | null
+  sampleRate?: number | null
+  metadata?: Record<string, unknown> | null
+}
+
 const BANK_OCR_LANG_OPTIONS = [
   { value: 'eng', label: 'English' },
   { value: 'tha', label: 'ไทย (Thai)' },
@@ -299,6 +310,17 @@ const PROVIDER_LABELS: Record<string, string> = {
   openai: 'OpenAI',
   github: 'GitHub Models',
   ollama: 'Ollama'
+}
+
+const VOICE_PROVIDER_LABELS: Record<string, string> = {
+  openvoice: 'OpenVoice',
+  vaja: 'VAJA'
+}
+
+const VOICE_ACCELERATOR_LABELS: Record<string, string> = {
+  cpu: 'CPU',
+  gpu: 'GPU',
+  external: 'External'
 }
 
 const STREAMING_PROVIDERS = new Set<string>(['ollama', 'anthropic', 'openai', 'github'])
@@ -1541,7 +1563,7 @@ export function App() {
   const [speechStatusMessage, setSpeechStatusMessage] = useState<string | null>(null)
 
   const VOICE_SERVICE_HINT =
-    'Voice service unavailable. Ensure the OpenVoice containers are running (openvoice-tts / openvoice-tts-gpu) and reload.'
+    'Voice service unavailable. Ensure VAJA and/or OpenVoice services are running, then refresh.'
   const appendVoiceServiceHint = (message: string) => {
     const trimmed = (message || '').trim()
     if (!trimmed) {
@@ -2277,33 +2299,32 @@ export function App() {
 
   const voiceFeatureEnabled = Boolean(healthInfo?.voiceFeatureEnabled)
 
-  const openvoiceCpuHealthy = useMemo(
-    () => healthServices.some((svc) => svc.name === 'openvoice' && svc.status === 'ok'),
-    [healthServices]
-  )
-  const openvoiceGpuHealthy = useMemo(
-    () => healthServices.some((svc) => svc.name === 'openvoiceGpu' && svc.status === 'ok'),
-    [healthServices]
-  )
-  const visibleVoiceOptions = useMemo(() => {
-    if (!voiceFeatureEnabled) {
-      return []
-    }
-    if (!openvoiceCpuHealthy && !openvoiceGpuHealthy) {
-      return []
-    }
-    if (!voiceOptions.length) return voiceOptions
-    if (openvoiceGpuHealthy) {
-      return voiceOptions
-    }
-    return voiceOptions.filter((voice) => (voice.tier || 'standard').toLowerCase() !== 'premium')
-  }, [voiceOptions, openvoiceCpuHealthy, openvoiceGpuHealthy, voiceFeatureEnabled])
+  const voiceProviderSummary = useMemo(() => {
+    if (!voiceOptions.length) return [] as { label: string; accelerator?: string | null; count: number }[]
+    const summaryMap = new Map<string, { label: string; accelerator?: string | null; count: number }>()
+    voiceOptions.forEach((voice) => {
+      const providerLabel = VOICE_PROVIDER_LABELS[voice.provider?.toLowerCase() ?? ''] || voice.provider || 'Voice'
+      const acceleratorLabel = VOICE_ACCELERATOR_LABELS[voice.accelerator?.toLowerCase() ?? ''] || voice.accelerator || null
+      const key = `${providerLabel}-${acceleratorLabel || 'na'}`
+      const existing = summaryMap.get(key)
+      if (existing) {
+        existing.count += 1
+      } else {
+        summaryMap.set(key, {
+          label: providerLabel,
+          accelerator: acceleratorLabel,
+          count: 1
+        })
+      }
+    })
+    return Array.from(summaryMap.values())
+  }, [voiceOptions])
 
   const voiceStatusTone: StatusTone = voicesLoading
     ? 'loading'
     : !voiceFeatureEnabled
       ? 'unknown'
-      : visibleVoiceOptions.length
+      : voiceOptions.length
         ? 'ok'
         : voiceFetchError
           ? 'error'
@@ -2314,15 +2335,15 @@ export function App() {
       ? 'Loading voices…'
       : !voiceFeatureEnabled
         ? 'Voice disabled'
-        : visibleVoiceOptions.length
-          ? `${visibleVoiceOptions.length} voice${visibleVoiceOptions.length > 1 ? 's' : ''} ready`
+        : voiceOptions.length
+          ? `${voiceOptions.length} voice${voiceOptions.length > 1 ? 's' : ''} ready`
           : 'No voices available'
 
   const voiceStatusHelper =
     !voiceFeatureEnabled
-      ? 'Start the OpenVoice containers to unlock voice playback.'
-      : !visibleVoiceOptions.length && !voicesLoading
-        ? 'Refresh provider status once OpenVoice services are online.'
+      ? 'Start the VAJA or OpenVoice services to unlock voice playback.'
+      : !voiceOptions.length && !voicesLoading
+        ? 'Refresh provider status once TTS services are online.'
         : null
 
   useEffect(() => {
@@ -2632,29 +2653,29 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    if (!visibleVoiceOptions.length) {
+    if (!voiceOptions.length) {
       if (selectedVoice !== null) {
         setSelectedVoice(null)
       }
       return
     }
-    if (selectedVoice && visibleVoiceOptions.some((voice) => voice.id === selectedVoice)) {
+    if (selectedVoice && voiceOptions.some((voice) => voice.id === selectedVoice)) {
       return
     }
     const fallback =
-      (defaultVoiceId && visibleVoiceOptions.find((voice) => voice.id === defaultVoiceId)?.id) || visibleVoiceOptions[0].id
+      (defaultVoiceId && voiceOptions.find((voice) => voice.id === defaultVoiceId)?.id) || voiceOptions[0].id
     setSelectedVoice(fallback)
-  }, [visibleVoiceOptions, defaultVoiceId, selectedVoice])
+  }, [voiceOptions, defaultVoiceId, selectedVoice])
 
   useEffect(() => {
-    if (!visibleVoiceOptions.length) return
+    if (!voiceOptions.length) return
     if (speechLanguage === 'th') {
-      const thaiVoice = visibleVoiceOptions.find((voice) => voice.id.toLowerCase().includes('th'))
+      const thaiVoice = voiceOptions.find((voice) => voice.id.toLowerCase().includes('th'))
       if (thaiVoice && thaiVoice.id !== selectedVoice) {
         setSelectedVoice(thaiVoice.id)
       }
     }
-  }, [speechLanguage, visibleVoiceOptions, selectedVoice])
+  }, [speechLanguage, voiceOptions, selectedVoice])
 
   useEffect(() => {
     if (activePanel !== 'chat') {
@@ -3376,7 +3397,7 @@ export function App() {
         formData.append('whisper_model', whisperModel)
         formData.append('accelerator', acc)
         formData.append('provider', llmProvider)
-        if (selectedVoice && visibleVoiceOptions.some((voice) => voice.id === selectedVoice)) {
+        if (selectedVoice && voiceOptions.some((voice) => voice.id === selectedVoice)) {
           formData.append('voice', selectedVoice)
         }
         if (speechLanguage) {
@@ -5262,18 +5283,22 @@ export function App() {
                       value={selectedVoice || ''}
                       onChange={(e) => setSelectedVoice(e.target.value || null)}
                       className="chip-select voice-select"
-                      disabled={!visibleVoiceOptions.length || voicesLoading}
+                      disabled={!voiceOptions.length || voicesLoading}
                     >
-                      {visibleVoiceOptions.length === 0 ? (
+                      {voiceOptions.length === 0 ? (
                         <option value="">{voicesLoading ? 'Loading voices…' : 'No voices available'}</option>
                       ) : (
-                        visibleVoiceOptions.map((voice) => {
+                        voiceOptions.map((voice) => {
                           const parts = [voice.name]
-                          if ((voice.tier || 'standard') === 'premium') {
-                            parts.push('Premium')
+                          const origin = describeVoiceOrigin(voice)
+                          if (origin) {
+                            parts.push(origin)
                           }
                           if (voice.sampleRate) {
                             parts.push(`${voice.sampleRate}Hz`)
+                          }
+                          if (voice.tier && voice.tier.toLowerCase() === 'premium') {
+                            parts.push('Premium')
                           }
                           return (
                             <option key={voice.id} value={voice.id}>
@@ -5294,15 +5319,32 @@ export function App() {
                       {voicePreviewLoading ? 'Previewing…' : '▶ Preview'}
                     </button>
                   </div>
-                  {(selectedVoiceInfo?.tier === 'premium' || premiumVoiceSummary) && (
+                  {voiceProviderSummary.length > 0 && (
+                    <div className="voice-provider-badges" aria-live="polite">
+                      {voiceProviderSummary.map((summary) => (
+                        <span
+                          key={`${summary.label}-${summary.accelerator || 'any'}`}
+                          className={`voice-provider-pill voice-provider-${(summary.accelerator || 'any')
+                            .toLowerCase()
+                            .replace(/[^a-z0-9]+/g, '-')}`}
+                        >
+                          {summary.label}
+                          {summary.accelerator ? ` · ${summary.accelerator}` : ''}
+                          {` (${summary.count})`}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {selectedVoiceInfo && (
                     <div className="voice-helper-row">
-                      {selectedVoiceInfo?.tier === 'premium' && (
+                      <span className="voice-origin-pill">{describeVoiceOrigin(selectedVoiceInfo) || 'Voice'}</span>
+                      {selectedVoiceInfo.tier && (
                         <span className="voice-tier-pill" aria-live="polite">
-                          Premium
+                          {selectedVoiceInfo.tier}
                         </span>
                       )}
-                      {premiumVoiceSummary && (
-                        <span className="voice-helper-text">{premiumVoiceSummary}</span>
+                      {selectedVoiceInfo.sampleRate && (
+                        <span className="voice-helper-text">{selectedVoiceInfo.sampleRate}Hz</span>
                       )}
                     </div>
                   )}

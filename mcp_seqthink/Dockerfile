@@ -7,7 +7,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @modelcontextprotocol/server-sequential-thinking \
+    && npm install -g @modelcontextprotocol/server-sequential-thinking@0.6.2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

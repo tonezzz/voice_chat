@@ -647,7 +647,8 @@ const VAJA_VOICES = [
 ];
 const YOLO_MCP_URL = resolveServiceUrl(process.env.YOLO_MCP_URL, 'http://localhost:8000');
 const VOICE_FEATURE_ENABLED =
-  (process.env.ENABLE_VOICE_FEATURE || process.env.VOICE_FEATURE_ENABLED || '').toLowerCase() === 'true';
+  (process.env.ENABLE_VOICE_FEATURE || process.env.VOICE_FEATURE_ENABLED || '').toLowerCase() === 'true' ||
+  VAJA_ENABLED;
 const BSLIP_MCP_URL = resolveServiceUrl(process.env.BSLIP_MCP_URL, 'http://localhost:8002');
 const IMAGE_MCP_URL = resolveServiceUrl(process.env.IMAGE_MCP_URL, 'http://localhost:8001');
 const IMAGE_MCP_GPU_URL = resolveServiceUrl(process.env.IMAGE_MCP_GPU_URL);
@@ -3212,7 +3213,31 @@ app.get('/voices', async (req, res) => {
     const defaultCandidates = [];
     const triedBases = new Set();
 
-    const tryOpenvoiceSource = async (baseUrl, label) => {
+    const pushVoices = (voices = []) => {
+      voices.forEach((voice) => {
+        if (!voice?.id) return;
+        aggregated.push(voice);
+      });
+    };
+
+    if (VAJA_ENABLED) {
+      const vajaVoices = VAJA_VOICES.map((voice) => ({
+        id: voice.id,
+        name: voice.name,
+        provider: 'vaja',
+        accelerator: 'external',
+        tier: 'standard',
+        language: 'th',
+        metadata: { style: voice.name.split('•')[2]?.trim() || null }
+      }));
+      pushVoices(vajaVoices);
+      const firstVajaVoice = vajaVoices.find((voice) => Boolean(voice?.id));
+      if (firstVajaVoice?.id) {
+        defaultCandidates.push(firstVajaVoice.id);
+      }
+    }
+
+    const tryOpenvoiceSource = async (baseUrl, label, accelerator) => {
       if (!baseUrl) {
         return;
       }
@@ -3223,7 +3248,13 @@ app.get('/voices', async (req, res) => {
       triedBases.add(normalized);
       try {
         const { voices, defaultVoice } = await fetchVoicesFromService(normalized, 'openvoice');
-        aggregated.push(...voices);
+        const shaped = voices.map((voice) => ({
+          ...voice,
+          provider: 'openvoice',
+          accelerator,
+          tier: voice.tier || 'standard'
+        }));
+        pushVoices(shaped);
         if (defaultVoice) {
           defaultCandidates.push(defaultVoice);
         }
@@ -3232,14 +3263,14 @@ app.get('/voices', async (req, res) => {
       }
     };
 
-    await tryOpenvoiceSource(OPENVOICE_URL, 'cpu');
+    await tryOpenvoiceSource(OPENVOICE_URL, 'cpu', 'cpu');
 
-    if (!aggregated.length) {
-      await tryOpenvoiceSource(OPENVOICE_GPU_URL, 'gpu');
+    if (!aggregated.some((voice) => voice.provider === 'openvoice')) {
+      await tryOpenvoiceSource(OPENVOICE_GPU_URL, 'gpu', 'gpu');
     }
 
     if (!aggregated.length) {
-      return res.status(503).json({ error: 'voices_unavailable', detail: 'no openvoice voices available' });
+      return res.status(503).json({ error: 'voices_unavailable', detail: 'no voices available' });
     }
 
     const combinedDefault =
