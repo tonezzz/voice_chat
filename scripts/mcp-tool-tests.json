@@ -46,6 +46,16 @@
     "arguments": {}
   },
   {
+    "name": "memory-search-nodes",
+    "service": "memory",
+    "envVar": "MEMORY_MCP_URL",
+    "path": "/invoke",
+    "tool": "search_nodes",
+    "arguments": {
+      "query": "health-check"
+    }
+  },
+  {
     "name": "memento-search-nodes",
     "service": "memento",
     "envVar": "MEMENTO_MCP_URL",

@@ -1,0 +1,27 @@
+{
+    email tonezzz@hotmail.com
+    acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
+chaba.gizmo-thailand.com, chaba.surf-thailand.com, *.chaba.surf-thailand.com {
+    encode gzip zstd
+    log {
+        output stdout
+    }
+
+    tls {
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+    }
+
+    @kk1path {
+        path /*
+    }
+
+    handle @kk1path {
+        reverse_proxy http://a_kakk:80 {
+            header_up Host {host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-For {remote}
+        }
+    }
+}

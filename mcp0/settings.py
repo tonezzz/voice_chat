@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     host: str = Field("0.0.0.0", alias="MCP0_HOST")
     port: int = Field(8010, alias="MCP0_PORT")
     provider_list: Optional[str] = Field(None, alias="MCP0_PROVIDERS")
+    http_routes: Optional[str] = Field(None, alias="MCP0_HTTP_ROUTES")
     request_timeout: float = Field(10.0, alias="MCP0_TIMEOUT_SECONDS")
     allow_origins: str | None = Field(None, alias="MCP0_ALLOW_ORIGINS")
     admin_token: Optional[str] = Field(None, alias="MCP0_ADMIN_TOKEN")

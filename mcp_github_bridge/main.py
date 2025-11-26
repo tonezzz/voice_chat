@@ -97,10 +97,17 @@ class GithubMCPBridge:
     async def invoke_tool(self, tool: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         params = {
             "tool": tool,
-            "arguments": arguments,
+            "toolName": tool,
+            "name": tool,
+            "arguments": arguments or {},
         }
-        response = await self._request("tools.invoke", params)
-        return response
+        try:
+            return await self._request("tools.invoke", params)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if isinstance(detail, dict) and detail.get("code") == -32601:
+                return await self._request("tools/call", params)
+            raise
 
     async def _initialize_session(self) -> None:
         init_response = await self._request(

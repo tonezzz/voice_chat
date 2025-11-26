@@ -47,3 +47,21 @@ class ProxyResponse(BaseModel):
     target_url: str
     status_code: int
     response: Any = None
+
+
+class RouteDescriptor(BaseModel):
+    name: str = Field(..., description="Unique identifier for the routed backend")
+    path_prefix: str = Field(..., description="Incoming path prefix that should proxy to the target")
+    target_url: str = Field(..., description="Upstream URL that receives the routed traffic")
+    strip_prefix: bool = Field(False, description="Remove the matching prefix before proxying")
+    preserve_host: bool = Field(False, description="Forward the original Host header instead of the upstream host")
+    websockets: bool = Field(True, description="Allow WebSocket upgrades to flow through the route")
+
+
+class RouteInfo(RouteDescriptor):
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class RouteListResponse(BaseModel):
+    routes: List[RouteInfo]
+    updated_at: datetime = Field(default_factory=datetime.utcnow)

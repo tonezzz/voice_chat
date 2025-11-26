@@ -14,8 +14,8 @@ x-healthcheck-fast: &healthcheck_fast
 
 x-healthcheck-slow: &healthcheck_slow
   interval: 60s
-  timeout: 15s
-  retries: 5
+  timeout: 10s
+  retries: 3
 
 services:
   mcp0:
@@ -39,7 +39,7 @@ services:
       - GITHUB_WEBHOOK_TOOL=${GITHUB_WEBHOOK_TOOL:-run_space}
       - GITHUB_WEBHOOK_EVENTS=${GITHUB_WEBHOOK_EVENTS:-}
       - GITHUB_WEBHOOK_TOOL_MAP=${GITHUB_WEBHOOK_TOOL_MAP:-}
-      - MCP0_PROVIDERS=githubModel:${GITHUB_MCP_URL:-http://mcp-github:8080}|health=${GITHUB_MCP_HEALTH_PATH:-/health}|health_method=GET|capabilities=/.well-known/mcp.json|tools=${GITHUB_MCP_TOOLS:-list_models+run_space},memento:http://mcp-memento:8005|health=/health|capabilities=/.well-known/mcp.json|tools=create_entities+create_relations+add_observations+read_graph+search_nodes,meeting:http://mcp-meeting:8008|health=/health|capabilities=/.well-known/mcp.json|tools=start_meeting+end_meeting+append_transcript+ingest_audio_chunk+get_meeting_notes+summarize_meeting+list_sessions
+      - MCP0_PROVIDERS=githubModel:${GITHUB_MCP_URL:-http://mcp-github:8080}|health=${GITHUB_MCP_HEALTH_PATH:-/health}|health_method=GET|capabilities=/.well-known/mcp.json|tools=${GITHUB_MCP_TOOLS:-list_models+run_space},meeting:http://mcp-meeting:8008|health=/health|capabilities=/.well-known/mcp.json|tools=start_meeting+end_meeting+append_transcript+ingest_audio_chunk+get_meeting_notes+summarize_meeting+list_sessions
     ports:
       - "8010:8010"
     healthcheck:
@@ -67,11 +67,16 @@ services:
       - BSLIP_MCP_URL=${BSLIP_MCP_URL:-}
       - IMAGE_MCP_URL=${IMAGE_MCP_URL:-}
       - IMAGE_MCP_GPU_URL=${IMAGE_MCP_GPU_URL:-http://imagen-gpu:8001}
+      - DNSTOOLS_MCP_URL=${DNSTOOLS_MCP_URL:-http://mcp-dnstools:8018}
+      - MEMORY_MCP_URL=${MEMORY_MCP_URL:-http://mcp-memory:8020}
       - VAJA_MCP_URL=${VAJA_MCP_URL:-http://mcp-vaja:8017}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - ENABLE_REDIS_CACHE=${ENABLE_REDIS_CACHE:-true}
+      - REDIS_CACHE_TTL_SECONDS=${REDIS_CACHE_TTL_SECONDS:-300}
       - IDP_MCP_URL=${IDP_MCP_URL:-}
       - IDP_MCP_GPU_URL=${IDP_MCP_GPU_URL:-}
       - MEETING_MCP_URL=${MEETING_MCP_URL:-http://mcp-meeting:8008}
-      - MEMENTO_MCP_URL=${MEMENTO_MCP_URL:-http://mcp-memento:8005}
+      - MEMENTO_MCP_URL=${MEMENTO_MCP_URL:-}
       - MCP0_URL=http://mcp0:8010
       - GITHUB_MCP_URL=${GITHUB_MCP_URL:-http://mcp-github:8080}
       - GITHUB_MCP_HEALTH_PATH=${GITHUB_MCP_HEALTH_PATH:-/health}
@@ -106,6 +111,77 @@ services:
       retries: 5
     depends_on:
       - imagen-gpu
+      - redis
+
+  a_kakk:
+    image: nginx:stable-alpine
+    container_name: a-kakk
+    <<: *service_defaults
+    volumes:
+      - C:\_dev\_models\a_kakk:/usr/share/nginx/html:ro
+      - C:\_dev\_models\a_kakk\config\default.conf:/etc/nginx/conf.d/default.conf:ro
+      - C:\_dev\_models\tony\logs\a-kakk:/var/log/nginx
+    ports:
+      - "4173:80"
+    depends_on:
+      - server
+
+  localtunnel:
+    image: node:22-alpine
+    container_name: voice-chat-localtunnel
+    <<: *service_defaults
+    working_dir: /app
+    volumes:
+      - ./localtunnel/entrypoint.sh:/app/entrypoint.sh:ro
+    environment:
+      - LT_PORT=${LT_PORT:-4173}
+      - LT_HOST=${LT_HOST:-a_kakk}
+      - LT_SUBDOMAIN=${LT_SUBDOMAIN:-chaba}
+    entrypoint: ["/bin/sh", "/app/entrypoint.sh"]
+    depends_on:
+      - a_kakk
+
+  caddy:
+    build:
+      context: ./caddy
+    container_name: kk1-caddy
+    <<: *service_defaults
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-config:/config
+      - caddy-data:/data
+    environment:
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+    depends_on:
+      - a_kakk
+
+  a_chaba:
+    image: nginx:stable-alpine
+    container_name: a-chaba
+    <<: *service_defaults
+    volumes:
+      - C:\_dev\_models\a_chaba:/usr/share/nginx/html:ro
+      - C:\_dev\_models\a_chaba\config\default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "4174:80"
+    depends_on:
+      - server
+
+  edge:
+    image: nginx:stable-alpine
+    container_name: voice-chat-edge
+    <<: *service_defaults
+    volumes:
+      - ./nginx/edge.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - server
+      - a_kakk
+      - a_chaba
 
   imagen-gpu:
     build:
@@ -131,6 +207,7 @@ services:
               capabilities: [gpu]
     volumes:
       - imagen-cache:/app/models
+      - ${DIFFUSERS_CACHE_ROOT:-C:/_dev/_models/diffusers}:/app/models
     ports:
       - "8001:8001"
     healthcheck:
@@ -175,6 +252,8 @@ services:
       - GITHUB_WEBHOOK_TOOL=${GITHUB_WEBHOOK_TOOL:-run_space}
       - GITHUB_WEBHOOK_EVENTS=${GITHUB_WEBHOOK_EVENTS:-}
       - GITHUB_WEBHOOK_TOOL_MAP=${GITHUB_WEBHOOK_TOOL_MAP:-}
+      - GITHUB_TOOLSETS=${GITHUB_TOOLSETS:-default,models}
+
     ports:
       - "8200:8080"
     healthcheck:
@@ -197,6 +276,50 @@ services:
     healthcheck:
       <<: *healthcheck_slow
       test: ["CMD-SHELL", "curl -sf http://localhost:8015/health || exit 1"]
+
+  mcp-dnstools:
+    build:
+      context: ./mcp_dnstools
+      <<: *build_cache
+    container_name: mcp-dnstools
+    <<: *service_defaults
+    environment:
+      - PORT=8018
+      - DNSTOOLS_PROVIDER_NAME=${DNSTOOLS_PROVIDER_NAME:-dnstools}
+      - DNSTOOLS_NAMESERVERS=${DNSTOOLS_NAMESERVERS:-1.1.1.1,8.8.8.8}
+      - DNSTOOLS_ENABLE_DOH=${DNSTOOLS_ENABLE_DOH:-true}
+      - DNSTOOLS_DOH_ENDPOINT=${DNSTOOLS_DOH_ENDPOINT:-https://dns.google/resolve}
+      - DNSTOOLS_HEALTH_DOMAIN=${DNSTOOLS_HEALTH_DOMAIN:-example.com}
+      - DNSTOOLS_SUMMARY_TYPES=${DNSTOOLS_SUMMARY_TYPES:-A,AAAA,CNAME,MX,TXT,NS,SOA}
+      - MCP0_URL=http://mcp0:8010
+      - MCP0_ADMIN_TOKEN=${MCP0_ADMIN_TOKEN:-}
+    ports:
+      - "8018:8018"
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost:8018/health || exit 1"]
+
+  mcp-memory:
+    build:
+      context: ./mcp_memory
+      <<: *build_cache
+    container_name: mcp-memory
+    <<: *service_defaults
+    environment:
+      - PORT=8020
+      - MEMORY_FILE_PATH=${MEMORY_FILE_PATH:-/data/memory.jsonl}
+      - MEMORY_PROVIDER_NAME=${MEMORY_PROVIDER_NAME:-memory}
+      - MEMORY_BASE_URL=${MEMORY_BASE_URL:-http://mcp-memory:8020}
+      - MEMORY_DEFAULT_TOOLS=${MEMORY_DEFAULT_TOOLS:-create_entities,create_relations,add_observations,delete_entities,delete_observations,delete_relations,read_graph,search_nodes,open_nodes}
+      - MCP0_URL=http://mcp0:8010
+      - MCP0_ADMIN_TOKEN=${MCP0_ADMIN_TOKEN:-}
+    volumes:
+      - ${MEMORY_STORAGE_ROOT:-C:/_dev/_models/memory}:/data
+    ports:
+      - "8020:8020"
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost:8020/health || exit 1"]
 
   mcp-vaja:
     build:
@@ -238,5 +361,23 @@ services:
     depends_on:
       - server
 
+  redis:
+    image: redis:7-alpine
+    container_name: voice-chat-redis
+    <<: *service_defaults
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   imagen-cache:
+  redis-data:
+  caddy-config:
+  caddy-data:

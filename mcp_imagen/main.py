@@ -13,6 +13,7 @@ import torch
 from diffusers import AutoPipelineForText2Image
 from mcp.server.fastmcp import FastMCP
 from PIL import Image
+import numpy as np
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
@@ -78,7 +79,14 @@ def _latents_to_base64(pipeline: AutoPipelineForText2Image, latents: torch.Tenso
             decoded = pipeline.vae.decode(scaled).sample
         decoded = (decoded / 2 + 0.5).clamp(0, 1)
         decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
-        array = (decoded * 255).round().astype("uint8")[0]
+        decoded = np.nan_to_num(decoded, nan=0.5, posinf=1.0, neginf=0.0)
+        sample = decoded[0]
+        vmin = np.min(sample)
+        vmax = np.max(sample)
+        if np.isfinite(vmin) and np.isfinite(vmax) and vmax - vmin > 1e-4:
+            sample = (sample - vmin) / (vmax - vmin)
+        sample = np.clip(sample, 0.0, 1.0)
+        array = (sample * 255).round().astype("uint8")
         preview = Image.fromarray(array)
         return _image_to_base64(preview)
     except Exception:
@@ -288,6 +296,12 @@ async def generate_stream_http(request: Request) -> StreamingResponse:
 
 
 async def root(_: Request) -> JSONResponse:
+    """Return the basic readiness payload for default route checks."""
+    return JSONResponse({"status": "ok", "model": _MODEL_ID, "device": _TORCH_DEVICE})
+
+
+async def health(_: Request) -> JSONResponse:
+    """Expose an explicit /health endpoint for Docker healthchecks."""
     return JSONResponse({"status": "ok", "model": _MODEL_ID, "device": _TORCH_DEVICE})
 
 
@@ -298,6 +312,7 @@ def main() -> None:
     app = Starlette(
         routes=[
             Route("/", root, methods=["GET"]),
+            Route("/health", health, methods=["GET"]),
             Route("/generate", generate_http, methods=["POST"]),
             Route("/generate-stream", generate_stream_http, methods=["POST"]),
         ]

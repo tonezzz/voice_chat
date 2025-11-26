@@ -4,7 +4,7 @@ version: "2"
 tunnels:
   stack-api:
     proto: http
-    addr: server:3001
+    addr: edge:80
     metadata: "Stack API + GPU queue"
     hostname: stirred-horse-unlikely.ngrok-free.app
   mcp-debug-shell:

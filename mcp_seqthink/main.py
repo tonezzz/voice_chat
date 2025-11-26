@@ -233,7 +233,11 @@ async def health() -> BridgeStatus:
 
 @app.get("/.well-known/mcp.json")
 async def manifest() -> Dict[str, Any]:
-    return bridge.manifest() or {"name": PROVIDER_NAME, "capabilities": {}}
+    return bridge.manifest() or {
+        "name": PROVIDER_NAME,
+        "version": "0.0",
+        "capabilities": {"tools": []},
+    }
 
 
 @app.post("/invoke")

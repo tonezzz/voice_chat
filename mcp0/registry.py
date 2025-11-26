@@ -10,7 +10,14 @@ from urllib.parse import urljoin
 
 import httpx
 
-from schemas import AggregatedHealth, ProviderDescriptor, ProviderHealth, ProviderInfo
+from schemas import (
+    AggregatedHealth,
+    ProviderDescriptor,
+    ProviderHealth,
+    ProviderInfo,
+    RouteDescriptor,
+    RouteInfo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -174,3 +181,53 @@ class ProviderRegistry:
             self._capabilities_updated_at[descriptor.name] = datetime.utcnow()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to fetch capabilities for %s: %s", descriptor.name, exc)
+
+
+class HTTPRouteRegistry:
+    def __init__(self, routes: Optional[Dict[str, RouteInfo]] = None) -> None:
+        self._routes: Dict[str, RouteInfo] = routes or {}
+
+    @classmethod
+    def from_env(cls, env_value: Optional[str]) -> "HTTPRouteRegistry":
+        routes: Dict[str, RouteInfo] = {}
+        if env_value:
+            entries = [entry.strip() for entry in env_value.split(",") if entry.strip()]
+            for entry in entries:
+                parts = [part for part in entry.split("|") if part]
+                if not parts:
+                    continue
+                name_prefix = parts[0]
+                name, _, path_prefix = name_prefix.partition(":")
+                if not name or not path_prefix:
+                    logger.warning("Skipping invalid HTTP route entry: %s", entry)
+                    continue
+                options: Dict[str, Any] = {"path_prefix": path_prefix}
+                for option in parts[1:]:
+                    opt_key, _, opt_value = option.partition("=")
+                    opt_key = opt_key.strip().lower()
+                    opt_value = opt_value.strip()
+                    if opt_key in {"target", "target_url"}:
+                        options["target_url"] = opt_value
+                    elif opt_key in {"strip", "strip_prefix"}:
+                        options["strip_prefix"] = opt_value.lower() in {"true", "1", "yes", "on"}
+                    elif opt_key in {"preserve_host", "preservehost"}:
+                        options["preserve_host"] = opt_value.lower() in {"true", "1", "yes", "on"}
+                    elif opt_key in {"websockets", "ws"}:
+                        options["websockets"] = opt_value.lower() not in {"false", "0", "no", "off"}
+                if "target_url" not in options:
+                    logger.warning("Skipping HTTP route '%s': missing target", entry)
+                    continue
+                descriptor = RouteDescriptor(name=name.strip(), **options)
+                routes[descriptor.name] = RouteInfo(**descriptor.model_dump())
+        return cls(routes=routes)
+
+    def list_routes(self) -> List[RouteInfo]:
+        return list(self._routes.values())
+
+    def upsert_route(self, descriptor: RouteDescriptor) -> RouteInfo:
+        info = RouteInfo(**descriptor.model_dump())
+        self._routes[descriptor.name] = info
+        return info
+
+    def remove_route(self, route_name: str) -> bool:
+        return self._routes.pop(route_name, None) is not None

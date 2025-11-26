@@ -1,0 +1,178 @@
+.floating-mic {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  font-family: 'Space Grotesk', 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.floating-mic-panel {
+  backdrop-filter: blur(16px);
+  background: rgba(11, 11, 11, 0.85);
+  border-radius: 18px;
+  padding: 16px 20px;
+  color: #fff;
+  box-shadow: 0 25px 70px rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.floating-mic-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.mic-indicator {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.3);
+  box-shadow: 0 0 0 0 rgba(255, 88, 100, 0.4);
+  transition: background 0.3s ease, box-shadow 0.3s ease;
+}
+
+.mic-indicator.active {
+  background: #ff5864;
+  box-shadow: 0 0 0 8px rgba(255, 88, 100, 0.08);
+}
+
+.floating-mic-eyebrow {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  margin: 0;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.floating-mic-command {
+  margin: 2px 0 0;
+  font-size: 1rem;
+}
+
+.floating-mic-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.mic-button {
+  border: none;
+  border-radius: 999px;
+  padding: 10px 18px;
+  background: #ffffff;
+  color: #0d0d0d;
+  cursor: pointer;
+  font-weight: 600;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.mic-button.listening {
+  background: #ff5864;
+  color: #fff;
+  box-shadow: 0 12px 30px rgba(255, 88, 100, 0.35);
+}
+
+.mic-button:hover {
+  transform: translateY(-1px);
+}
+
+button.ghost {
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  background: transparent;
+  color: #fff;
+  border-radius: 999px;
+  padding: 10px 16px;
+  cursor: pointer;
+}
+
+.floating-window-stack {
+  position: relative;
+  width: 320px;
+  min-height: 180px;
+}
+
+.floating-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  border-radius: 18px;
+  background: #1b1b1d;
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  padding: 16px;
+  opacity: 0.95;
+}
+
+.floating-window header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.floating-window h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.window-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.window-actions button {
+  border: none;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.floating-window-body {
+  margin-top: 10px;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
+.floating-window-footer {
+  margin-top: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.badge {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  font-size: 0.75rem;
+}
+
+.link-button {
+  border: none;
+  background: none;
+  color: #8ab6ff;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+@media (max-width: 768px) {
+  .floating-mic {
+    right: 16px;
+    width: calc(100% - 32px);
+  }
+
+  .floating-window-stack {
+    width: 100%;
+  }
+}

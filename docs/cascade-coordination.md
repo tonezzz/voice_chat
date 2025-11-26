@@ -164,3 +164,16 @@ Supported actions:
 4. Persist descriptors for dynamic MCPs in a small JSON file (e.g., `server/conf/mcp_dynamic.json`) and have a bootstrap task replay them on `mcp0` restarts to avoid manual re-registration.
 
 > Tip: before exposing a new optional MCP to users, run `scripts/check-mcp-health.ps1` so the aggregated status page reflects which providers are online and which are intentionally dormant.
+
+## 9. Shared workflow & reporting table
+
+| # | Checklist item | Required actions / commands |
+| --- | --- | --- |
+| 1 | Locking & scope control | Always announce: `Taking <file(s)> for <feature> (lines X–Y)` before editing shared files (server/index.js, client/src/App.tsx, docker-compose, `.env`, Redis service). Update the note if scope widens and explicitly release locks when done. |
+| 2 | Batch cohesive work | Complete each logical change in one pass (e.g., “meeting handlers + VAJA health”) instead of piecemeal commits. |
+| 3 | Verification & logging | Run every relevant check and paste the exact commands + key output so teammates trust the state. Common Windows templates:<br>`cmd /c "cd /d c:\_dev\windsurf_ai\voice_chat && npx dotenv-cli -e .env -- docker compose up -d server redis"`<br>`cmd /c "cd /d c:\_dev\windsurf_ai\voice_chat && npx dotenv-cli -e .env -- npm --prefix server test"` |
+| 4 | Post-handoff summary | List files touched (with rough line ranges), call out TODOs/follow-ups, and state whether each file is unlocked. |
+| 5 | Library hygiene | When touching a dependency, inspect for newer releases and update when appropriate. |
+| 6 | Redis cache readiness | `.env` defaults enable `ENABLE_REDIS_CACHE=true` pointing to `redis://redis:6379/0`. Always bring `server` and `redis` up together before testing snapshots. Smoke test via:<br>1. `curl -X POST http://localhost:3002/carwatch/snapshot -H "Content-Type: application/json" -d @payload.json`<br>2. `curl http://localhost:3002/carwatch/snapshot` → expect `{ "source": "redis" }` on repeat calls. Log hit/miss observations and flush with `docker exec voice-chat-redis redis-cli FLUSHALL` if needed. |
+| 7 | Final report format | Every update must end with: (1) Current working status, (2) Work queue status (done / in progress / pending / future / blocked), (3) Suggested new chat title, (4) Conflict-risk assessment. |
+

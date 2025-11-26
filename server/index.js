@@ -9,6 +9,12 @@ const multer = require('multer');
 const FormData = require('form-data');
 const crypto = require('crypto');
 const Tesseract = require('tesseract.js');
+const {
+  isRedisEnabled,
+  getJson: getRedisJson,
+  setJson: setRedisJson,
+  DEFAULT_CACHE_TTL_SECONDS
+} = require('./services/redisClient');
 
 const app = express();
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '50mb';
@@ -22,6 +28,28 @@ const dynamicEndpointRegistry = new Map();
 
 const serveClientIndex = (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
+};
+
+const checkRedisHealth = async () => {
+  if (!isRedisEnabled()) {
+    return { name: 'redis', status: 'disabled' };
+  }
+  try {
+    await getRedisJson('__health_probe__');
+    return { name: 'redis', status: 'ok' };
+  } catch (err) {
+    return { name: 'redis', status: 'error', detail: err?.message || 'redis_unreachable' };
+  }
+};
+
+const checkGithubProviderConfigured = () => {
+  if (!isGithubProvider()) {
+    return { name: 'githubModel', status: 'disabled' };
+  }
+  if (!GITHUB_MODEL_TOKEN) {
+    return { name: 'githubModel', status: 'unconfigured' };
+  }
+  return { name: 'githubModel', status: 'configured' };
 };
 
 app.get(['/preview', '/app-preview', '/imagen', '/imagen/'], serveClientIndex);
@@ -627,6 +655,8 @@ const MODEL = process.env.MODEL || 'llama3';
 const PORT = process.env.PORT || 3001;
 const STT_URL = resolveServiceUrl(process.env.STT_URL, 'http://localhost:5001');
 const STT_GPU_URL = resolveServiceUrl(process.env.STT_GPU_URL);
+const OPENVOICE_URL = resolveServiceUrl(process.env.OPENVOICE_URL);
+const OPENVOICE_GPU_URL = resolveServiceUrl(process.env.OPENVOICE_GPU_URL);
 const VAJA_MCP_URL = resolveServiceUrl(process.env.VAJA_MCP_URL || process.env.VAJA_ENDPOINT || '');
 const VAJA_VOICES = [
   { id: 'nana', name: 'Nana • Female • Animation' },
@@ -646,6 +676,7 @@ const VAJA_VOICES = [
   { id: 'thanwa', name: 'Thanwa • Male • Broadcast style' }
 ];
 const YOLO_MCP_URL = resolveServiceUrl(process.env.YOLO_MCP_URL, 'http://localhost:8000');
+const VAJA_ENABLED = !!VAJA_MCP_URL;
 const VOICE_FEATURE_ENABLED =
   (process.env.ENABLE_VOICE_FEATURE || process.env.VOICE_FEATURE_ENABLED || '').toLowerCase() === 'true' ||
   VAJA_ENABLED;
@@ -883,8 +914,6 @@ const requireWorkerAuth = (req, res, next) => {
   }
   next();
 };
-
-const VAJA_ENABLED = !!VAJA_MCP_URL;
 
 const MCP_AUTOMATION_PROMPT = `You can request external tool executions via MCP0.
 When a GitHub operation is needed, emit a fenced code block labeled mcp0 using strict JSON:
@@ -1483,6 +1512,8 @@ const requestWithTimeout = (url, options = {}) => {
 };
 
 const CARWATCH_ALLOWED_CONNECTIONS = new Set(['online', 'connecting', 'offline']);
+const CARWATCH_REDIS_CACHE_KEY = 'carwatch:snapshot';
+const CARWATCH_CACHE_TTL_SECONDS = Math.max(1, Math.round(CARWATCH_SNAPSHOT_TTL_MS / 1000)) || DEFAULT_CACHE_TTL_SECONDS;
 
 const carwatchStore = {
   snapshot: null,
@@ -1530,7 +1561,7 @@ const normalizeCarwatchEvents = (events) => {
     .filter((event) => !!event.label);
 };
 
-const storeCarwatchSnapshot = (payload = {}) => {
+const storeCarwatchSnapshot = async (payload = {}) => {
   const now = new Date();
   const connectionValue = (payload.connection || '').toLowerCase();
   const connection = CARWATCH_ALLOWED_CONNECTIONS.has(connectionValue) ? connectionValue : 'online';
@@ -1551,6 +1582,16 @@ const storeCarwatchSnapshot = (payload = {}) => {
 
   carwatchStore.snapshot = snapshot;
   carwatchStore.receivedAt = now.getTime();
+  if (isRedisEnabled()) {
+    const persisted = await setRedisJson(
+      CARWATCH_REDIS_CACHE_KEY,
+      snapshot,
+      CARWATCH_CACHE_TTL_SECONDS || DEFAULT_CACHE_TTL_SECONDS
+    );
+    if (!persisted) {
+      console.warn('[carwatch] failed to cache snapshot in redis');
+    }
+  }
   return snapshot;
 };
 
@@ -1562,6 +1603,23 @@ const getCarwatchSnapshot = () => {
     return null;
   }
   return carwatchStore.snapshot;
+};
+
+const loadCarwatchSnapshot = async () => {
+  const inMemory = getCarwatchSnapshot();
+  if (inMemory) {
+    return { snapshot: inMemory, source: 'memory' };
+  }
+  if (!isRedisEnabled()) {
+    return { snapshot: null, source: 'memory' };
+  }
+  const cached = await getRedisJson(CARWATCH_REDIS_CACHE_KEY);
+  if (cached) {
+    carwatchStore.snapshot = cached;
+    carwatchStore.receivedAt = Date.now();
+    return { snapshot: cached, source: 'redis' };
+  }
+  return { snapshot: null, source: 'redis' };
 };
 
 const checkCarwatchHealth = () => {
@@ -2850,7 +2908,7 @@ app.post('/carwatch/snapshot', async (req, res) => {
       return res.status(400).json({ error: 'invalid_payload' });
     }
 
-    const snapshot = storeCarwatchSnapshot(payload);
+    const snapshot = await storeCarwatchSnapshot(payload);
     console.log('[carwatch] snapshot stored', {
       device: snapshot.deviceName,
       detections: snapshot.detections.length,
@@ -2864,15 +2922,20 @@ app.post('/carwatch/snapshot', async (req, res) => {
   }
 });
 
-app.get('/carwatch/snapshot', (req, res) => {
-  const snapshot = getCarwatchSnapshot();
-  const ageMs = carwatchStore.receivedAt ? Date.now() - carwatchStore.receivedAt : null;
+app.get('/carwatch/snapshot', async (_req, res) => {
+  try {
+    const { snapshot, source } = await loadCarwatchSnapshot();
+    const ageMs = carwatchStore.receivedAt ? Date.now() - carwatchStore.receivedAt : null;
 
-  if (!snapshot) {
-    return res.json({ snapshot: null, ageMs: null, error: 'no_snapshot' });
+    if (!snapshot) {
+      return res.json({ snapshot: null, ageMs: null, error: 'no_snapshot', source });
+    }
+
+    return res.json({ snapshot, ageMs, source });
+  } catch (err) {
+    console.error('Failed to load CarWatch snapshot:', err);
+    return res.status(500).json({ error: 'server_error', detail: err?.message || 'carwatch_snapshot_load_failed' });
   }
-
-  return res.json({ snapshot, ageMs });
 });
 
 app.post('/detect-image', upload.single('image'), async (req, res) => {
@@ -3151,7 +3214,13 @@ app.get('/health', async (_req, res) => {
     );
   }
 
-  const serviceChecks = await Promise.all([...coreServiceChecks, Promise.resolve(checkCarwatchHealth())]);
+  const serviceChecks = await Promise.all([
+    ...coreServiceChecks,
+    checkRedisHealth(),
+    Promise.resolve(checkCarwatchHealth()),
+    Promise.resolve(checkGithubProviderConfigured()),
+    checkGithubModelHealth()
+  ]);
 
   const hasError = serviceChecks.some((svc) => svc.status === 'error');
 
@@ -3176,6 +3245,8 @@ app.get('/health', async (_req, res) => {
     mcp0Url: MCP0_URL || null,
     githubMcpUrl: GITHUB_MCP_URL || null,
     voiceFeatureEnabled: VOICE_FEATURE_ENABLED,
+    redisEnabled: isRedisEnabled(),
+    githubProvider: isGithubProvider() ? 'github' : NORMALIZED_BASE_PROVIDER,
     services: serviceChecks,
     timestamp: new Date().toISOString()
   });
@@ -3283,14 +3354,25 @@ app.get('/voices', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on http://0.0.0.0:${PORT}`);
-  console.log(`Using Ollama at ${OLLAMA_URL} with model ${MODEL}`);
-  if (OLLAMA_GPU_URL) {
-    console.log(`GPU Ollama available at ${OLLAMA_GPU_URL}`);
-  }
-  console.log(`Using STT at ${STT_URL}`);
-  if (STT_GPU_URL) {
-    console.log(`GPU STT available at ${STT_GPU_URL}`);
-  }
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Server listening on http://0.0.0.0:${PORT}`);
+    if (isRedisEnabled()) {
+      console.log(`[redis] cache enabled (ttl=${DEFAULT_CACHE_TTL_SECONDS}s)`);
+    } else {
+      console.warn('[redis] cache disabled — set ENABLE_REDIS_CACHE=true to enable snapshot persistence');
+    }
+    const githubStatus = checkGithubProviderConfigured();
+    console.log(`[githubModel] status: ${githubStatus.status}`);
+    console.log(`Using Ollama at ${OLLAMA_URL} with model ${MODEL}`);
+    if (OLLAMA_GPU_URL) {
+      console.log(`GPU Ollama available at ${OLLAMA_GPU_URL}`);
+    }
+    console.log(`Using STT at ${STT_URL}`);
+    if (STT_GPU_URL) {
+      console.log(`GPU STT available at ${STT_GPU_URL}`);
+    }
+  });
+}
+
+module.exports = app;

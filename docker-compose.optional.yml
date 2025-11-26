@@ -151,8 +151,7 @@ services:
       context: ./mcp_tuya_bridge
       <<: *build_cache
     container_name: mcp-tuya
-    profiles: ["optional", "tuya"]
-    <<: *service_defaults
+    profiles: ["optional"]
     environment:
       - TUYA_ENDPOINT=${TUYA_ENDPOINT:-}
       - TUYA_ACCESS_ID=${TUYA_ACCESS_ID:-}
@@ -163,8 +162,54 @@ services:
     ports:
       - "8007:8007"
     healthcheck:
-      <<: *healthcheck_slow
       test: ["CMD-SHELL", "curl -sf http://localhost:8007/health || exit 1"]
+      interval: 60s
+      timeout: 15s
+      retries: 5
+    restart: unless-stopped
+
+  anythingllm:
+    image: mintplexlabs/anythingllm:latest
+    container_name: anythingllm
+    profiles: ["optional"]
+    environment:
+      - SERVER_PORT=3001
+      - STORAGE_DIR=/app/server/storage
+      - UID=${ANYTHINGLLM_UID:-1000}
+      - GID=${ANYTHINGLLM_GID:-1000}
+    volumes:
+      - ${ANYTHINGLLM_STORAGE_ROOT:-C:/_dev/_models/anythingllm}:/app/server/storage
+    ports:
+      - "3101:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3001/api/health || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  mcp-mydocs:
+    build:
+      context: ./mcp_mydocs
+      <<: *build_cache
+    container_name: mcp-mydocs
+    profiles: ["optional"]
+    environment:
+      - PORT=8014
+      - ANYTHINGLLM_API_URL=${ANYTHINGLLM_API_URL:-}
+      - ANYTHINGLLM_API_KEY=${ANYTHINGLLM_API_KEY:-}
+      - ANYTHINGLLM_WORKSPACE=${ANYTHINGLLM_WORKSPACE:-default}
+      - ANYTHINGLLM_EMBED_MODEL=${ANYTHINGLLM_EMBED_MODEL:-nomic-embed-text}
+    depends_on:
+      - anythingllm
+    ports:
+      - "8014:8014"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8014/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
 
   mcp_idp:
     build:

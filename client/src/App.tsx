@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import FloatingMicPanel from './components/FloatingMicPanel'
 import {
   AppBar,
   Box,
@@ -7165,6 +7166,7 @@ export function App() {
           </div>
         </div>
       ) : null}
+      {!imageStandaloneMode && <FloatingMicPanel />}
     </div>
   )
 }

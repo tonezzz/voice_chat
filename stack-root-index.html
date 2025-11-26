@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice Chat Stack Overview</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      line-height: 1.5;
+      font-size: 16px;
+    }
+    body {
+      margin: 0;
+      padding: 2rem;
+      background: #0b1020;
+      color: #f5f7ff;
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 18px;
+      padding: 2rem;
+      box-shadow: 0 20px 45px rgba(10, 14, 35, 0.4);
+    }
+    h1 {
+      margin-top: 0;
+      font-size: clamp(2rem, 3vw, 2.75rem);
+    }
+    section {
+      margin-top: 2rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.6rem 0.4rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    th {
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      font-size: 0.75rem;
+      color: rgba(255, 255, 255, 0.6);
+    }
+    .value {
+      font-family: "JetBrains Mono", "Fira Code", Consolas, Menlo, Monaco, monospace;
+      word-break: break-all;
+      color: #9de1ff;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 999px;
+      padding: 0.35rem 0.9rem;
+      font-size: 0.85rem;
+    }
+    .pill strong {
+      font-size: 1rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+      margin: 1.25rem 0 0;
+    }
+    .card {
+      padding: 1rem;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+    ul {
+      padding-left: 1.2rem;
+      margin: 0.4rem 0 0;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Voice Chat Stack Overview</h1>
+      <p class="pill"><strong>105</strong> variables detected · 22 masked · Generated 11/25/2025, 5:51:17 AM UTC</p>
+    </header>
+
+    <section>
+      <h2>FTP Endpoint</h2>
+      <div class="grid">
+        <article class="card">
+          <strong>Host</strong>
+          <p>chaba.h3.gizmo-thailand.com</p>
+        </article>
+        <article class="card">
+          <strong>Username</strong>
+          <p>voice_chat</p>
+        </article>
+        <article class="card">
+          <strong>Remote Path</strong>
+          <p>/www/chaba.h3.gizmo-thailand.com/public</p>
+        </article>
+      </div>
+      <p style="margin-top:1rem;font-size:0.9rem;color:rgba(255,255,255,0.7)">Password and tokens remain masked in public exports.</p>
+    </section>
+
+    <section>
+      <h2>Paths & Directories</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Variable</th>
+            <th>Value</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <tr>
+            <td>KK1_LANDING_PATH</td>
+            <td class="value">/app/kk1-external/index.html</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>KK1_LANDING_DIR</td>
+            <td class="value">C:/_dev/_models/kk1</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>FTP_REMOTE_PATH</td>
+            <td class="value">/www/chaba.h3.gizmo-thailand.com/public</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>YOLO_MODEL_ROOT</td>
+            <td class="value">C:/_dev/_models/yolo</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VAJA_OUTPUT_DIR</td>
+            <td class="value">C:/_dev/_models/vaja_audio</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_STT_HEALTH_PATH</td>
+            <td class="value">/health</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_STORAGE_PATH</td>
+            <td class="value">/data/meetings.json</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_STORAGE_ROOT</td>
+            <td class="value">C:/_dev/_models/meeting</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_DATA_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice/data</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_CHECKPOINT_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice/checkpoints</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_REFERENCE_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice/references</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_CONF_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice/conf/openvoice</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_V2_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice_v2</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_V2_CHECKPOINT_DIR</td>
+            <td class="value">C:/_dev/_models/openvoice_v2</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_V2_CHECKPOINT_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice_v2</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OLLAMA_DATA_ROOT</td>
+            <td class="value">C:/_dev/_models/ollama</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_DATA_ROOT</td>
+            <td class="value">C:/_dev/_models/memento</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_DB_PATH</td>
+            <td class="value">/data/memento.db</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_SQLITE_VEC_PATH</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Service Endpoints</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Variable</th>
+            <th>Value</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <tr>
+            <td>YOLO_MCP_URL</td>
+            <td class="value">http://mcp-yolo:8000</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OLLAMA_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OLLAMA_GPU_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>STT_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>STT_GPU_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>REDIS_URL</td>
+            <td class="value">redis://redis:6379/0</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VAJA_MCP_URL</td>
+            <td class="value">http://mcp-vaja:8017</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>IMAGE_MCP_URL</td>
+            <td class="value">http://imagen-gpu:8001</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>IMAGE_MCP_GPU_URL</td>
+            <td class="value">http://imagen-gpu:8001</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>IDP_MCP_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>IDP_MCP_GPU_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_MCP_URL</td>
+            <td class="value">http://mcp-memento:8005</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_MCP_URL</td>
+            <td class="value">http://mcp-meeting:8008</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_STT_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMORY_MCP_URL</td>
+            <td class="value">http://localhost:8020</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VMS_MCP_URL</td>
+            <td class="value">http://host.docker.internal:8006</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GDRIVE_MCP_URL</td>
+            <td class="value">http://mcp-gdrive:8012</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GPHOTOS_MCP_URL</td>
+            <td class="value">http://mcp-gphotos:8013</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>TUYA_MCP_URL</td>
+            <td class="value">http://mcp-tuya:8007</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VMS_HOST</td>
+            <td class="value">127.0.0.1</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VMS_PORT</td>
+            <td class="value">3300</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_GPU_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_PGHOST</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_PGPORT</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_MODEL_CHAT_BASE_URL</td>
+            <td class="value">https://api.github.com/repos/tonezzz/voice_chat/deployments</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_MODEL_CHAT_URL</td>
+            <td class="value">https://models.github.ai/inference/chat/completions</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MCP0_URL</td>
+            <td class="value">http://localhost:8010</td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Complete Variable Snapshot</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Variable</th>
+            <th>Value</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <tr>
+            <td>KK1_LANDING_PATH</td>
+            <td class="value">/app/kk1-external/index.html</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>KK1_LANDING_DIR</td>
+            <td class="value">C:/_dev/_models/kk1</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>FTP_HOST</td>
+            <td class="value">chaba.h3.gizmo-thailand.com</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>FTP_USERNAME</td>
+            <td class="value">voice_chat</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>FTP_PASSWORD</td>
+            <td class="value">f07d…Ut</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>FTP_REMOTE_PATH</td>
+            <td class="value">/www/chaba.h3.gizmo-thailand.com/public</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>LLM_PROVIDER</td>
+            <td class="value">anthropic</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>YOLO_MODEL_ROOT</td>
+            <td class="value">C:/_dev/_models/yolo</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>YOLO_MCP_URL</td>
+            <td class="value">http://mcp-yolo:8000</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OLLAMA_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OLLAMA_GPU_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>STT_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>STT_GPU_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>REDIS_URL</td>
+            <td class="value">redis://redis:6379/0</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>ENABLE_REDIS_CACHE</td>
+            <td class="value">true</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>REDIS_CACHE_TTL_SECONDS</td>
+            <td class="value">300</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VAJA_ENDPOINT</td>
+            <td class="value">https://api.aiforthai.in.th/vaja</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VAJA_MCP_URL</td>
+            <td class="value">http://mcp-vaja:8017</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VAJA_OUTPUT_DIR</td>
+            <td class="value">C:/_dev/_models/vaja_audio</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>IMAGE_MCP_URL</td>
+            <td class="value">http://imagen-gpu:8001</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>IMAGE_MCP_GPU_URL</td>
+            <td class="value">http://imagen-gpu:8001</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>IDP_MCP_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>IDP_MCP_GPU_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_MCP_URL</td>
+            <td class="value">http://mcp-memento:8005</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_MCP_URL</td>
+            <td class="value">http://mcp-meeting:8008</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_STT_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_STT_HEALTH_PATH</td>
+            <td class="value">/health</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_MAX_SEGMENTS</td>
+            <td class="value">1500</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_SUMMARY_MAX_ENTRIES</td>
+            <td class="value">20</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_DEFAULT_LANGUAGE</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_DEFAULT_WHISPER_MODEL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_STORAGE_PATH</td>
+            <td class="value">/data/meetings.json</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEETING_STORAGE_ROOT</td>
+            <td class="value">C:/_dev/_models/meeting</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMORY_MCP_URL</td>
+            <td class="value">http://localhost:8020</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VMS_MCP_URL</td>
+            <td class="value">http://host.docker.internal:8006</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GDRIVE_MCP_URL</td>
+            <td class="value">http://mcp-gdrive:8012</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GDRIVE_SERVICE_ACCOUNT_JSON</td>
+            <td class="value">/secrets/service_account.json</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GDRIVE_CREDENTIALS_FILE</td>
+            <td class="value">C:/_dev/_models/gdrive/ai-assistant-442100-a96b65ef0853.json</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GDRIVE_SCOPES</td>
+            <td class="value">https://www.googleapis.com/auth/drive</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GPHOTOS_MCP_URL</td>
+            <td class="value">http://mcp-gphotos:8013</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GPHOTOS_CLIENT_ID</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GPHOTOS_CLIENT_SECRET</td>
+            <td class="value">(empty)</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>GPHOTOS_REFRESH_TOKEN</td>
+            <td class="value">(empty)</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>GPHOTOS_SCOPES</td>
+            <td class="value">https://www.googleapis.com/auth/photoslibrary.readonly</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>TUYA_ENDPOINT</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>TUYA_ACCESS_ID</td>
+            <td class="value">(empty)</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>TUYA_ACCESS_SECRET</td>
+            <td class="value">(empty)</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>TUYA_CUSTOM_MCP_ENDPOINT</td>
+            <td class="value">http://mcp0:8010/mcp</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>TUYA_MCP_URL</td>
+            <td class="value">http://mcp-tuya:8007</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>TUYA_RECONNECT_MIN_SECONDS</td>
+            <td class="value">5</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>TUYA_RECONNECT_MAX_SECONDS</td>
+            <td class="value">60</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VMS_HOST</td>
+            <td class="value">127.0.0.1</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VMS_PORT</td>
+            <td class="value">3300</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VMS_ACCESS_ID</td>
+            <td class="value">*****</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>VMS_ACCESS_PW</td>
+            <td class="value">*****</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>VMS_IMG_WIDTH</td>
+            <td class="value">320</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VMS_IMG_HEIGHT</td>
+            <td class="value">240</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>VMS_PIXEL_FORMAT</td>
+            <td class="value">RGB</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_GPU_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_URL</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_DATA_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice/data</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_CHECKPOINT_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice/checkpoints</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_REFERENCE_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice/references</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_CONF_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice/conf/openvoice</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_V2_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice_v2</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_V2_CHECKPOINT_DIR</td>
+            <td class="value">C:/_dev/_models/openvoice_v2</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OPENVOICE_V2_CHECKPOINT_ROOT</td>
+            <td class="value">C:/_dev/_models/openvoice_v2</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OLLAMA_MODEL</td>
+            <td class="value">llama3.2:3b</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>OLLAMA_DATA_ROOT</td>
+            <td class="value">C:/_dev/_models/ollama</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>HF_STT_MODELS</td>
+            <td class="value">C:/_dev/_models/huggingface/stt</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_DATA_ROOT</td>
+            <td class="value">C:/_dev/_models/memento</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_DB_DRIVER</td>
+            <td class="value">sqlite</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_DB_PATH</td>
+            <td class="value">/data/memento.db</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_DB_DSN</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_SQLITE_VEC_PATH</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_PGHOST</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_PGPORT</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_PGUSER</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_PGPASSWORD</td>
+            <td class="value">(empty)</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_PGDATABASE</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MEMENTO_PGSSLMODE</td>
+            <td class="value">(empty)</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_MODEL</td>
+            <td class="value">Llama-3.2-11B-Vision-Instruct</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_MODEL_DEPLOYMENT</td>
+            <td class="value">Llama-3.2-11B-Vision-Instruct</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_MODEL_CHAT_BASE_URL</td>
+            <td class="value">https://api.github.com/repos/tonezzz/voice_chat/deployments</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_MODEL_CHAT_URL</td>
+            <td class="value">https://models.github.ai/inference/chat/completions</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_API_VERSION</td>
+            <td class="value">2022-11-28</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MCP0_URL</td>
+            <td class="value">http://localhost:8010</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MCP0_PROVIDERS</td>
+            <td class="value">githubModel:http://mcp-github:8080|health=/health|capabilities=/.well-known/mcp.json|tools=list_models+run_space,yolo:http://mcp-yolo:8000|health=/|capabilities=/.well-known/mcp.json|tools=detect_objects,memento:http://mcp-memento:8005|health=/health|capabilities=/.well-known/mcp.json|tools=create_entities+create_relations+add_observations+read_graph+search_nodes,tuya:http://mcp-tuya:8007|health=/health|capabilities=/.well-known/ready|tools=,meeting:http://mcp-meeting:8008|health=/health|capabilities=/.well-known/mcp.json|tools=start_meeting+end_meeting+append_transcript+ingest_audio_chunk+get_meeting_notes+summarize_meeting+list_sessions,gdrive:http://mcp-gdrive:8012|health=/health|capabilities=/.well-known/mcp.json|tools=list_files+get_file_metadata+download_file+upload_file,gphotos:http://mcp-gphotos:8013|health=/health|capabilities=/.well-known/mcp.json|tools=list_albums+list_media_items+upload_media_item,vaja:http://mcp-vaja:8017|health=/health|capabilities=/.well-known/mcp.json|tools=synthesize_speech</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>MCP0_ADMIN_TOKEN</td>
+            <td class="value">mcp0…in</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>GPU_WORKER_TOKEN</td>
+            <td class="value">cola…et</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>SERVICE_AUTH_TOKEN</td>
+            <td class="value">cola…45</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>NGROK_AUTHTOKEN</td>
+            <td class="value">2dX3…Ei</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_MCP_TOKEN</td>
+            <td class="value">gith…SD</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_PERSONAL_TOKEN</td>
+            <td class="value">gith…SD</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_PERSONAL_ACCESS_TOKEN</td>
+            <td class="value">gith…SD</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>GITHUB_MODEL_TOKEN</td>
+            <td class="value">gith…uI</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>ANTHROPIC_API_KEY</td>
+            <td class="value">sk-a…AA</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>ANTHROPIC_MODEL</td>
+            <td class="value">claude-3-5-sonnet-20241022</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>ANTHROPIC_VERSION</td>
+            <td class="value">2023-06-01</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>ANTHROPIC_MAX_TOKENS</td>
+            <td class="value">****</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>ANTHROPIC_TEMPERATURE</td>
+            <td class="value">0.2</td>
+            <td></td>
+          </tr>
+
+          <tr>
+            <td>CLAUDE_API_KEY</td>
+            <td class="value">sk-a…AA</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>OPENAI_API_KEY</td>
+            <td class="value">sk-p…UA</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>AI4THAI_API_KEY</td>
+            <td class="value">Ya0g…4k</td>
+            <td>masked</td>
+          </tr>
+
+          <tr>
+            <td>HUGGINGFACE_API_KEY</td>
+            <td class="value">hf_o…yz</td>
+            <td>masked</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
