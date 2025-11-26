@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
@@ -11,6 +12,7 @@ import dns.rdataclass
 import dns.rdata
 import dns.rdatatype
 import dns.resolver
+import dns.reversename
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +31,34 @@ def _bool(value: Optional[str], *, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _rdap_url(domain: str) -> str:
+    suffix = domain.rsplit(".", 1)[-1].lower() if "." in domain else domain.lower()
+    template = RDAP_TLD_ENDPOINTS.get(suffix, RDAP_ENDPOINT_TEMPLATE)
+    if not template:
+        raise HTTPException(status_code=503, detail="rdap_unconfigured")
+    return template.format(domain=domain.upper())
+
+
+def _rdap_entity_name(entity: Dict[str, Any]) -> Optional[str]:
+    vcard = entity.get("vcardArray") if isinstance(entity, dict) else None
+    if not isinstance(vcard, list) or len(vcard) < 2:
+        return entity.get("handle") if isinstance(entity, dict) else None
+    for item in vcard[1]:
+        if isinstance(item, list) and len(item) >= 4 and item[0] == "fn":
+            return item[3]
+    return entity.get("handle") if isinstance(entity, dict) else None
+
+
+def _rdap_events(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    events = []
+    for entry in payload.get("events", []) or []:
+        action = entry.get("eventAction")
+        date = entry.get("eventDate")
+        if action and date:
+            events.append({"action": action, "date": date})
+    return events
+
+
 def _split_csv(value: Optional[str]) -> List[str]:
     if not value:
         return []
@@ -45,6 +75,13 @@ if not SUMMARY_RECORD_TYPES:
     SUMMARY_RECORD_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA"]
 HEALTH_DOMAIN = os.getenv("DNSTOOLS_HEALTH_DOMAIN", "example.com").strip() or "example.com"
 PROVIDER_NAME = os.getenv("DNSTOOLS_PROVIDER_NAME", "dnstools")
+RDAP_ENDPOINT_TEMPLATE = (os.getenv("DNSTOOLS_RDAP_ENDPOINT") or "https://rdap.org/domain/{domain}").strip()
+RDAP_TIMEOUT = float(os.getenv("DNSTOOLS_RDAP_TIMEOUT_SECONDS", "8"))
+RDAP_TLD_ENDPOINTS = {
+    "com": "https://rdap.verisign.com/com/v1/domain/{domain}",
+    "net": "https://rdap.verisign.com/net/v1/domain/{domain}",
+    "org": "https://rdap.publicinterestregistry.net/rdap/org/domain/{domain}",
+}
 
 DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$"
@@ -231,6 +268,22 @@ async def _fetch_records(domain: str, record_type: str, nameservers: List[str]) 
     return records, warnings
 
 
+async def _fetch_rdap(domain: str) -> Tuple[Dict[str, Any], str]:
+    url = _rdap_url(domain)
+    try:
+        async with httpx.AsyncClient(timeout=RDAP_TIMEOUT) as client:
+            response = await client.get(url, headers={"Accept": "application/rdap+json, application/json"})
+    except httpx.RequestError as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"rdap_unreachable:{exc}") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=404, detail="rdap_not_found")
+    try:
+        payload: Dict[str, Any] = response.json()
+    except ValueError as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail="rdap_invalid_json") from exc
+    return payload, url
+
+
 def _require_record_type(value: Any) -> str:
     if value is None:
         return "A"
@@ -240,6 +293,19 @@ def _require_record_type(value: Any) -> str:
     if record_type not in SUPPORTED_RECORD_TYPES:
         raise HTTPException(status_code=400, detail=f"Unsupported record_type '{record_type}'")
     return record_type
+
+
+def _require_ip(value: Any) -> str:
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="ip must be a string")
+    candidate = value.strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail="ip is required")
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid_ip") from exc
+    return candidate
 
 
 async def tool_lookup_record(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -332,11 +398,91 @@ async def tool_spf_inspect(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return {"domain": domain, "records": spf_entries, "warnings": warnings}
 
 
+async def tool_reverse_lookup(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    ip_value = _require_ip(arguments.get("ip"))
+    nameservers = _parse_nameservers(arguments.get("nameservers"))
+    pointer = dns.reversename.from_address(ip_value).to_text()
+    records, warnings = await _fetch_records(pointer.rstrip("."), "PTR", nameservers)
+    if not records:
+        raise HTTPException(status_code=404, detail={"error": "ptr_not_found", "warnings": warnings})
+    return {
+        "ip": ip_value,
+        "ptr_name": pointer,
+        "records": records,
+        "warnings": warnings,
+    }
+
+
+async def tool_dnssec_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    domain = _validate_domain(arguments.get("domain"))
+    nameservers = _parse_nameservers(arguments.get("nameservers"))
+    records, warnings = await _fetch_records(domain, "DS", nameservers)
+    return {
+        "domain": domain,
+        "dnssec_enabled": bool(records),
+        "records": records,
+        "warnings": warnings,
+    }
+
+
+async def tool_ns_health(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    domain = _validate_domain(arguments.get("domain"))
+    nameservers = _parse_nameservers(arguments.get("nameservers"))
+    ns_records, warnings = await _fetch_records(domain, "NS", nameservers)
+    if not ns_records:
+        raise HTTPException(status_code=404, detail={"error": "ns_not_found", "warnings": warnings})
+    hosts: List[Dict[str, Any]] = []
+    for record in ns_records:
+        host = record.get("value")
+        ipv4, warn_v4 = await _fetch_records(host, "A", nameservers)
+        ipv6, warn_v6 = await _fetch_records(host, "AAAA", nameservers)
+        hosts.append(
+            {
+                "host": host,
+                "ipv4": [entry.get("value") for entry in ipv4],
+                "ipv6": [entry.get("value") for entry in ipv6],
+                "warnings": warn_v4 + warn_v6,
+            }
+        )
+    return {
+        "domain": domain,
+        "nameservers": hosts,
+        "warnings": warnings,
+    }
+
+
+async def tool_registrar_lookup(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    domain = _validate_domain(arguments.get("domain"))
+    payload, url = await _fetch_rdap(domain)
+    registrars: List[Dict[str, Any]] = []
+    for entity in payload.get("entities", []) or []:
+        roles = [role.lower() for role in (entity.get("roles") or [])]
+        if "registrar" in roles:
+            registrars.append(
+                {
+                    "handle": entity.get("handle"),
+                    "name": _rdap_entity_name(entity),
+                    "roles": roles,
+                }
+            )
+    return {
+        "domain": domain,
+        "rdap_url": url,
+        "registrars": registrars,
+        "statuses": payload.get("status", []),
+        "events": _rdap_events(payload),
+    }
+
+
 tool_registry = {
     "lookup_record": tool_lookup_record,
     "dns_summary": tool_dns_summary,
     "mx_health": tool_mx_health,
     "spf_inspect": tool_spf_inspect,
+    "reverse_lookup": tool_reverse_lookup,
+    "dnssec_status": tool_dnssec_status,
+    "ns_health": tool_ns_health,
+    "registrar_lookup": tool_registrar_lookup,
 }
 
 
@@ -408,6 +554,68 @@ tool_schemas: Dict[str, Dict[str, Any]] = {
                         {"type": "string"},
                     ]
                 },
+            },
+        },
+    },
+    "reverse_lookup": {
+        "name": "reverse_lookup",
+        "description": "Perform PTR lookup for an IPv4/IPv6 address.",
+        "input_schema": {
+            "type": "object",
+            "required": ["ip"],
+            "properties": {
+                "ip": {"type": "string"},
+                "nameservers": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "string"},
+                    ]
+                },
+            },
+        },
+    },
+    "dnssec_status": {
+        "name": "dnssec_status",
+        "description": "Check whether DS records are published for a domain.",
+        "input_schema": {
+            "type": "object",
+            "required": ["domain"],
+            "properties": {
+                "domain": {"type": "string"},
+                "nameservers": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "string"},
+                    ]
+                },
+            },
+        },
+    },
+    "ns_health": {
+        "name": "ns_health",
+        "description": "Resolve NS hosts and report their glue IPs.",
+        "input_schema": {
+            "type": "object",
+            "required": ["domain"],
+            "properties": {
+                "domain": {"type": "string"},
+                "nameservers": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "string"},
+                    ]
+                },
+            },
+        },
+    },
+    "registrar_lookup": {
+        "name": "registrar_lookup",
+        "description": "Fetch registrar + status metadata via RDAP.",
+        "input_schema": {
+            "type": "object",
+            "required": ["domain"],
+            "properties": {
+                "domain": {"type": "string"},
             },
         },
     },

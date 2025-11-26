@@ -242,7 +242,7 @@ services:
     environment:
       - YOLO_MODEL=/app/models/yolov8n.pt
     volumes:
-      - C:/_dev/_models/yolo:/app/models
+      - ${MCP_YOLO_ROOT:-C:/_chaba/chaba-1/mcp-yolo}:/app/models
     ports:
       - "8000:8000"
     healthcheck:
@@ -405,6 +405,24 @@ services:
       retries: 5
     restart: unless-stopped
 
+  dev-wsai:
+    image: ghcr.io/linuxserver/code-server:latest
+    container_name: dev-wsai
+    profiles: ["optional", "dev"]
+    <<: *service_defaults
+    environment:
+      - PUID=${DEV_WSAI_PUID:-1000}
+      - PGID=${DEV_WSAI_PGID:-1000}
+      - TZ=${TZ:-UTC}
+      - PASSWORD=${DEV_WSAI_PASSWORD:-}
+      - SUDO_PASSWORD=${DEV_WSAI_SUDO_PASSWORD:-}
+    volumes:
+      - ${DEV_WSAI_CONFIG_ROOT:-C:/_dev/_models/dev-wsai}:/config
+      - ./:/config/workspace
+      - //var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${DEV_WSAI_PORT:-8443}:8443"
+
   # Utility container for interactive debugging (shell, curl, etc.)
   mcp-debug:
     build:
@@ -415,6 +433,8 @@ services:
     working_dir: /workspace
     volumes:
       - .:/workspace:delegated
+      - ${MCP_DEBUG_ROOT:-C:/_chaba/chaba-1/mcp-debug}:/workspace/localdata
+      - ${STACK_SHARES_ROOT:-C:/_chaba/chaba-1/shares}:/workspace/shares
     environment:
       - DEBUG=${DEBUG:-}
       - HEARTBEAT_INTERVAL=${MCP_DEBUG_HEARTBEAT_INTERVAL:-30}

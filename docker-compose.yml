@@ -142,8 +142,7 @@ services:
       - a_kakk
 
   caddy:
-    build:
-      context: ./caddy
+    image: caddy:2.9
     container_name: kk1-caddy
     <<: *service_defaults
     ports:
@@ -153,8 +152,6 @@ services:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-config:/config
       - caddy-data:/data
-    environment:
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
     depends_on:
       - a_kakk
 

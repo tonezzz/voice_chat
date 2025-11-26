@@ -32,6 +32,7 @@ RUN apt-get update \
         netcat-openbsd \
         nodejs \
         npm \
+        openssh-client \
         openssl \
         procps \
         python3-pil \

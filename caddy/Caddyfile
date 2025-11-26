@@ -3,14 +3,10 @@
     acme_ca https://acme-v02.api.letsencrypt.org/directory
 }
 
-chaba.gizmo-thailand.com, chaba.surf-thailand.com, *.chaba.surf-thailand.com {
+chaba.gizmo-thailand.com, chaba.surf-thailand.com {
     encode gzip zstd
     log {
         output stdout
-    }
-
-    tls {
-        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
     }
 
     @kk1path {

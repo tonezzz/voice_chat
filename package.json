@@ -1,0 +1,8 @@
+{
+  "name": "voice-chat-workflows",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "mcp-debug": "docker exec -it mcp-debug"
+  }
+}
