@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const fsp = fs.promises;
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const express = require('express');
@@ -25,6 +26,246 @@ app.use(express.urlencoded({ limit: JSON_BODY_LIMIT, extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const dynamicEndpointRegistry = new Map();
+
+const MIN_GITHUB_MODELS_REFRESH_INTERVAL_MS = 60 * 1000;
+const DEFAULT_GITHUB_MODELS_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+const GITHUB_MODELS_CATALOG_URL = process.env.GITHUB_MODELS_CATALOG_URL || 'https://models.github.ai/v1/models';
+const GITHUB_MODELS_REFRESH_INTERVAL_MS = Math.max(
+  MIN_GITHUB_MODELS_REFRESH_INTERVAL_MS,
+  Number(process.env.GITHUB_MODELS_REFRESH_INTERVAL_MS) || DEFAULT_GITHUB_MODELS_REFRESH_INTERVAL_MS
+);
+
+const resolveGithubModelsSharedPath = () => {
+  const customPath = (process.env.GITHUB_MODELS_SHARED_PATH || '').trim();
+  if (customPath) {
+    return path.isAbsolute(customPath) ? customPath : path.join(__dirname, '..', customPath);
+  }
+  return path.join(__dirname, '..', 'shared', 'models', 'github-public-models.json');
+};
+
+const checkGithubCatalogHealth = async () => {
+  try {
+    const snapshot = await getGithubModelsCatalogSnapshot();
+    const summary = summarizeGithubCatalogSnapshot(snapshot, { includeModels: false });
+    const status = summary.status === 'ok' ? 'ok' : summary.status === 'empty' ? 'warning' : 'error';
+    return { name: 'githubModelsCatalog', status, detail: summary };
+  } catch (err) {
+    return { name: 'githubModelsCatalog', status: 'error', detail: err?.message || 'catalog_unavailable' };
+  }
+};
+
+const GITHUB_MODELS_SHARED_PATH = resolveGithubModelsSharedPath();
+const GITHUB_MODELS_SHARED_DIR = path.dirname(GITHUB_MODELS_SHARED_PATH);
+
+const githubModelsCatalogState = {
+  source: GITHUB_MODELS_CATALOG_URL,
+  fetchedAt: null,
+  fetchedAtMs: 0,
+  total: 0,
+  models: [],
+  lastError: null,
+  filePath: GITHUB_MODELS_SHARED_PATH
+};
+
+let githubModelsRefreshPromise = null;
+let githubModelsRefreshTimer = null;
+
+const ensureGithubModelsDirectory = () => {
+  try {
+    fs.mkdirSync(GITHUB_MODELS_SHARED_DIR, { recursive: true });
+  } catch (err) {
+    console.error('[github-models] failed to create shared directory:', err?.message || err);
+  }
+};
+
+const applyGithubCatalogSnapshot = (snapshot) => {
+  if (!snapshot || !Array.isArray(snapshot.models)) {
+    return;
+  }
+  githubModelsCatalogState.source = snapshot.source || GITHUB_MODELS_CATALOG_URL;
+  githubModelsCatalogState.models = snapshot.models;
+  githubModelsCatalogState.total = typeof snapshot.total === 'number' ? snapshot.total : snapshot.models.length;
+  githubModelsCatalogState.fetchedAt = snapshot.fetchedAt || new Date().toISOString();
+  githubModelsCatalogState.fetchedAtMs = Date.parse(githubModelsCatalogState.fetchedAt) || Date.now();
+  githubModelsCatalogState.lastError = null;
+};
+
+const persistGithubCatalogSnapshot = async (snapshot) => {
+  if (!snapshot || !Array.isArray(snapshot.models)) {
+    return;
+  }
+  ensureGithubModelsDirectory();
+  try {
+    await fsp.writeFile(GITHUB_MODELS_SHARED_PATH, JSON.stringify(snapshot, null, 2), 'utf8');
+  } catch (err) {
+    console.error('[github-models] failed to write catalog cache:', err?.message || err);
+  }
+};
+
+const hydrateGithubCatalogFromDisk = async () => {
+  try {
+    const raw = await fsp.readFile(GITHUB_MODELS_SHARED_PATH, 'utf8');
+    const snapshot = JSON.parse(raw);
+    if (snapshot && Array.isArray(snapshot.models)) {
+      applyGithubCatalogSnapshot(snapshot);
+    }
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      console.warn('[github-models] failed to read cached catalog:', err?.message || err);
+    }
+  }
+};
+
+const fetchGithubCatalogFromRemote = async () => {
+  const response = await fetch(GITHUB_MODELS_CATALOG_URL, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'voice-chat-server/1.0 (+github-models catalog refresh)'
+    }
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`catalog_fetch_failed (${response.status}): ${detail?.slice(0, 200) || 'no detail'}`);
+  }
+
+  const payload = await response.json();
+  const models = Array.isArray(payload?.data)
+    ? payload.data
+    : Array.isArray(payload?.models)
+      ? payload.models
+      : Array.isArray(payload)
+        ? payload
+        : [];
+
+  if (!Array.isArray(models)) {
+    throw new Error('catalog_response_invalid');
+  }
+
+  return {
+    source: GITHUB_MODELS_CATALOG_URL,
+    fetchedAt: new Date().toISOString(),
+    total: models.length,
+    models
+  };
+};
+
+const refreshGithubModelsCatalog = async ({ force = false, reason = 'scheduled' } = {}) => {
+  if (!force && githubModelsRefreshPromise) {
+    return githubModelsRefreshPromise;
+  }
+
+  if (
+    !force &&
+    githubModelsCatalogState.fetchedAtMs &&
+    Date.now() - githubModelsCatalogState.fetchedAtMs < GITHUB_MODELS_REFRESH_INTERVAL_MS
+  ) {
+    return githubModelsCatalogState;
+  }
+
+  githubModelsRefreshPromise = (async () => {
+    const snapshot = await fetchGithubCatalogFromRemote();
+    applyGithubCatalogSnapshot(snapshot);
+    await persistGithubCatalogSnapshot(snapshot);
+    console.log(`[github-models] catalog refreshed (${snapshot.total} models, reason=${reason})`);
+    return githubModelsCatalogState;
+  })()
+    .catch((err) => {
+      githubModelsCatalogState.lastError = {
+        message: err?.message || 'github_models_refresh_failed',
+        at: new Date().toISOString(),
+        reason
+      };
+      console.error('[github-models] catalog refresh failed:', err);
+      throw err;
+    })
+    .finally(() => {
+      githubModelsRefreshPromise = null;
+    });
+
+  return githubModelsRefreshPromise;
+};
+
+const getGithubModelsCatalogSnapshot = async ({ forceRefresh = false } = {}) => {
+  if (!githubModelsCatalogState.models.length) {
+    await hydrateGithubCatalogFromDisk();
+  }
+
+  if (forceRefresh) {
+    await refreshGithubModelsCatalog({ force: true, reason: 'manual' }).catch(() => {});
+  } else if (!githubModelsCatalogState.models.length) {
+    await refreshGithubModelsCatalog({ force: true, reason: 'autoload' }).catch(() => {});
+  }
+
+  return {
+    source: githubModelsCatalogState.source,
+    fetchedAt: githubModelsCatalogState.fetchedAt,
+    fetchedAtMs: githubModelsCatalogState.fetchedAtMs || null,
+    total: githubModelsCatalogState.total,
+    models: githubModelsCatalogState.models,
+    filePath: githubModelsCatalogState.filePath,
+    lastError: githubModelsCatalogState.lastError
+  };
+};
+
+const summarizeGithubCatalogSnapshot = (snapshot, { includeModels = true } = {}) => {
+  if (!snapshot) {
+    return { status: 'empty', source: GITHUB_MODELS_CATALOG_URL, total: 0, models: includeModels ? [] : undefined };
+  }
+
+  const parsedFetchedAtMs = typeof snapshot.fetchedAtMs === 'number' && Number.isFinite(snapshot.fetchedAtMs)
+    ? snapshot.fetchedAtMs
+    : snapshot.fetchedAt
+      ? Date.parse(snapshot.fetchedAt)
+      : null;
+  const now = Date.now();
+  const staleMs = parsedFetchedAtMs ? Math.max(0, now - parsedFetchedAtMs) : null;
+
+  const status = snapshot.lastError
+    ? 'degraded'
+    : snapshot.total > 0
+      ? 'ok'
+      : 'empty';
+
+  const base = {
+    status,
+    source: snapshot.source,
+    fetchedAt: snapshot.fetchedAt,
+    fetchedAtMs: parsedFetchedAtMs,
+    total: snapshot.total,
+    filePath: snapshot.filePath,
+    lastError: snapshot.lastError,
+    staleMs,
+    refreshIntervalMs: GITHUB_MODELS_REFRESH_INTERVAL_MS
+  };
+
+  if (includeModels) {
+    base.models = snapshot.models;
+  }
+
+  return base;
+};
+
+const initializeGithubModelsCatalogPipeline = () => {
+  ensureGithubModelsDirectory();
+  hydrateGithubCatalogFromDisk().catch((err) => {
+    console.warn('[github-models] failed to hydrate catalog from disk:', err?.message || err);
+  });
+  refreshGithubModelsCatalog({ force: true, reason: 'startup' }).catch((err) => {
+    console.warn('[github-models] initial catalog fetch failed:', err?.message || err);
+  });
+  githubModelsRefreshTimer = setInterval(() => {
+    refreshGithubModelsCatalog({ force: true, reason: 'interval' }).catch((err) => {
+      console.warn('[github-models] scheduled refresh failed:', err?.message || err);
+    });
+  }, GITHUB_MODELS_REFRESH_INTERVAL_MS);
+  if (typeof githubModelsRefreshTimer?.unref === 'function') {
+    githubModelsRefreshTimer.unref();
+  }
+};
+
+initializeGithubModelsCatalogPipeline();
 
 const serveClientIndex = (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -350,13 +591,12 @@ registerDynamicEndpointGroup('meeting', {
     {
       method: 'post',
       path: '/ingest-audio',
-      handler: upload.single('audio'),
-      description: 'ingest audio chunk'
+      handler: meetingIngestAudioHandler,
+      description: 'ingest audio chunk',
+      middlewares: [upload.single('audio')]
     }
   ]
 });
-
-app.post('/meeting/ingest-audio', upload.single('audio'), meetingIngestAudioHandler);
 
 app.post('/identify-people', upload.single('image'), async (req, res) => {
   if (!req.file) {
@@ -2606,7 +2846,14 @@ registerDynamicEndpointGroup('github-model', {
   routes: [
     { method: 'get', path: '/health', handler: githubModelHealthHandler, description: 'health' },
     { method: 'post', path: '/chat', handler: githubModelChatHandler, description: 'chat proxy' },
-    { method: 'post', path: '/compare', handler: githubModelCompareHandler, description: 'model compare' }
+    { method: 'post', path: '/compare', handler: githubModelCompareHandler, description: 'model compare' },
+    { method: 'get', path: '/catalog', handler: githubModelCatalogHandler, description: 'public catalog snapshot' },
+    {
+      method: 'post',
+      path: '/catalog/refresh',
+      handler: githubModelCatalogRefreshHandler,
+      description: 'force catalog refresh'
+    }
   ]
 });
 

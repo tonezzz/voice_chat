@@ -29,10 +29,12 @@ RUN apt-get update \
         libxrandr2 \
         libxi6 \
         net-tools \
+        sshpass \
         netcat-openbsd \
         nodejs \
         npm \
         openssh-client \
+        openssh-server \
         openssl \
         procps \
         python3-pil \
@@ -44,7 +46,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g wscat \
     && npx --yes playwright@1.49.1 install chromium \
-    && npm install --prefix /opt/mcp-browser --omit=dev playwright@1.49.1
+    && npm install --prefix /opt/mcp-browser --omit=dev playwright@1.49.1 \
+    && adduser --disabled-password --gecos '' debug \
+    && mkdir -p /run/sshd
 
 ENV NODE_PATH=/opt/mcp-browser/node_modules
 

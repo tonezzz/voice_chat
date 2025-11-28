@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: mcp-pc1-uptime [options]
+
+Environment variables (overrides):
+  WSL_USER            Target WSL username (default tonezzz)
+  WSL_HOST            Host/IP exposed via Windows portproxy (default host.docker.internal)
+  WSL_PORT            SSH port (default 2222)
+  WSL_KEY_PATH        Private key path inside container (default /home/debug/.ssh/pc1_wsl_entire)
+  WSL_KEY_SOURCE      Fallback key source (default /workspace/localdata/keys/pc1_wsl_entire)
+  WSL_STRICT          StrictHostKeyChecking (default no)
+  WSL_SSH_ARGS        Extra ssh args passed to mcp-wsl
+
+Runs `uptime -p` via the Windows-hosted PC1 WSL distro and prints the result.
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+: "${WSL_USER:=tonezzz}"
+: "${WSL_HOST:=host.docker.internal}"
+: "${WSL_PORT:=2222}"
+: "${WSL_KEY_PATH:=/home/debug/.ssh/pc1_wsl_entire}"
+: "${WSL_KEY_SOURCE:=/workspace/localdata/keys/pc1_wsl_entire}"
+: "${WSL_STRICT:=no}"
+
+if [[ -n "${WSL_SSH_ARGS:-}" ]]; then
+  export WSL_SSH_ARGS
+fi
+
+exec env \
+  WSL_USER="$WSL_USER" \
+  WSL_HOST="$WSL_HOST" \
+  WSL_PORT="$WSL_PORT" \
+  WSL_KEY_PATH="$WSL_KEY_PATH" \
+  WSL_KEY_SOURCE="$WSL_KEY_SOURCE" \
+  WSL_STRICT="$WSL_STRICT" \
+  mcp-wsl uptime -p

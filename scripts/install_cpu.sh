@@ -21,7 +21,6 @@ PIPER_MODEL_URL=${PIPER_MODEL_URL:-https://huggingface.co/rhasspy/piper-voices/r
 PIPER_CONFIG_URL=${PIPER_CONFIG_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US-amy-medium.onnx.json}
 YOLO_MODEL_URL=${YOLO_MODEL_URL:-https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt}
 OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
-NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
 
 install_prereqs() {
   log "Installing base packages..."
@@ -119,7 +118,6 @@ HF_STT_MODELS=${MODELS_ROOT}/huggingface/stt
 HF_TTS_MODELS=${MODELS_ROOT}/huggingface/tts
 YOLO_MODEL_ROOT=${MODELS_ROOT}/yolo
 OLLAMA_MODEL=${OLLAMA_MODEL}
-NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
 EOF
 }
 
@@ -144,7 +142,7 @@ wait_for_container() {
 bring_up_stack() {
   log "Starting CPU-only docker-compose stack..."
   pushd "${STACK_DIR}" >/dev/null
-  docker compose --env-file .env.linux up -d openvoice-tts stt tts yolo_mcp ollama server ngrok
+  docker compose --env-file .env.linux up -d openvoice-tts stt tts yolo_mcp ollama server
   popd >/dev/null
 }
 

@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "mcp-debug": "docker exec -it mcp-debug"
+    "mcp-debug": "docker exec -it mcp-debug",
+    "instrans:build": "npm run build --prefix instrans/client",
+    "instrans:sync": "node scripts/sync-instrans-dist.cjs",
+    "instrans:deploy": "npm run build --prefix instrans/client && node scripts/sync-instrans-dist.cjs",
+    "host1:metrics": "docker exec mcp-debug bash -lc '/workspace/mcp_debug/bin/mcp-host-metrics'",
+    "host1:sync": "npx dotenv-cli -e .env -- docker compose --profile host1-sync run --rm host1-sync",
+    "host1:publish": "npm run host1:metrics && npm run host1:sync",
+    "host1:publish-loop": "node scripts/host1-publish-loop.cjs",
+    "host1:watch": "node scripts/host1-publish-watch.cjs"
   }
 }

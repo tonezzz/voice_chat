@@ -1,0 +1,4 @@
+# Enforce LF endings for shell scripts and MCP utilities
+*.sh text eol=lf
+mcp_debug/bin/* text eol=lf
+scripts/*.sh text eol=lf

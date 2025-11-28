@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." &>/dev/null && pwd)"
+OUTPUT_PATH="${METRICS_OUTPUT:-$ROOT_DIR/_models/a_chaba/sites/hosts/metrics.json}"
+CREDENTIAL_PATH="${STACK_HOST1_CREDENTIAL:-/workspace/shares/credentials/host1-ssh.json}"
+
+if [[ ! -f "$CREDENTIAL_PATH" ]]; then
+  echo "[mcp-host-metrics] credential file not found: $CREDENTIAL_PATH" >&2
+  exit 1
+fi
+
+read -r -d '' REMOTE_CMD <<'REMOTE'
+set -euo pipefail
+python3 - <<'PY'
+import json
+import os
+import time
+import datetime as dt
+import subprocess
+
+HOST_KEY = 'host01'
+
+def read_cpu():
+    with open('/proc/stat', 'r', encoding='utf-8') as fh:
+        parts = fh.readline().split()[1:]
+        parts = list(map(int, parts))
+    idle = parts[3]
+    total = sum(parts)
+    return idle, total
+
+idle1, total1 = read_cpu()
+time.sleep(1.0)
+idle2, total2 = read_cpu()
+cpu_percent = 0.0
+if total2 != total1:
+    cpu_percent = (1.0 - (idle2 - idle1) / (total2 - total1)) * 100.0
+
+with open('/proc/loadavg', 'r', encoding='utf-8') as fh:
+    loadavg = [float(x.replace(',', '.')) for x in fh.read().split()[:3]]
+
+uptime = os.popen('uptime -p').read().strip()
+
+meminfo = {}
+with open('/proc/meminfo', 'r', encoding='utf-8') as fh:
+    for line in fh:
+        if ':' not in line:
+            continue
+        key, rest = line.split(':', 1)
+        meminfo[key.strip()] = int(rest.strip().split()[0])  # kB
+
+total_mem = meminfo.get('MemTotal')
+avail_mem = meminfo.get('MemAvailable')
+used_mem = total_mem - avail_mem if (total_mem and avail_mem) else None
+
+df_paths = ['/']
+if os.path.exists('/var/www'):
+    df_paths.append('/var/www')
+
+try:
+    df_output = subprocess.check_output(['df', '-B1', *df_paths], text=True)
+    disk_lines = df_output.strip().splitlines()[1:]
+except subprocess.CalledProcessError:
+    disk_lines = []
+
+disks = []
+for line in disk_lines:
+    parts = line.split()
+    if len(parts) < 6:
+        continue
+    disks.append({
+        'path': parts[-1],
+        'totalBytes': int(parts[1]),
+        'freeBytes': int(parts[3])
+    })
+
+now = dt.datetime.utcnow().isoformat() + 'Z'
+
+payload = {
+    'host': HOST_KEY,
+    'uptime': uptime,
+    'cpuPercent': round(cpu_percent, 2),
+    'loadAvg': loadavg,
+    'memory': {
+        'totalGb': round(total_mem / (1024 ** 2), 2) if total_mem else None,
+        'usedGb': round(used_mem / (1024 ** 2), 2) if used_mem else None
+    },
+    'disks': disks,
+    'updatedAt': now,
+    'status': 'ok'
+}
+
+print(json.dumps(payload))
+PY
+REMOTE
+
+remote_payload="$("$SCRIPT_DIR/mcp-sshpass-test" -c "$CREDENTIAL_PATH" -- "$REMOTE_CMD")"
+
+if [[ -z "$remote_payload" ]]; then
+  echo "[mcp-host-metrics] remote payload empty" >&2
+  exit 1
+fi
+
+tmp_remote="$(mktemp)"
+trap 'rm -f "$tmp_remote"' EXIT
+printf '%s\n' "$remote_payload" > "$tmp_remote"
+
+python3 - "$OUTPUT_PATH" "$tmp_remote" <<'PY'
+import json
+import pathlib
+import sys
+import datetime as dt
+
+output_path = pathlib.Path(sys.argv[1])
+remote_path = pathlib.Path(sys.argv[2])
+
+manual_defaults = {
+    'pc1': {
+        'uptime': 'Daily 09:00-20:00',
+        'cpuPercent': None,
+        'status': 'manual',
+        'note': 'Lighting desk · update via studio ops'
+    },
+    'pc2': {
+        'uptime': 'Standby (wake on ping)',
+        'cpuPercent': None,
+        'status': 'idle'
+    },
+    'pom01': {
+        'uptime': 'Provisioning (ETA Q4)',
+        'cpuPercent': None,
+        'status': 'pending'
+    }
+}
+
+try:
+    remote = json.loads(remote_path.read_text(encoding='utf-8'))
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"Failed to parse remote metrics: {exc}")
+
+if output_path.exists():
+    try:
+        base = json.loads(output_path.read_text(encoding='utf-8'))
+    except json.JSONDecodeError:
+        base = {'hosts': {}}
+else:
+    base = {'hosts': {}}
+
+hosts = base.setdefault('hosts', {})
+
+for key, defaults in manual_defaults.items():
+    if key not in hosts:
+        hosts[key] = defaults.copy()
+    else:
+        for field, value in defaults.items():
+            hosts[key].setdefault(field, value)
+
+host_key = remote.pop('host', 'host01')
+hosts[host_key] = remote
+base['generatedAt'] = remote.get('updatedAt', dt.datetime.utcnow().isoformat() + 'Z')
+
+output_path.parent.mkdir(parents=True, exist_ok=True)
+output_path.write_text(json.dumps(base, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+PY
+
+echo "[mcp-host-metrics] Metrics updated at $OUTPUT_PATH"

@@ -7,6 +7,12 @@ TAIL_FILES="${TAIL_FILES:-}"
 TTYD_ENABLED="${TTYD_ENABLED:-true}"
 TTYD_PORT="${TTYD_PORT:-7681}"
 TTYD_EXTRA_ARGS="${TTYD_EXTRA_ARGS:-}"
+SSH_ENABLED="${SSH_ENABLED:-auto}"
+SSH_PORT="${SSH_PORT:-22}"
+SSH_AUTHORIZED_KEYS_FILE="${SSH_AUTHORIZED_KEYS_FILE:-/workspace/localdata/ssh/authorized_keys}"
+SSH_AUTHORIZED_KEYS="${SSH_AUTHORIZED_KEYS:-}"
+SSH_STATUS="disabled"
+SSH_CONFIG_PATH="${SSH_CONFIG_PATH:-/etc/ssh/sshd_config.d/99-mcp-debug.conf}"
 mkdir -p "$LOG_DIR"
 
 cleanup() {
@@ -16,8 +22,62 @@ cleanup() {
   if [[ -n "${TTYD_PID:-}" ]]; then
     kill "$TTYD_PID" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${SSHD_PID:-}" ]]; then
+    kill "$SSHD_PID" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
+
+start_sshd() {
+  local auth_dir="/home/debug/.ssh"
+  local auth_file="$auth_dir/authorized_keys"
+  local key_source=""
+
+  install -d -m 700 -o debug -g debug "$auth_dir"
+
+  if [[ -n "$SSH_AUTHORIZED_KEYS" ]]; then
+    printf '%s\n' "$SSH_AUTHORIZED_KEYS" >"$auth_file"
+    key_source='SSH_AUTHORIZED_KEYS env'
+  elif [[ -f "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+    cp "$SSH_AUTHORIZED_KEYS_FILE" "$auth_file"
+    key_source="$SSH_AUTHORIZED_KEYS_FILE"
+  else
+    SSH_STATUS="waiting for authorized keys at $SSH_AUTHORIZED_KEYS_FILE"
+    if [[ "$SSH_ENABLED" == "true" ]]; then
+      echo "[mcp-debug] SSH_ENABLED=true but no authorized keys found (expected $SSH_AUTHORIZED_KEYS_FILE or SSH_AUTHORIZED_KEYS)" >&2
+      return 1
+    fi
+    echo "[mcp-debug] SSH keys not found; skipping sshd startup. Set SSH_ENABLED=true to force and provide keys." >&2
+    return 0
+  fi
+
+  chmod 600 "$auth_file"
+  chown debug:debug "$auth_file"
+
+  if [[ ! -f /etc/ssh/ssh_host_rsa_key ]]; then
+    echo "[mcp-debug] Generating SSH host keys"
+    ssh-keygen -A >/dev/null
+  fi
+
+  cat >"$SSH_CONFIG_PATH" <<CONF
+Port $SSH_PORT
+PasswordAuthentication no
+PermitRootLogin no
+AuthorizedKeysFile /home/debug/.ssh/authorized_keys
+AllowUsers debug
+AllowTcpForwarding no
+GatewayPorts no
+X11Forwarding no
+ClientAliveInterval 180
+ClientAliveCountMax 2
+UseDNS no
+CONF
+
+  echo "[mcp-debug] Starting sshd on port $SSH_PORT (authorized keys: $key_source)"
+  /usr/sbin/sshd -D -e &
+  SSHD_PID=$!
+  SSH_STATUS="running on port $SSH_PORT (PID ${SSHD_PID}, keys: $key_source)"
+}
 
 if [[ -n "$TAIL_FILES" ]]; then
   echo "[mcp-debug] Tailing logs: $TAIL_FILES"
@@ -37,6 +97,15 @@ else
   echo "[mcp-debug] ttyd disabled (set TTYD_ENABLED=true to enable web shell)"
 fi
 
+if [[ "$SSH_ENABLED" != "false" ]]; then
+  if ! start_sshd; then
+    echo "[mcp-debug] Failed to start sshd"
+    exit 1
+  fi
+else
+  SSH_STATUS="disabled via SSH_ENABLED=false"
+fi
+
 cat <<'BANNER'
 ============================================================
  MCP Debug Helper - container is running
@@ -54,6 +123,15 @@ while true; do
     echo "  ttyd status: running on port ${TTYD_PORT} (PID ${TTYD_PID})"
   else
     echo "  ttyd status: disabled"
+  fi
+  if [[ -n "${SSHD_PID:-}" ]]; then
+    if kill -0 "$SSHD_PID" >/dev/null 2>&1; then
+      echo "  sshd status: $SSH_STATUS"
+    else
+      echo "  sshd status: exited (check docker logs)"
+    fi
+  else
+    echo "  sshd status: $SSH_STATUS"
   fi
   if [[ -n "$recent" ]]; then
     echo "  recent logs:" $recent

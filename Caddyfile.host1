@@ -1,0 +1,50 @@
+chaba.surf-thailand.com {
+    handle_path /a-kakk/* {
+        root * /var/www/a-kakk
+        try_files {path} {path}/
+        file_server
+    }
+
+    handle /instrans-api/* {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    handle /mcp-hub/* {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    handle_path /a-chaba/* {
+        root * /var/www/a-chaba
+        try_files {path} {path}/
+        file_server
+    }
+
+    # Voice Chat API load-balanced across host1 + Pom01
+    handle /api/* {
+        reverse_proxy {
+            to 127.0.0.1:3001
+            to 119.59.126.21:3001
+            lb_policy round_robin
+            health_uri /health
+            health_interval 20s
+            health_timeout 5s
+            fail_duration 30s
+        }
+    }
+
+    # Socket.IO/WebSocket passthrough to both backends
+    handle /socket.io/* {
+        reverse_proxy {
+            to 127.0.0.1:3001
+            to 119.59.126.21:3001
+            lb_policy round_robin
+            transport http {
+                keepalive 30s
+            }
+        }
+    }
+
+    # Default root
+    root * /var/www/a-chaba/sites/voice_chat
+    file_server
+}

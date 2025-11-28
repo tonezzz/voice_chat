@@ -18,6 +18,28 @@ x-healthcheck-slow: &healthcheck_slow
   retries: 5
 
 services:
+  instrans:
+    build:
+      context: ./instrans/server
+      <<: *build_cache
+    container_name: instrans-server
+    profiles: ["optional", "instrans"]
+    <<: *service_defaults
+    environment:
+      - NODE_ENV=production
+      - PORT=${INSTRANS_PORT:-3100}
+      - INSTRANS_PORT=${INSTRANS_PORT:-3100}
+      - INSTRANS_STT_URL=${INSTRANS_STT_URL:-http://stt-whisper-gpu:5001}
+      - INSTRANS_DEFAULT_LANG=${INSTRANS_DEFAULT_LANG:-en}
+      - INSTRANS_ALLOWED_ORIGIN=${INSTRANS_ALLOWED_ORIGIN:-*}
+      - INSTRANS_SUMMARY_SENTENCES=${INSTRANS_SUMMARY_SENTENCES:-3}
+      - INSTRANS_SSE_HEARTBEAT_MS=${INSTRANS_SSE_HEARTBEAT_MS:-15000}
+      - INSTRANS_AUDIO_CHUNK_LIMIT=${INSTRANS_AUDIO_CHUNK_LIMIT:-5242880}
+      - INSTRANS_ENABLE_TRANSLATION=${INSTRANS_ENABLE_TRANSLATION:-true}
+      - INSTRANS_ENABLE_SUMMARY=${INSTRANS_ENABLE_SUMMARY:-true}
+    depends_on:
+      - stt-cpu
+
   # ---------------------------------------------------------------------------
   # Speech + TTS stacks
   # ---------------------------------------------------------------------------
@@ -92,6 +114,28 @@ services:
     runtime: nvidia
     ports:
       - "5002:5001"
+    volumes:
+      - ${HF_STT_MODELS:-C:/_dev/_models/huggingface/stt}:/app/models
+    healthcheck:
+      <<: *healthcheck_fast
+      test: ["CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1"]
+
+  stt-cpu:
+    build:
+      context: ./stt
+      <<: *build_cache
+      args:
+        USE_GPU: "false"
+    container_name: stt-whisper-cpu
+    profiles: ["optional", "cpu"]
+    <<: *service_defaults
+    init: true
+    environment:
+      - WHISPER_MODEL=base
+      - WHISPER_DEVICE=cpu
+      - WHISPER_DOWNLOAD_DIR=/app/models
+    ports:
+      - "5001:5001"
     volumes:
       - ${HF_STT_MODELS:-C:/_dev/_models/huggingface/stt}:/app/models
     healthcheck:
@@ -440,7 +484,7 @@ services:
       - HEARTBEAT_INTERVAL=${MCP_DEBUG_HEARTBEAT_INTERVAL:-30}
       - LOG_DIR=${MCP_DEBUG_LOG_DIR:-/workspace/logs}
       - TAIL_FILES=${MCP_DEBUG_TAIL_FILES:-/workspace/logs/tty-feed.log}
-      - TTYD_ENABLED=${MCP_DEBUG_TTYD_ENABLED:-true}
+      - TTYD_ENABLED=${MCP_DEBUG_TTYD_ENABLED:-false}
       - TTYD_PORT=${MCP_DEBUG_TTYD_PORT:-7681}
       - TTYD_EXTRA_ARGS=${MCP_DEBUG_TTYD_EXTRA_ARGS:-}
 

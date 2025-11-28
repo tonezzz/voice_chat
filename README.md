@@ -38,12 +38,11 @@ OLLAMA_MODEL=llama3.2:3b
 
 ### Environment files & secrets
 
-- `.env` (tracked) contains all runtime configuration: host paths, container URLs, and any required API keys (OpenAI, Anthropic, EasySlip, ngrok, etc.). Keep it in sync with teammates and rotate secrets when needed.
+- `.env` (tracked) contains all runtime configuration: host paths, container URLs, and any required API keys (OpenAI, Anthropic, EasySlip, etc.). Keep it in sync with teammates and rotate secrets when needed.
 
 Add/adjust entries directly inside `.env`:
 
 ```
-NGROK_AUTHTOKEN=xxx
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=...
 EASYSIP_API_KEY=...
@@ -230,25 +229,9 @@ powershell -File .\scripts\invoke-mcp-tools.ps1 -StopOnError
 powershell -ExecutionPolicy Bypass -File .\scripts\run-mcp-checks.ps1 -HealthService server,mcp0,meeting,vms -ToolService meeting,vms -ToolFilter start_meeting,append_transcript,list_sessions,get_channels -StopOnError
 ```
 
-### Remote mcp-debug shell via ngrok
-
-Need a quick remote terminal/diagnostics surface? The `mcp-debug` helper now ships with an embedded [ttyd](https://github.com/tsl0922/ttyd) shell (port `7681` by default). The main `ngrok` container loads `ngrok/ngrok.yml` and publishes both the UI server and the ttyd shell from a single agent session.
-
-1. Ensure `.env` contains `NGROK_AUTHTOKEN=...` and, if needed, overrides for:
-   - `MCP_DEBUG_TTYD_PORT` (defaults to `7681`)
-   - `MCP_DEBUG_TTYD_ENABLED=true` / `MCP_DEBUG_TTYD_EXTRA_ARGS="--basic-auth user:pass"`
-2. Start the services (server + ngrok + mcp-debug):
-   ```cmd
-   cmd /c "cd /d c:\_dev\windsurf_ai\voice_chat && npx dotenv-cli -e .env -- docker compose -f docker-compose.yml -f docker-compose.optional.yml up -d server mcp-debug ngrok"
-   ```
-3. Grab the public URLs from the shared agent logs: `docker logs -f voice-chat-ngrok` (look for `server` and `mcp-debug` tunnel entries).
-4. Open the desired URL from any PC. The `mcp-debug` tunnel lands on ttyd inside the container with `/workspace` mounted, while the `server` tunnel fronts the main UI/API.
-
-The heartbeat log now reports whether ttyd is running and which port it is bound to. Stop the tunnel with `docker compose ... down ngrok` when you are done, or disable ttyd entirely by setting `MCP_DEBUG_TTYD_ENABLED=false`.
-
 ### Frontend deployment workflow
 
-When shipping UI updates that must be visible through Docker/ngrok:
+When shipping UI updates that must be visible through Docker:
 
 1. Make your changes in `client/` and verify them with `npm run dev`.
 2. Run `npm run build:deploy` inside `client/` to regenerate `client/dist` and sync to `server/public`.
@@ -256,12 +239,12 @@ When shipping UI updates that must be visible through Docker/ngrok:
    ```
    cmd /c docker compose --env-file .env build server
    ```
-4. Restart (or `up -d`) the server + ngrok services to serve the new bundle:
+4. Restart (or `up -d`) the server service to serve the new bundle:
    ```
-   cmd /c docker compose --env-file .env up -d server ngrok
+   cmd /c docker compose --env-file .env up -d server
    ```
 
-Following this loop avoids the “old UI” problem when exposing the stack via ngrok or any long-lived container.
+Following this loop avoids the “old UI” problem when exposing the stack through long-lived containers.
 
 ## Automation helpers
 
@@ -318,7 +301,7 @@ If you prefer running Docker directly on Windows (without WSL), follow these ste
 
 1. Install Docker Desktop and make sure it is using the Windows container backend.
 2. Clone this repository somewhere on your Windows filesystem.
-3. Use `.env` for host paths and secrets (ngrok, OpenAI, etc.).
+3. Use `.env` for host paths and secrets (OpenAI, Anthropic, etc.).
 4. From the repo root load it when starting the stack, e.g. `cmd /c npx dotenv -e .env -- docker compose up -d`.
 
 ### Host model paths (Windows)

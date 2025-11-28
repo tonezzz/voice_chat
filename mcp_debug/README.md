@@ -106,6 +106,9 @@ docker compose -f docker-compose.yml -f docker-compose.optional.yml up -d mcp-de
 
 # Attach a shell
 docker exec -it mcp-debug bash
+
+# (optional) SSH in from another container/host once you've mounted keys
+ssh -i /path/to/key debug@mcp-debug
 ```
 
 From inside the shell you can run any helper script directly (they live in `/usr/local/bin`).
@@ -115,8 +118,20 @@ All scripts honor the following environment overrides:
 - `MCP0_URL` (default `http://mcp0:8010`)
 - `MEETING_URL` (default `http://mcp-meeting:8008`)
 - `HTTP_TIMEOUT` (seconds, default `15`)
+- `SSH_ENABLED` (`auto` by default) — set `false` to disable sshd entirely or `true` to force startup even when keys are missing.
+- `SSH_PORT` (default `22`) — change if another container already binds the port.
+- `SSH_AUTHORIZED_KEYS_FILE` (default `/workspace/localdata/ssh/authorized_keys`) — bind-mount a file with public keys to grant access.
+- `SSH_AUTHORIZED_KEYS` — provide inline public keys instead of a file.
 
 Set them per invocation (e.g., `SERVER_URL=http://host.docker.internal:3001 mcp-health`).
+
+When sshd is enabled you can connect from any container on the compose network using
+
+```bash
+ssh -i /workspace/localdata/keys/host1_ed25519 debug@mcp-debug
+```
+
+Only public-key auth is allowed and the `debug` account has no password, so be sure to mount the proper keypair into `/workspace/localdata/ssh` or inject it via `SSH_AUTHORIZED_KEYS`.
 
 ## Helper commands
 
@@ -135,6 +150,8 @@ Set them per invocation (e.g., `SERVER_URL=http://host.docker.internal:3001 mcp-
 | `mcp-browser-vision [url]` | Capture a screenshot via `mcp-browser` then analyze it with YOLO. |
 | `mcp-browser-vision-watch` | Looping monitor that screenshots URLs on a cadence and stores YOLO results. |
 | `mcp-vision-hook` | Optional alert/MCP forwarding hook invoked after each detection pass. |
+| `mcp-wsl [cmd]` | Execute commands inside your host WSL distro over SSH (see "WSL bridge"). |
+| `mcp-pc1-uptime` | Shortcut for `mcp-wsl uptime -p` targeting the PC1 WSL host (overrides via `WSL_*`). |
 
 Add new scripts under `mcp_debug/bin/` (prefixed with `mcp-`) and rebuild to bake them in.
 
@@ -148,6 +165,55 @@ Override `BASE_URL`, `VITE_API_BASE_URL`, or pass a spec pattern: `mcp-playwrigh
 
 The default entrypoint runs `mcp-debug-idle`, which prints a heartbeat message every 30s and tails files specified via
 `TAIL_FILES` (e.g., set `TAIL_FILES="/workspace/logs/*.log"` in compose overrides to stream diagnostics into `docker logs`).
+
+### WSL bridge (Windows hosts)
+
+You can drive your Windows Subsystem for Linux (WSL) distro from inside `mcp-debug` using the `mcp-wsl` helper.
+
+1. **Inside WSL** install + harden OpenSSH:
+
+   ```bash
+   sudo apt update && sudo apt install -y openssh-server
+   sudo tee /etc/ssh/sshd_config.d/99-mcp-debug.conf >/dev/null <<'CONF'
+   PasswordAuthentication no
+   PermitRootLogin no
+   AllowUsers $USER
+   AuthenticationMethods publickey
+   CONF
+   mkdir -p ~/.ssh && chmod 700 ~/.ssh
+   cat <<'KEY' >> ~/.ssh/authorized_keys
+   # paste the public key that mcp-debug will use
+   KEY
+   chmod 600 ~/.ssh/authorized_keys
+   sudo systemctl enable --now ssh
+   ```
+
+2. **On Windows** expose WSL SSH via portproxy (replace the IP if it changes):
+
+   ```powershell
+   $wslIp = '192.168.1.37' # run `wsl hostname -I` to refresh on reboot
+   netsh interface portproxy delete v4tov4 listenport=2222 listenaddress=0.0.0.0 2>$null
+   netsh interface portproxy add v4tov4 listenport=2222 listenaddress=0.0.0.0 connectport=22 connectaddress=$wslIp
+   New-NetFirewallRule -DisplayName "WSL SSH Proxy 2222" -Direction Inbound -Protocol TCP -LocalPort 2222 -Action Allow -Profile Any
+   ```
+
+   The repo also ships `scripts/setup-wsl-ssh-proxy.ps1` to automate the IP detection, portproxy, and key sync in one go.
+
+3. **Provide the private key** to mcp-debug (once per key change):
+
+   ```powershell
+   Copy-Item C:\_dev\_models\tony\conf\chaba-idc\wsl_debug_ed25519 C:\_chaba\chaba-1\mcp-debug\keys\wsl_debug_ed25519
+   docker exec mcp-debug bash -lc "mcp-wsl key-install"
+   ```
+
+4. **Run commands** from inside the container:
+
+   ```bash
+   docker exec mcp-debug env WSL_USER=tony mcp-wsl test
+   docker exec mcp-debug env WSL_USER=tony mcp-wsl 'htop -b -n1'
+   ```
+
+`mcp-wsl` accepts overrides such as `WSL_HOST`, `WSL_PORT`, `WSL_SSH_ARGS`, and defaults `WSL_STRICT=no` so it works with the port proxy without prompting.
 
 ## Diagnostics workflow
 

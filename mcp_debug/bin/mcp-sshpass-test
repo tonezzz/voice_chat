@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: mcp-sshpass-test [options] [-- remote_command]
+
+Options (env overrides in parentheses):
+  -c, --credential PATH   JSON file with host/user/password/port values.
+  -H, --host HOST         SSH host (SSHPASS_HOST)
+  -P, --port PORT         SSH port (SSHPASS_PORT, default 22)
+  -u, --user USER         SSH username (SSHPASS_USER)
+  -p, --password PASS     SSH password (SSHPASS_PASSWORD)
+      --password-file     Read password from file (newline trimmed).
+      --strict yes|no     StrictHostKeyChecking (SSHPASS_STRICT, default no)
+      --ssh-arg VALUE     Extra argument passed to ssh (repeatable).
+  -h, --help              Show this help text.
+
+Any arguments after `--` are executed on the remote host (default: whoami).
+USAGE
+}
+
+trim_secret() {
+  local value="$1"
+  while [[ "$value" == *$'\n' || "$value" == *$'\r' ]]; do
+    value=${value%$'\n'}
+    value=${value%$'\r'}
+  done
+  printf '%s' "$value"
+}
+
+credential_path=""
+host=${SSHPASS_HOST:-}
+user=${SSHPASS_USER:-}
+password=${SSHPASS_PASSWORD:-}
+password_file=""
+port=${SSHPASS_PORT:-22}
+strict=${SSHPASS_STRICT:-no}
+declare -a ssh_extras=()
+declare -a remote_cmd=("whoami")
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--credential)
+      credential_path="$2"
+      shift 2
+      ;;
+    -H|--host)
+      host="$2"
+      shift 2
+      ;;
+    -P|--port)
+      port="$2"
+      shift 2
+      ;;
+    -u|--user)
+      user="$2"
+      shift 2
+      ;;
+    -p|--password)
+      password="$2"
+      shift 2
+      ;;
+    --password-file)
+      password_file="$2"
+      shift 2
+      ;;
+    --strict)
+      strict="$2"
+      shift 2
+      ;;
+    --ssh-arg)
+      ssh_extras+=("$2")
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      if [[ $# -gt 0 ]]; then
+        remote_cmd=()
+        while [[ $# -gt 0 ]]; do
+          remote_cmd+=("$1")
+          shift
+        done
+      fi
+      break
+      ;;
+    *)
+      echo "[mcp-sshpass-test] Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+ done
+
+if [[ -n "$password_file" ]]; then
+  if [[ ! -f "$password_file" ]]; then
+    echo "[mcp-sshpass-test] Password file not found: $password_file" >&2
+    exit 1
+  fi
+  password=$(trim_secret "$(<"$password_file")")
+fi
+
+if [[ -n "$credential_path" ]]; then
+  if [[ ! -f "$credential_path" ]]; then
+    echo "[mcp-sshpass-test] Credential file not found: $credential_path" >&2
+    exit 1
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    [[ -n "$host" ]] || host=$(jq -er '.host // empty' "$credential_path")
+    [[ -n "$user" ]] || user=$(jq -er '.user // empty' "$credential_path")
+    [[ -n "$password" ]] || password=$(jq -er '.password // empty' "$credential_path")
+    local_port=$(jq -er '.port // empty' "$credential_path") || local_port=""
+    if [[ -n "$local_port" ]]; then
+      port="$local_port"
+    fi
+    password=$(trim_secret "$password")
+  else
+    echo "[mcp-sshpass-test] jq is required to parse credential files." >&2
+    exit 1
+  fi
+fi
+
+if [[ -z "$host" ]]; then
+  echo "[mcp-sshpass-test] Missing host (set via --host or credential)." >&2
+  exit 1
+fi
+
+if [[ -z "$user" ]]; then
+  echo "[mcp-sshpass-test] Missing user (set via --user or credential)." >&2
+  exit 1
+fi
+
+if [[ -z "$password" ]]; then
+  echo "[mcp-sshpass-test] Missing password (use --password, --password-file, credential, or SSHPASS_PASSWORD)." >&2
+  exit 1
+fi
+
+if [[ -z "$port" ]]; then
+  port=22
+fi
+
+password=$(trim_secret "$password")
+
+ssh_cmd=(
+  ssh
+  -p "$port"
+  -o StrictHostKeyChecking="$strict"
+  -o PreferredAuthentications=password
+  -o PubkeyAuthentication=no
+)
+
+if [[ ${#ssh_extras[@]} -gt 0 ]]; then
+  ssh_cmd+=("${ssh_extras[@]}")
+fi
+
+ssh_cmd+=("$user@$host" "--" "${remote_cmd[@]}")
+
+SSHPASS="$password" sshpass -e "${ssh_cmd[@]}"

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: mcp-wsl [options] [command]
+
+Environment variables:
+  WSL_HOST            Target host/IP (default host.docker.internal)
+  WSL_PORT            SSH port exposed by Windows portproxy (default 2222)
+  WSL_USER            WSL username (required)
+  WSL_KEY_PATH        Path for the private key inside the container
+                      (default /home/debug/.ssh/wsl_debug_ed25519)
+  WSL_KEY_SOURCE      Fallback source to copy the key from if KEY_PATH is missing
+                      (default /workspace/localdata/keys/wsl_debug_ed25519)
+  WSL_STRICT          StrictHostKeyChecking value (yes/no, default no)
+  WSL_SSH_ARGS        Extra options appended to ssh (space separated)
+
+Commands:
+  mcp-wsl key-install   Force copy of the key from WSL_KEY_SOURCE to WSL_KEY_PATH
+  mcp-wsl test          Quick connectivity test (runs 'uname -a')
+  mcp-wsl [cmd...]      Execute the provided command inside WSL (default: bash -l)
+USAGE
+}
+
+WSL_HOST=${WSL_HOST:-host.docker.internal}
+WSL_PORT=${WSL_PORT:-2222}
+WSL_USER=${WSL_USER:-}
+WSL_ALLOW_USERS=${WSL_ALLOW_USERS:-}
+WSL_KEY_PATH=${WSL_KEY_PATH:-/home/debug/.ssh/wsl_debug_ed25519}
+WSL_KEY_SOURCE=${WSL_KEY_SOURCE:-/workspace/localdata/keys/wsl_debug_ed25519}
+WSL_STRICT=${WSL_STRICT:-no}
+WSL_KNOWN_HOSTS=${WSL_KNOWN_HOSTS:-/home/debug/.ssh/wsl_known_hosts}
+WSL_SSH_ARGS=${WSL_SSH_ARGS:-}
+
+ensure_user() {
+  if [[ -z "$WSL_USER" ]]; then
+    echo "[mcp-wsl] Set WSL_USER to the username inside your WSL distro" >&2
+    exit 1
+  fi
+  if [[ -n "$WSL_ALLOW_USERS" ]]; then
+    local match=false
+    local IFS=','
+    for user in $WSL_ALLOW_USERS; do
+      if [[ "$WSL_USER" == "$user" ]]; then
+        match=true
+        break
+      fi
+    done
+    if [[ "$match" != true ]]; then
+      echo "[mcp-wsl] User '$WSL_USER' not permitted. Allowed: $WSL_ALLOW_USERS" >&2
+      exit 1
+    fi
+  fi
+}
+
+ensure_key() {
+  if [[ -f "$WSL_KEY_PATH" ]]; then
+    return
+  fi
+  if [[ ! -f "$WSL_KEY_SOURCE" ]]; then
+    echo "[mcp-wsl] Missing private key. Provide $WSL_KEY_SOURCE or override WSL_KEY_SOURCE." >&2
+    exit 1
+  fi
+  echo "[mcp-wsl] Installing key into $WSL_KEY_PATH"
+  install -d -m 700 "$(dirname "$WSL_KEY_PATH")"
+  install -m 600 "$WSL_KEY_SOURCE" "$WSL_KEY_PATH"
+}
+
+ensure_known_hosts() {
+  install -d -m 700 "$(dirname "$WSL_KNOWN_HOSTS")" >/dev/null 2>&1 || true
+  if [[ ! -f "$WSL_KNOWN_HOSTS" ]]; then
+    touch "$WSL_KNOWN_HOSTS"
+    chmod 600 "$WSL_KNOWN_HOSTS"
+  fi
+}
+
+run_ssh() {
+  ensure_user
+  ensure_key
+  ensure_known_hosts
+
+  local cmd=()
+  if [[ $# -eq 0 ]]; then
+    cmd=("bash" "-l")
+  else
+    cmd=("$@")
+  fi
+
+  local ssh_args=(-p "$WSL_PORT" \
+    -o StrictHostKeyChecking="$WSL_STRICT" \
+    -o UserKnownHostsFile="$WSL_KNOWN_HOSTS" \
+    -i "$WSL_KEY_PATH")
+
+  if [[ -n "$WSL_SSH_ARGS" ]]; then
+    # shellcheck disable=SC2206
+    extras=($WSL_SSH_ARGS)
+    ssh_args+=("${extras[@]}")
+  fi
+
+  exec ssh "${ssh_args[@]}" "$WSL_USER@$WSL_HOST" -- "${cmd[@]}"
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    key-install)
+      shift || true
+      ensure_key
+      echo "[mcp-wsl] Key installed at $WSL_KEY_PATH"
+      exit 0
+      ;;
+    test)
+      shift || true
+      run_ssh uname -a
+      ;;
+    *)
+      run_ssh "$@"
+      ;;
+  esac
+}
+
+main "$@"

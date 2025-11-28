@@ -126,6 +126,60 @@ services:
     depends_on:
       - server
 
+  host1-sync:
+    image: alpine:3.20
+    container_name: host1-sync
+    profiles: ["host1-sync"]
+    working_dir: /workspace
+    restart: "no"
+    entrypoint: ["/bin/sh", "/workspace/scripts/host1-sync.sh"]
+    environment:
+      - HOST1_HOST=chaba.surf-thailand.com
+      - HOST1_USER=chaba
+      - HOST1_SSH_KEY=/workspace/keys/host1_ed25519
+      - HOST1_CADDYFILE=/workspace/Caddyfile.host1
+      - SOURCE_A_KAKK=/workspace/_models/a_kakk
+      - SOURCE_A_CHABA=/workspace/_models/a_chaba
+      - SOURCE_KK1=/workspace/_models/kk/kk1
+    volumes:
+      - .:/workspace
+      - C:/_dev/_models:/workspace/_models:ro
+      - C:/_dev/_models/tony/conf/chaba-idc/host1_ed25519:/workspace/keys/host1_ed25519:ro
+
+  agent-host01:
+    build:
+      context: ./agent_host1
+      <<: *build_cache
+    container_name: agent-host01
+    <<: *service_defaults
+    working_dir: /workspace
+    environment:
+      - MAIN_STACK_HEALTH_URL=${MAIN_STACK_HEALTH_URL:-http://voice-chat-server:3000/health}
+      - HOST1_PUBLISH_INTERVAL_SECONDS=${HOST1_PUBLISH_INTERVAL_SECONDS:-300}
+      - HOST1_HEALTH_CHECK_INTERVAL_SECONDS=${HOST1_HEALTH_CHECK_INTERVAL_SECONDS:-60}
+      - HOST1_HEALTH_TIMEOUT_MS=${HOST1_HEALTH_TIMEOUT_MS:-5000}
+      - HOST1_LOG_DIR=/workspace/logs/mcp-host01
+      - HOST1_ID=${HOST1_ID:-host01}
+      - HOST1_LOG_ENDPOINT=${HOST1_LOG_ENDPOINT:-http://mcp-hub:8031/logs/host01}
+    command: ["node", "scripts/host1-publish-watch.cjs"]
+    volumes:
+      - .:/workspace
+      - C:/_dev/_models:/workspace/_models:ro
+      - C:/_dev/_models/tony/conf/chaba-idc/host1_ed25519:/workspace/keys/host1_ed25519:ro
+    depends_on:
+      - mcp-hub
+  mcp-hub:
+    build:
+      context: ./mcp_hub
+      <<: *build_cache
+    container_name: mcp-hub
+    <<: *service_defaults
+    environment:
+      - MCP_HUB_PORT=${MCP_HUB_PORT:-8031}
+      - MCP_HUB_STORAGE_ROOT=${MCP_HUB_STORAGE_ROOT:-/workspace/hub-storage}
+      - MCP_HUB_RETENTION_MS=${MCP_HUB_RETENTION_MS:-86400000}
+    volumes:
+      - .:/workspace
   localtunnel:
     image: node:22-alpine
     container_name: voice-chat-localtunnel
@@ -337,27 +391,6 @@ services:
     healthcheck:
       <<: *healthcheck_fast
       test: ["CMD-SHELL", "curl -sf http://localhost:8017/health || exit 1"]
-
-  ngrok:
-    image: ngrok/ngrok:latest
-    container_name: voice-chat-ngrok
-    <<: *service_defaults
-    environment:
-      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
-    volumes:
-      - ./ngrok/ngrok.yml:/etc/ngrok/ngrok.yml:ro
-    command:
-      - start
-      - --all
-      - --config
-      - /etc/ngrok/ngrok.yml
-      - --log
-      - stdout
-      - --log-level
-      - debug
-    depends_on:
-      - server
-
   redis:
     image: redis:7-alpine
     container_name: voice-chat-redis

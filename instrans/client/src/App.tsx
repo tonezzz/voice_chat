@@ -293,7 +293,7 @@ const App: React.FC = () => {
     void createSession(targetLanguage);
   }, [createSession, listening, stopListening, targetLanguage]);
 
-  const latestTranscript = session?.transcripts.at(-1);
+  const latestTranscript = session?.transcripts.length ? session.transcripts[session.transcripts.length - 1] : undefined;
   const nowContent = latestTranscript?.text || 'Waiting for speech…';
   const translationContent = latestTranscript?.translation || 'Translation will appear here.';
   const summaryContent = session?.summary || 'Summary will build as conversation continues.';

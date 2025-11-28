@@ -3,7 +3,12 @@ import FloatingMicPanel from './components/FloatingMicPanel'
 import {
   AppBar,
   Box,
+  Button,
   Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   IconButton,
   Menu,
   MenuItem,
@@ -14,6 +19,7 @@ import {
   Typography,
   type ChipProps
 } from '@mui/material'
+import CloseIcon from '@mui/icons-material/Close'
 import MoreVertIcon from '@mui/icons-material/MoreVert'
 import SensorsIcon from '@mui/icons-material/Sensors'
 import './style.css'
@@ -322,6 +328,19 @@ const VOICE_ACCELERATOR_LABELS: Record<string, string> = {
   cpu: 'CPU',
   gpu: 'GPU',
   external: 'External'
+}
+
+const describeVoiceOrigin = (voice: VoiceOption) => {
+  const providerLabel = voice.provider
+    ? VOICE_PROVIDER_LABELS[voice.provider.toLowerCase()] || voice.provider
+    : null
+  const acceleratorLabel = voice.accelerator
+    ? VOICE_ACCELERATOR_LABELS[(voice.accelerator as string)?.toLowerCase()] || voice.accelerator
+    : null
+  const parts: string[] = []
+  if (providerLabel) parts.push(providerLabel)
+  if (acceleratorLabel) parts.push(typeof acceleratorLabel === 'string' ? acceleratorLabel : String(acceleratorLabel))
+  return parts.join(' · ')
 }
 
 const STREAMING_PROVIDERS = new Set<string>(['ollama', 'anthropic', 'openai', 'github'])
@@ -1550,6 +1569,16 @@ export function App() {
   const [voicesLoading, setVoicesLoading] = useState(false)
   const [voicePreviewLoading, setVoicePreviewLoading] = useState(false)
   const [voicePreviewError, setVoicePreviewError] = useState<string | null>(null)
+
+  const visibleVoiceOptions = useMemo(() => {
+    if (!voiceOptions.length) {
+      return [] as VoiceOption[]
+    }
+    if (health !== 'ok') {
+      return voiceOptions.filter((voice) => (voice.tier || 'standard').toLowerCase() !== 'premium')
+    }
+    return voiceOptions
+  }, [voiceOptions, health])
   const [providersInitialized, setProvidersInitialized] = useState(false)
   const [githubModelStatus, setGithubModelStatus] = useState<{ status: string; detail?: string | null } | null>(null)
   const [githubModelChecking, setGithubModelChecking] = useState(false)

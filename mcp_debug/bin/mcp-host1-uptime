@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: mcp-host1-uptime [options]
+
+Environment variables (overrides):
+  HOST1_USER          SSH username (default chaba)
+  HOST1_HOST          Target hostname/IP (default chaba.surf-thailand.com)
+  HOST1_PORT          SSH port (default 22)
+  HOST1_KEY_PATH      Private key path inside container (default /home/debug/.ssh/host1_ed25519)
+  HOST1_KEY_SOURCE    Fallback key source to copy from (default /workspace/localdata/keys/host1_ed25519)
+  HOST1_STRICT        StrictHostKeyChecking value (default no)
+  HOST1_SSH_ARGS      Extra arguments appended to ssh (space separated)
+
+Runs `uptime -p` on the Host1 server using the shared SSH key.
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+: "${HOST1_USER:=chaba}"
+: "${HOST1_HOST:=chaba.surf-thailand.com}"
+: "${HOST1_PORT:=22}"
+: "${HOST1_KEY_PATH:=/home/debug/.ssh/host1_ed25519}"
+: "${HOST1_KEY_SOURCE:=/workspace/localdata/keys/host1_ed25519}"
+: "${HOST1_STRICT:=no}"
+
+ensure_key() {
+  if [[ -f "$HOST1_KEY_PATH" ]]; then
+    return
+  fi
+  if [[ ! -f "$HOST1_KEY_SOURCE" ]]; then
+    echo "[mcp-host1-uptime] Missing private key. Provide $HOST1_KEY_SOURCE or override HOST1_KEY_SOURCE." >&2
+    exit 1
+  fi
+  echo "[mcp-host1-uptime] Installing key into $HOST1_KEY_PATH"
+  install -d -m 700 "$(dirname "$HOST1_KEY_PATH")"
+  install -m 600 "$HOST1_KEY_SOURCE" "$HOST1_KEY_PATH"
+}
+
+ensure_key
+
+ssh_args=(
+  -i "$HOST1_KEY_PATH"
+  -p "$HOST1_PORT"
+  -o StrictHostKeyChecking="$HOST1_STRICT"
+)
+
+if [[ -n "${HOST1_SSH_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  extras=($HOST1_SSH_ARGS)
+  ssh_args+=("${extras[@]}")
+fi
+
+exec ssh "${ssh_args[@]}" "$HOST1_USER@$HOST1_HOST" -- uptime -p
